@@ -35,10 +35,10 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch, Rectangle as MplRectangle
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QHBoxLayout,
-                                QLabel, QMainWindow, QProgressBar, QPushButton,
-                                QRadioButton, QSlider, QStackedWidget,
-                                QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
+                                QHBoxLayout, QLabel, QMainWindow, QProgressBar,
+                                QPushButton, QRadioButton, QSlider,
+                                QStackedWidget, QVBoxLayout, QWidget)
 
 from pde_compute import compute_equilibrium
 
@@ -152,6 +152,7 @@ class TxCanvas(FigureCanvasQTAgg):
         self.precomputed = precomputed
         self._colors = _color_map(system.phases)
         self._lowest_T = system.T_initial   # lowest temperature explored so far
+        self._reveal_all = False
 
         fig = Figure(tight_layout=True)
         super().__init__(fig)
@@ -229,22 +230,38 @@ class TxCanvas(FigureCanvasQTAgg):
             T_initial, color='black',
             linewidth=2.0, linestyle='--', zorder=10)
 
-    def reset(self, precomputed):
-        """Redraw canvas with new precomputed data (after secondary P-slider move)."""
+    def reset(self, precomputed, current_T=None):
+        """Redraw canvas with new precomputed data (after secondary P-slider move).
+
+        current_T sets the cover position; defaults to T_initial so the diagram
+        starts fully covered when no primary slider has been moved yet.
+        The current _reveal_all state is preserved across resets.
+        """
+        if current_T is None:
+            current_T = self.system.T_initial
         self.precomputed = precomputed
-        self._lowest_T = self.system.T_initial
+        self._lowest_T = current_T
         self.ax.cla()
         self._setup_axes()
         self._draw_full_diagram()
-        self._add_cover_and_cursor(self.system.T_initial)
+        self._add_cover_and_cursor(current_T)
+        if self._reveal_all:
+            self._cover.set_height(0)
         self.draw()
 
     def set_cursor(self, T):
         """Move cursor to T; shrink the cover if T is a new minimum."""
         if T < self._lowest_T:
             self._lowest_T = T
-            self._cover.set_height(T - self.system.T_min)
+            if not self._reveal_all:
+                self._cover.set_height(T - self.system.T_min)
         self._cursor_line.set_ydata([T, T])
+        self.draw()
+
+    def set_reveal_all(self, flag):
+        """Show or hide the cover rectangle regardless of the slider position."""
+        self._reveal_all = flag
+        self._cover.set_height(0 if flag else self._lowest_T - self.system.T_min)
         self.draw()
 
 
@@ -266,6 +283,7 @@ class PxCanvas(FigureCanvasQTAgg):
         self.precomputed = precomputed
         self._colors = _color_map(system.phases)
         self._lowest_P = system.P_initial   # lowest pressure explored so far
+        self._reveal_all = False
 
         fig = Figure(tight_layout=True)
         super().__init__(fig)
@@ -342,22 +360,38 @@ class PxCanvas(FigureCanvasQTAgg):
             P_initial, color='black',
             linewidth=2.0, linestyle='--', zorder=10)
 
-    def reset(self, precomputed):
-        """Redraw canvas with new precomputed data (after secondary T-slider move)."""
+    def reset(self, precomputed, current_P=None):
+        """Redraw canvas with new precomputed data (after secondary T-slider move).
+
+        current_P sets the cover position; defaults to P_initial so the diagram
+        starts fully covered when no primary slider has been moved yet.
+        The current _reveal_all state is preserved across resets.
+        """
+        if current_P is None:
+            current_P = self.system.P_initial
         self.precomputed = precomputed
-        self._lowest_P = self.system.P_initial
+        self._lowest_P = current_P
         self.ax.cla()
         self._setup_axes()
         self._draw_full_diagram()
-        self._add_cover_and_cursor(self.system.P_initial)
+        self._add_cover_and_cursor(current_P)
+        if self._reveal_all:
+            self._cover.set_height(0)
         self.draw()
 
     def set_cursor(self, P):
         """Move cursor to P; shrink the cover if P is a new minimum."""
         if P < self._lowest_P:
             self._lowest_P = P
-            self._cover.set_height(P - self.system.P_min)
+            if not self._reveal_all:
+                self._cover.set_height(P - self.system.P_min)
         self._cursor_line.set_ydata([P, P])
+        self.draw()
+
+    def set_reveal_all(self, flag):
+        """Show or hide the cover rectangle regardless of the slider position."""
+        self._reveal_all = flag
+        self._cover.set_height(0 if flag else self._lowest_P - self.system.P_min)
         self.draw()
 
 
@@ -476,11 +510,14 @@ class MainWindow(QMainWindow):
         canvas_row.addWidget(self.gx_canvas)
         canvas_row.addWidget(self._right_stack)
 
+        self._reveal_cb = QCheckBox('Reveal all')
+
         T_slider_row = QHBoxLayout()
         T_slider_row.addWidget(QLabel(f'{system.T_min:.0f} K'))
         T_slider_row.addWidget(self.T_slider)
         T_slider_row.addWidget(QLabel(f'{system.T_max:.0f} K'))
         T_slider_row.addWidget(self.T_label)
+        T_slider_row.addWidget(self._reveal_cb)
 
         root = QVBoxLayout()
         if mode_row is not None:
@@ -528,6 +565,7 @@ class MainWindow(QMainWindow):
             self._mode_group.idClicked.connect(self._on_mode_changed)
         if self._precompute_btn is not None:
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
+        self._reveal_cb.toggled.connect(self._on_reveal_all_toggled)
 
         # Render initial state.
         self._on_T_changed(int(system.T_initial))
@@ -568,8 +606,8 @@ class MainWindow(QMainWindow):
             self._precomputed_Px = new_Px
             self._P_arr = np.array([r.P for r in new_Px])
             self.gx_canvas._y_lim = _compute_ylim(new_Px)
-            self.px_canvas.reset(new_Px)
             P = self._current_P()
+            self.px_canvas.reset(new_Px, current_P=P)
             idx = int(np.argmin(np.abs(self._P_arr - P)))
             self.gx_canvas.redraw(new_Px[idx])
             self.px_canvas.set_cursor(P)
@@ -591,8 +629,8 @@ class MainWindow(QMainWindow):
         self._precomputed_Px = new_Px
         self._P_arr = np.array([r.P for r in new_Px])
         self.gx_canvas._y_lim = _compute_ylim(new_Px)
-        self.px_canvas.reset(new_Px)
         P = self._current_P()
+        self.px_canvas.reset(new_Px, current_P=P)
         idx = int(np.argmin(np.abs(self._P_arr - P)))
         self.gx_canvas.redraw(new_Px[idx])
         self.px_canvas.set_cursor(P)
@@ -612,8 +650,8 @@ class MainWindow(QMainWindow):
             self._precomputed_Tx = new_Tx
             self._T_arr = np.array([r.T for r in new_Tx])
             self.gx_canvas._y_lim = _compute_ylim(new_Tx)
-            self.tx_canvas.reset(new_Tx)
             T = self._current_T()
+            self.tx_canvas.reset(new_Tx, current_T=T)
             idx = int(np.argmin(np.abs(self._T_arr - T)))
             self.gx_canvas.redraw(new_Tx[idx])
             self.tx_canvas.set_cursor(T)
@@ -635,8 +673,8 @@ class MainWindow(QMainWindow):
         self._precomputed_Tx = new_Tx
         self._T_arr = np.array([r.T for r in new_Tx])
         self.gx_canvas._y_lim = _compute_ylim(new_Tx)
-        self.tx_canvas.reset(new_Tx)
         T = self._current_T()
+        self.tx_canvas.reset(new_Tx, current_T=T)
         idx = int(np.argmin(np.abs(self._T_arr - T)))
         self.gx_canvas.redraw(new_Tx[idx])
         self.tx_canvas.set_cursor(T)
@@ -645,21 +683,25 @@ class MainWindow(QMainWindow):
         if button_id == 0:
             self._mode = 'fixed_P'
             self._right_stack.setCurrentIndex(0)
-            # Reset T-x canvas to initial state, then reveal up to current T.
-            self.tx_canvas.reset(self._precomputed_Tx)
             T = self._current_T()
+            self.tx_canvas.reset(self._precomputed_Tx, current_T=T)
             idx = int(np.argmin(np.abs(self._T_arr - T)))
             self.gx_canvas.redraw(self._precomputed_Tx[idx])
             self.tx_canvas.set_cursor(T)
         else:
             self._mode = 'fixed_T'
             self._right_stack.setCurrentIndex(1)
-            # Reset P-x canvas to initial state, then reveal up to current P.
-            self.px_canvas.reset(self._precomputed_Px)
             P = self._current_P()
+            self.px_canvas.reset(self._precomputed_Px, current_P=P)
             idx = int(np.argmin(np.abs(self._P_arr - P)))
             self.gx_canvas.redraw(self._precomputed_Px[idx])
             self.px_canvas.set_cursor(P)
+
+    def _on_reveal_all_toggled(self, checked):
+        """Show or hide the cover on all phase-diagram canvases."""
+        self.tx_canvas.set_reveal_all(checked)
+        if self.px_canvas is not None:
+            self.px_canvas.set_reveal_all(checked)
 
     def _on_precompute_clicked(self):
         """Start background computation of the full T-P-x grid."""
