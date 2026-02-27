@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo — eutectic binary A-B with congruently-melting intermediate compound.
+
+  Energy form: HS
+    G(x, T) = H(x) - T·S(x)
+
+  System description:
+    - One liquid phase spanning x ∈ [0, 1].
+    - Alpha: A-rich solid solution (x ∈ [0.0, 0.4]).
+    - Gamma: stoichiometric AB compound (x ∈ [0.4, 0.6]), deep energy well.
+    - Beta:  B-rich solid solution (x ∈ [0.6, 1.0]).
+
+  Pure-component and compound melting points:
+
+    Component A:  T_melt = (H_L0 - H_α0) / (S_L - S_α)
+                         = (5.7 - 0.5) / (0.008 - 0.004) = 5.2 / 0.004 = 1300 K
+
+    Component B:  T_melt = (H_L1 - H_β1) / (S_L - S_β)
+                         = (5.7 - 0.5) / (0.008 - 0.004) = 5.2 / 0.004 = 1300 K
+
+    AB compound:  T_melt = (H_L(0.5) - H_γ(0.5)) / (S_L - S_γ)
+                         = (5.45 - (-1.55)) / (0.008 - 0.003) = 7.0 / 0.005 = 1400 K
+
+  The compound melts congruently above the end members, producing two eutectic
+  points (one between alpha and gamma, one between gamma and beta) and a
+  central maximum in the liquidus at x = 0.5.
+-->
+
+<pde>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+  </system>
+
+  <temperature>
+    <min>400</min>
+    <max>1500</max>
+    <initial>1500</initial>
+  </temperature>
+
+  <!-- ============================================================
+       Liquid phase (full range)
+       H_L(x) = 5.7 - 1.0x + 1.0x²
+         H_L(0) = 5.7   H_L(0.5) = 5.45   H_L(1) = 5.7  (symmetric endpoints)
+       S_L = 0.008
+       ============================================================ -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="5.7" x1="-1.0" x2="1.0"/>
+      <S x0="0.008"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Alpha phase (A-rich solid solution, x ∈ [0.0, 0.4])
+       H_α(x) = 0.5 - 0.5x + 4.0x²   (deep A well, steep rise toward B)
+       S_α = 0.004
+       ============================================================ -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.4"/>
+    <energy model="quadratic">
+      <H x0="0.5" x1="-0.5" x2="4.0"/>
+      <S x0="0.004"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Gamma phase — AB intermetallic compound (x ∈ [0.4, 0.6])
+       H_γ(x) = 30.0x² - 30.0x + 5.95   (sharp well; minimum at x = 0.5)
+         H_γ(0.5) = 7.5 - 15.0 + 5.95 = -1.55
+       S_γ = 0.003 (ordered compound, lower entropy than solid solutions)
+       ============================================================ -->
+
+  <phase name="gamma" type="solid">
+    <composition_range xmin="0.4" xmax="0.6"/>
+    <energy model="quadratic">
+      <H x0="5.95" x1="-30.0" x2="30.0"/>
+      <S x0="0.003"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Beta phase (B-rich solid solution, x ∈ [0.6, 1.0])
+       H_β(x) = 4.0x² - 7.5x + 4.0
+         H_β(1) = 0.5   (mirror of alpha on the B side)
+       S_β = 0.004
+       ============================================================ -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.6" xmax="1.0"/>
+    <energy model="quadratic">
+      <H x0="4.0" x1="-7.5" x2="4.0"/>
+      <S x0="0.004"/>
+    </energy>
+  </phase>
+
+</pde>

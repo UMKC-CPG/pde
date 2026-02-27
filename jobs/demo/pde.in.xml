@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sample input file for PDE — symmetric eutectic binary A-B system.
+
+  Energy form: HS
+    G(x, T) = H(x) - T·S(x)
+    Coefficients are in ascending composition order:
+      x0 = constant term, x1 = linear in x, x2 = quadratic in x.
+
+  System description:
+    - Two components: A (x=0) and B (x=1)
+    - One liquid phase, stable at high temperature (~above 1250 K)
+    - Two solid solution phases (alpha: A-rich, beta: B-rich)
+
+  At T_initial = 1500 K the liquid curve lies below all solid curves.
+  As temperature decreases the liquid curve rises, revealing the alpha
+  and beta stability fields and producing a symmetric eutectic diagram.
+-->
+
+<pde>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+  </system>
+
+  <temperature>
+    <min>500</min>
+    <max>1500</max>
+    <initial>1500</initial>
+  </temperature>
+
+  <!-- ============================================================
+       Liquid phase
+       H_L(x) = 2x² - 2x + 8    (shallow bowl, min at x=0.5)
+       S_L(x) = 0.01             (high, flat entropy → stable at high T)
+       Melting crossover at pure endpoints: T ≈ 1250 K
+       ============================================================ -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="8.0" x1="-2.0" x2="2.0"/>
+      <S x0="0.01" x1="0.0" x2="0.0"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Alpha phase (A-rich solid solution, x ∈ [0.0, 0.5])
+       H_α(x) = 4x² - 0.5x + 0.5
+       S_α(x) = 0.004            (lower entropy than liquid)
+       Boundary values at x=0:
+         H_α(0) = 0.5,  S_α(0) = 0.004
+       ============================================================ -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.5"/>
+    <energy model="quadratic">
+      <H x0="0.5" x1="-0.5" x2="4.0"/>
+      <S x0="0.004" x1="0.0" x2="0.0"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Beta phase (B-rich solid solution, x ∈ [0.5, 1.0])
+       H_β(x) = 4x² - 7.5x + 4
+       S_β(x) = 0.004            (lower entropy than liquid)
+       Boundary values at x=1:
+         H_β(1) = 0.5,  S_β(1) = 0.004
+       Mirror image of alpha (symmetric eutectic).
+       ============================================================ -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.5" xmax="1.0"/>
+    <energy model="quadratic">
+      <H x0="4.0" x1="-7.5" x2="4.0"/>
+      <S x0="0.004" x1="0.0" x2="0.0"/>
+    </energy>
+  </phase>
+
+</pde>

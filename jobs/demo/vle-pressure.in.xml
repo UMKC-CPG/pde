@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  vle-pressure.in.xml  -  Simple vapor-liquid equilibrium at variable pressure.
+
+  System: binary A-B, two phases (vapor + liquid), pressure range 0.5-5.0 atm.
+  Energy units: kJ/mol.  Pressure units: atm.  Temperature units: K.
+
+  Energy model  (HS form):
+    Vapor:  G(x, T, P) = H(x) - T*S(x) + R*T*ln(P/P_ref)
+      The R*T*ln(P/P_ref) term is the full pressure dependence for an ideal gas
+      (it comes from integrating V dP = (RT/P) dP).  No separate V block is used;
+      adding P*V(x) on top would double-count the pressure contribution.
+
+    Liquid: G(x, T, P) = H(x) - T*S(x) + P*V(x)
+      For a condensed phase V is small and constant (Poynting correction).
+      No ideal_gas term.
+
+  Vapor phase (ideal gas):
+    H(x) = 5.0 - 2.0*x + 4.0*x^2  kJ/mol
+    S(x) = 0.05  kJ/mol/K (nearly flat)
+    ideal_gas="true" adds R*T*ln(P/P_ref) with R=8.314e-3 kJ/mol/K, P_ref=1 atm.
+
+  Liquid phase:
+    H(x) = 4.0 - 1.0*x + 1.5*x^2  kJ/mol
+    S(x) = 0.005  kJ/mol/K
+    V(x) = 0.02  L/mol (small molar volume, weak Poynting correction)
+    ideal_gas="false" (default)
+
+  Expected behavior:
+    At T=350 K and P=1 atm the vapor G curve lies above the liquid, producing
+    a two-phase VLE region.  As P increases, R*T*ln(P/P_ref) raises the vapor
+    G curve further, widening the two-phase region (higher pressure suppresses
+    the vapor phase).  At low P the vapor G drops, narrowing the two-phase gap.
+
+  Note: parameter values are illustrative, not fitted to a real system.
+  This demo exercises the pressure-dependent code paths in pde_energy and
+  pde_compute.
+-->
+<pde>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+  </system>
+
+  <temperature>
+    <min>100</min>
+    <max>500</max>
+    <initial>500</initial>
+  </temperature>
+
+  <pressure>
+    <min>0.5</min>
+    <max>5.0</max>
+    <initial>2.0</initial>
+    <R_gas>8.314e-3</R_gas>
+    <P_ref>1.0</P_ref>
+  </pressure>
+
+  <!-- Vapor phase: ideal gas.  Pressure dependence comes entirely from
+       R*T*ln(P/P_ref); no separate V block (that would double-count). -->
+  <phase name="vapor" type="gas" ideal_gas="true">
+    <energy model="quadratic">
+      <H x0="21.0" x1="-2.0" x2="4.0"/>
+      <S x0="0.05" x1="0.0" x2="0.0"/>
+    </energy>
+  </phase>
+
+  <!-- Liquid phase: no ideal-gas term, small Poynting volume -->
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="4.0" x1="-1.0" x2="1.5"/>
+      <S x0="0.005" x1="0.0" x2="0.0"/>
+      <V x0="0.02"  x1="0.0" x2="0.0"/>
+    </energy>
+  </phase>
+
+</pde>

@@ -1,0 +1,9 @@
+#!/bin/bash
+
+export PDE_BRANCH="pde"
+export PDE_DIR=$HOME/CPG/cpg-repo/$PDE_BRANCH
+export PDE_RC="$PDE_DIR/.pde"
+export PDE_BIN="$PDE_DIR/bin"
+export LD_LIBRARY_PATH=$CPG_SHARE/mamba/envs/cpg10/lib:$LD_LIBRARY_PATH
+
+export PATH=$PDE_BIN:$PATH

@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo — asymmetric eutectic using the polynomial energy form.
+
+  Energy form: polynomial
+    G(x, T) = Σᵢ cᵢ(T)·xⁱ   where cᵢ(T) = Σⱼ aᵢⱼ·Tʲ
+
+  Coefficient conventions:
+    Outer index i = x-power (ascending: x0=constant, x1=linear, x2=quadratic).
+    Inner index j = T-power  (ascending: a0=constant, a1=linear in T, a2=quadratic in T).
+
+  System description:
+    - Same three-phase eutectic topology as the symmetric demo (pde.in.xml)
+      but with a T-dependent interaction term in the liquid.
+    - The x²·T¹ cross-term (a1 on the x2 element of the liquid) encodes a
+      non-ideal mixing interaction that weakens as temperature rises, making
+      the liquid slightly less bowl-shaped at high T.
+    - This shifts the effective melting point of B relative to A, producing
+      an asymmetric eutectic from an otherwise symmetric-looking parameter set.
+
+  Effective melting points (pure endpoints, x-power terms evaluated at x=0 or 1):
+
+    Component A (x=0):  only the x0 term contributes.
+      G_L(0,T) = 8.0 - 0.01·T
+      G_α(0,T) = 0.5 - 0.004·T
+      T_melt_A = (8.0 - 0.5) / (0.01 - 0.004) = 7.5 / 0.006 ≈ 1250 K
+
+    Component B (x=1):  all x-power terms sum to 1.
+      G_L(1,T) = (8.0 - 0.01T) + (-2.0) + (2.0 - 0.001T) = 8.0 - 0.011·T
+      G_β(1,T) = (4.0 - 0.004T) + (-7.5) + (4.0 + 0.001T) = 0.5 - 0.003·T
+      T_melt_B = (8.0 - 0.5) / (0.011 - 0.003) = 7.5 / 0.008 ≈ 938 K
+
+  The eutectic falls below 938 K, shifted toward the B-rich side — all arising
+  from the single a1=-0.001 T-coefficient on the liquid x2 term.
+-->
+
+<pde>
+
+  <system>
+    <components>A B</components>
+    <energy_form>polynomial</energy_form>
+  </system>
+
+  <temperature>
+    <min>400</min>
+    <max>1400</max>
+    <initial>1400</initial>
+  </temperature>
+
+  <!-- ============================================================
+       Liquid phase (polynomial form, full range)
+
+       G_L(x,T) = (8.0 - 0.01T) + (-2.0)x + (2.0 - 0.001T)x²
+
+       The x² interaction decreases with T (ideal behaviour at high T):
+         Ω(T) = 2.0 - 0.001T → 0 as T → 2000 K
+       ============================================================ -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <x0 a0="8.0"  a1="-0.01"/>
+      <x1 a0="-2.0"/>
+      <x2 a0="2.0"  a1="-0.001"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Alpha phase (A-rich solid solution, x ∈ [0.0, 0.5])
+
+       G_α(x,T) = (0.5 - 0.004T) + (-0.5)x + (4.0 + 0.001T)x²
+
+       The x² interaction increases slightly with T (solid becomes less
+       stable in mixed compositions as T rises).
+       ============================================================ -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.5"/>
+    <energy model="quadratic">
+      <x0 a0="0.5"  a1="-0.004"/>
+      <x1 a0="-0.5"/>
+      <x2 a0="4.0"  a1="0.001"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Beta phase (B-rich solid solution, x ∈ [0.5, 1.0])
+
+       G_β(x,T) = (4.0 - 0.004T) + (-7.5)x + (4.0 + 0.001T)x²
+       ============================================================ -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.5" xmax="1.0"/>
+    <energy model="quadratic">
+      <x0 a0="4.0"  a1="-0.004"/>
+      <x1 a0="-7.5"/>
+      <x2 a0="4.0"  a1="0.001"/>
+    </energy>
+  </phase>
+
+</pde>

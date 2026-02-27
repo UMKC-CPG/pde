@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo — isomorphous (complete solid solubility) binary A-B.
+
+  Energy form: HS
+    G(x, T) = H(x) - T·S(x)
+
+  System description:
+    - A and B are completely miscible in both liquid and solid.
+    - One liquid phase and one solid solution phase, both spanning x ∈ [0, 1].
+    - No eutectic or peritectic: liquid and solid form a classic lens diagram.
+    - A melts higher than B, so the lens is tilted.
+
+  Pure-component melting points:
+
+    Component A:  T_melt = (H_L0 - H_S0) / (S_L - S_S)
+                         = (6.1 - 0.5) / (0.008 - 0.004) = 5.6 / 0.004 = 1400 K
+
+    Component B:  T_melt = (H_L1 - H_S1) / (S_L - S_S)
+                         = (8.9 - 4.5) / (0.008 - 0.004) = 4.4 / 0.004 = 1100 K
+
+  The phase diagram shows:
+    - Above the liquidus curve  → single-phase liquid.
+    - Below the solidus curve   → single-phase solid solution.
+    - Between the two curves    → two-phase (liquid + solid) region.
+-->
+
+<pde>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+  </system>
+
+  <temperature>
+    <min>800</min>
+    <max>1600</max>
+    <initial>1600</initial>
+  </temperature>
+
+  <!-- ============================================================
+       Liquid phase (full range)
+       H_L(x) = 6.1 + 4.8x - 2.0x²
+         H_L(0) = 6.1   H_L(1) = 8.9
+       S_L = 0.008 (higher entropy than solid → stable at high T)
+       ============================================================ -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="6.1" x1="4.8" x2="-2.0"/>
+      <S x0="0.008"/>
+    </energy>
+  </phase>
+
+  <!-- ============================================================
+       Solid solution (full range, x ∈ [0, 1])
+       H_S(x) = 0.5 - 1.0x + 5.0x²
+         H_S(0) = 0.5   H_S(1) = 4.5
+       S_S = 0.004 (lower entropy than liquid)
+       ============================================================ -->
+
+  <phase name="solid" type="solid">
+    <energy model="quadratic">
+      <H x0="0.5" x1="-1.0" x2="5.0"/>
+      <S x0="0.004"/>
+    </energy>
+  </phase>
+
+</pde>
