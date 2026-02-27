@@ -561,7 +561,19 @@ class MainWindow(QMainWindow):
             idx = int(np.argmin(np.abs(self._T_arr - T)))
             self.gx_canvas.redraw(self._precomputed_Tx[idx])
             self.tx_canvas.set_cursor(T)
-        # In 'fixed_T' mode T is the secondary slider: label updates here;
+        elif self._full_grid is not None:
+            # T is the secondary slider and grid is cached — instant update.
+            T_idx = int(np.argmin(np.abs(self._T_arr - T)))
+            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(N_P_STEPS)]
+            self._precomputed_Px = new_Px
+            self._P_arr = np.array([r.P for r in new_Px])
+            self.gx_canvas._y_lim = _compute_ylim(new_Px)
+            self.px_canvas.reset(new_Px)
+            P = self._current_P()
+            idx = int(np.argmin(np.abs(self._P_arr - P)))
+            self.gx_canvas.redraw(new_Px[idx])
+            self.px_canvas.set_cursor(P)
+        # Otherwise T is the secondary slider with no cache: label updates here;
         # canvas update (recompute) fires in _on_T_released.
 
     def _on_T_released(self):
@@ -593,7 +605,19 @@ class MainWindow(QMainWindow):
             idx = int(np.argmin(np.abs(self._P_arr - P)))
             self.gx_canvas.redraw(self._precomputed_Px[idx])
             self.px_canvas.set_cursor(P)
-        # In 'fixed_P' mode P is the secondary slider: label updates here;
+        elif self._full_grid is not None:
+            # P is the secondary slider and grid is cached — instant update.
+            P_idx = int(np.argmin(np.abs(self._P_arr - P)))
+            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(N_T_STEPS)]
+            self._precomputed_Tx = new_Tx
+            self._T_arr = np.array([r.T for r in new_Tx])
+            self.gx_canvas._y_lim = _compute_ylim(new_Tx)
+            self.tx_canvas.reset(new_Tx)
+            T = self._current_T()
+            idx = int(np.argmin(np.abs(self._T_arr - T)))
+            self.gx_canvas.redraw(new_Tx[idx])
+            self.tx_canvas.set_cursor(T)
+        # Otherwise P is the secondary slider with no cache: label updates here;
         # canvas update (recompute) fires in _on_P_released.
 
     def _on_P_released(self):

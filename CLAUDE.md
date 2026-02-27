@@ -113,12 +113,28 @@ Pressure terms:
 
 ### `pde_viz.py`
 
-Interactive PySide6 + matplotlib window:
+Interactive PySide6 + matplotlib window with full pressure support:
 
-- **Pre-computes** 200 temperature steps (T_max → T_min) at startup via `precompute_diagram(system)` (calls `compute_equilibrium` with `P=0.0`; pressure slider is **not yet implemented**).
-- **Left canvas** (`GxCanvas`): G(x) curves per phase + lower convex envelope + common tangent lines. Redrawn on every slider move.
-- **Right canvas** (`TxCanvas`): T-x phase diagram. Drawn once at startup; a white cover rectangle hides the unrevealed low-T portion, shrinking as the slider moves downward (O(1) updates).
-- **Slider**: integer kelvin ticks; label shows current T.
+**Pre-computation** — at startup, `launch_ui(system)` calls:
+- `precompute_Tx_diagram(system, P_initial)` — 200 T steps (T_max → T_min) at fixed P.
+- `precompute_Px_diagram(system, T_initial)` — 200 P steps (P_max → P_min) at fixed T (only when `system.has_pressure`).
+- `precompute_diagram` is kept as a backward-compatible alias for `precompute_Tx_diagram`.
+
+**Canvases:**
+- **`GxCanvas`** (left): G(x) curves per phase + lower convex envelope + common tangent lines. Redrawn on every primary slider move.
+- **`TxCanvas`** (right, Fixed P mode): T-x phase diagram revealed incrementally top-down; white cover rectangle shrinks as T slider moves down (O(1) updates).
+- **`PxCanvas`** (right, Fixed T mode): P-x phase diagram, symmetric to `TxCanvas` but revealed bottom-up as P slider moves down.
+
+**Controls:**
+- **Mode selector** (only when `system.has_pressure`): "Fixed P (T-x)" / "Fixed T (P-x)" radio buttons swap the right canvas and reassign primary/secondary roles to the sliders.
+- **T slider**: integer kelvin ticks; always visible.
+- **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max.
+- **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): launches `FullGridWorker` (a `QThread`) to compute the full N_T_STEPS × N_P_STEPS grid in the background. Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute).
+
+**Slider interaction logic:**
+- Primary slider (`valueChanged`) → fast O(1) update: nearest pre-computed result looked up by index.
+- Secondary slider (`sliderReleased`) → recomputes the opposite sweep at the new secondary value (or performs an instant index lookup if the full grid is cached).
+- Mode switch → resets the newly-primary canvas to `T_initial`/`P_initial` and re-reveals up to the current slider position.
 
 ### `pde.1.py`
 
