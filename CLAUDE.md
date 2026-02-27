@@ -129,12 +129,13 @@ Interactive PySide6 + matplotlib window with full pressure support:
 - **Mode selector** (only when `system.has_pressure`): "Fixed P (T-x)" / "Fixed T (P-x)" radio buttons swap the right canvas and reassign primary/secondary roles to the sliders.
 - **T slider**: integer kelvin ticks; always visible.
 - **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max.
+- **"Reveal all" checkbox**: when checked, hides the cover rectangle on both canvases so the full phase diagram is visible regardless of slider position. Unchecking restores the cover to the current slider position. State is preserved across diagram regens triggered by the secondary slider.
 - **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): launches `FullGridWorker` (a `QThread`) to compute the full N_T_STEPS × N_P_STEPS grid in the background. Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute).
 
 **Slider interaction logic:**
 - Primary slider (`valueChanged`) → fast O(1) update: nearest pre-computed result looked up by index.
-- Secondary slider (`sliderReleased`) → recomputes the opposite sweep at the new secondary value (or performs an instant index lookup if the full grid is cached).
-- Mode switch → resets the newly-primary canvas to `T_initial`/`P_initial` and re-reveals up to the current slider position.
+- Secondary slider (`sliderReleased`) → recomputes the opposite sweep at the new secondary value (or performs an instant index lookup if the full grid is cached). The cover is initialized at the current primary slider position, not reset to `T_initial`/`P_initial`.
+- Mode switch → cover is initialized at the current primary slider position.
 
 ### `pde.1.py`
 
