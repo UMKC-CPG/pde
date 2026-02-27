@@ -36,9 +36,10 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Patch, Rectangle as MplRectangle
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
-                                QHBoxLayout, QLabel, QMainWindow, QProgressBar,
-                                QPushButton, QRadioButton, QSlider,
-                                QStackedWidget, QVBoxLayout, QWidget)
+                                QColorDialog, QComboBox, QDialog, QGridLayout,
+                                QHBoxLayout, QLabel, QMainWindow, QMenu,
+                                QProgressBar, QPushButton, QRadioButton,
+                                QSlider, QStackedWidget, QVBoxLayout, QWidget)
 
 from pde_compute import compute_equilibrium
 
@@ -63,7 +64,60 @@ _COLOR_PALETTE = [
 ]
 
 _TWO_PHASE_COLOR = '#D8D8D8'    # light grey fill for two-phase regions
-_TWO_PHASE_HATCH = '///'        # diagonal hatch overlay
+_TWO_PHASE_HATCH = '///'        # diagonal hatch overlay (matplotlib pattern string)
+
+_PALETTES = {
+    'Default':         ['#E8A020', '#3A7DBC', '#C94040', '#3AA85A',
+                        '#C9A030', '#8A40C9', '#C97030', '#40B8C9'],
+    'Colorblind-safe': ['#E69F00', '#56B4E9', '#009E73', '#F0E442',
+                        '#0072B2', '#D55E00', '#CC79A7', '#999999'],
+    'Pastel':          ['#FFB347', '#AED6F1', '#F1948A', '#A9DFBF',
+                        '#F9E79F', '#D2B4DE', '#FAD7A0', '#A2D9CE'],
+    'Dark':            ['#8B4513', '#1A3A5C', '#7B0000', '#1A5C2A',
+                        '#6B5B00', '#4A1A6B', '#8B4500', '#006B7B'],
+    # Tableau 10 — matplotlib's default color cycle (v2+)
+    'Tableau':         ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728',
+                        '#9467BD', '#8C564B', '#E377C2', '#7F7F7F'],
+    # Solarized — from the popular terminal/editor color scheme
+    'Solarized':       ['#268BD2', '#CB4B16', '#859900', '#2AA198',
+                        '#D33682', '#6C71C4', '#B58900', '#657B83'],
+    # Nord — cool blues and muted accents from the Nord theme
+    'Nord':            ['#5E81AC', '#BF616A', '#A3BE8C', '#EBCB8B',
+                        '#B48EAD', '#88C0D0', '#D08770', '#4C566A'],
+    # Earthy — warm natural tones
+    'Earthy':          ['#A0522D', '#6B8E23', '#8B7355', '#556B2F',
+                        '#CD853F', '#708090', '#8B8B00', '#2E8B57'],
+    # Vivid — high-saturation, high-contrast for presentations
+    'Vivid':           ['#E6194B', '#3CB44B', '#4363D8', '#F58231',
+                        '#911EB4', '#42D4F4', '#F032E6', '#BFEF45'],
+    # Muted — desaturated, easy on the eyes for long sessions
+    'Muted':           ['#4878CF', '#6ACC65', '#D65F5F', '#B47CC7',
+                        '#C4AD66', '#77BEDB', '#8C8C8C', '#A2C7A5'],
+}
+
+# Hatch patterns available for the two-phase region.
+# Keys are human-readable display names; values are matplotlib hatch strings.
+_HATCH_OPTIONS = {
+    'None':          '',
+    'Diagonal':      '///',
+    'Back-diagonal': 3 * '\\',
+    'Vertical':      '|||',
+    'Horizontal':    '---',
+    'Cross':         'xxx',
+    'Dots':          '...',
+    'Plus':          '+++',
+    'Stars':         '***',
+}
+# Reverse lookup: hatch string → display name
+_HATCH_NAMES = {v: k for k, v in _HATCH_OPTIONS.items()}
+
+# Legend location options shown in the right-click context menu (row-major,
+# matching the spatial layout so the menu reads like a 3×3 grid of corners).
+_LEGEND_LOCATIONS = [
+    'upper left',  'upper center',  'upper right',
+    'center left', 'center',        'center right',
+    'lower left',  'lower center',  'lower right',
+]
 
 
 # ---------------------------------------------------------------------------
@@ -91,15 +145,18 @@ def _compute_ylim(precomputed):
 class GxCanvas(FigureCanvasQTAgg):
     """Left panel: Gibbs energy curves vs. composition at the current T (and P)."""
 
-    def __init__(self, system, y_lim=None):
+    def __init__(self, system, y_lim=None, colors=None):
         self.system = system
         fig = Figure(tight_layout=True)
         super().__init__(fig)
         self.ax = fig.add_subplot(111)
-        self._colors = _color_map(system.phases)
+        self._colors = colors if colors is not None else _color_map(system.phases)
         self._y_lim = y_lim
+        self._legend_loc = 'upper left'
+        self._last_result = None
 
     def redraw(self, result):
+        self._last_result = result
         ax = self.ax
         ax.cla()
 
@@ -130,8 +187,23 @@ class GxCanvas(FigureCanvasQTAgg):
         ax.set_xlim(-0.02, 1.02)
         if self._y_lim is not None:
             ax.set_ylim(self._y_lim)
-        ax.legend(loc='upper right', fontsize=8)
+        ax.legend(loc=self._legend_loc, fontsize=8)
         self.draw()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addSection('Legend position')
+        for loc in _LEGEND_LOCATIONS:
+            action = menu.addAction(loc)
+            action.setCheckable(True)
+            action.setChecked(loc == self._legend_loc)
+            action.triggered.connect(lambda checked, l=loc: self._set_legend_loc(l))
+        menu.exec(event.globalPos())
+
+    def _set_legend_loc(self, loc):
+        self._legend_loc = loc
+        if self._last_result is not None:
+            self.redraw(self._last_result)
 
 
 # ---------------------------------------------------------------------------
@@ -141,18 +213,25 @@ class GxCanvas(FigureCanvasQTAgg):
 class TxCanvas(FigureCanvasQTAgg):
     """Right panel: T-x phase diagram with incremental top-down revelation."""
 
-    def __init__(self, system, precomputed):
+    def __init__(self, system, precomputed, colors=None,
+                 two_phase_color=_TWO_PHASE_COLOR, two_phase_hatch=_TWO_PHASE_HATCH):
         """
         Parameters
         ----------
-        system      : System
-        precomputed : list[EqResult]  sorted by T descending (T_max first)
+        system          : System
+        precomputed     : list[EqResult]  sorted by T descending (T_max first)
+        colors          : dict {phase_name: color_str}  or None to use default
+        two_phase_color : str  hex color for two-phase regions
+        two_phase_hatch : str  matplotlib hatch pattern ('' = no hatch)
         """
         self.system = system
         self.precomputed = precomputed
-        self._colors = _color_map(system.phases)
+        self._colors = colors if colors is not None else _color_map(system.phases)
+        self._two_phase_color = two_phase_color
+        self._two_phase_hatch = two_phase_hatch
         self._lowest_T = system.T_initial   # lowest temperature explored so far
         self._reveal_all = False
+        self._legend_loc = 'upper left'
 
         fig = Figure(tight_layout=True)
         super().__init__(fig)
@@ -177,11 +256,12 @@ class TxCanvas(FigureCanvasQTAgg):
             for p in self.system.phases
             if p.phase_type != 'end_member'
         ]
-        handles.append(Patch(facecolor=_TWO_PHASE_COLOR,
-                             hatch=_TWO_PHASE_HATCH,
-                             edgecolor='grey',
+        handles.append(Patch(facecolor=self._two_phase_color,
+                             hatch=self._two_phase_hatch or None,
+                             edgecolor='black' if self._two_phase_hatch else 'none',
+                             linewidth=0,
                              label='two-phase'))
-        ax.legend(handles=handles, loc='upper right', fontsize=8)
+        ax.legend(handles=handles, loc=self._legend_loc, fontsize=8)
 
     def _draw_full_diagram(self):
         """Render all pre-computed regions into the axes (called once at init)."""
@@ -202,9 +282,10 @@ class TxCanvas(FigureCanvasQTAgg):
                 if r['type'] == 'two_phase':
                     ax.broken_barh(
                         [(x0, width)], (T_bot, dT),
-                        facecolors=_TWO_PHASE_COLOR,
-                        edgecolors='grey',
-                        hatch=_TWO_PHASE_HATCH,
+                        facecolors=self._two_phase_color,
+                        edgecolors='black' if self._two_phase_hatch else 'none',
+                        linewidth=0,
+                        hatch=self._two_phase_hatch or None,
                         alpha=0.9)
                 else:
                     phase = self.system.phases[r['phases'][0]]
@@ -264,6 +345,33 @@ class TxCanvas(FigureCanvasQTAgg):
         self._cover.set_height(0 if flag else self._lowest_T - self.system.T_min)
         self.draw()
 
+    def recolor(self):
+        """Redraw the diagram with updated colors, preserving cover/reveal state."""
+        self.ax.cla()
+        self._setup_axes()
+        self._draw_full_diagram()
+        self._add_cover_and_cursor(self._lowest_T)
+        if self._reveal_all:
+            self._cover.set_height(0)
+        self.draw()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addSection('Legend position')
+        for loc in _LEGEND_LOCATIONS:
+            action = menu.addAction(loc)
+            action.setCheckable(True)
+            action.setChecked(loc == self._legend_loc)
+            action.triggered.connect(lambda checked, l=loc: self._set_legend_loc(l))
+        menu.exec(event.globalPos())
+
+    def _set_legend_loc(self, loc):
+        self._legend_loc = loc
+        leg = self.ax.get_legend()
+        if leg is not None:
+            leg.set_loc(loc)
+            self.draw()
+
 
 # ---------------------------------------------------------------------------
 # P-x canvas
@@ -272,18 +380,25 @@ class TxCanvas(FigureCanvasQTAgg):
 class PxCanvas(FigureCanvasQTAgg):
     """Right panel (Fixed T mode): P-x phase diagram with incremental revelation."""
 
-    def __init__(self, system, precomputed):
+    def __init__(self, system, precomputed, colors=None,
+                 two_phase_color=_TWO_PHASE_COLOR, two_phase_hatch=_TWO_PHASE_HATCH):
         """
         Parameters
         ----------
-        system      : System
-        precomputed : list[EqResult]  sorted by P descending (P_max first)
+        system          : System
+        precomputed     : list[EqResult]  sorted by P descending (P_max first)
+        colors          : dict {phase_name: color_str}  or None to use default
+        two_phase_color : str  hex color for two-phase regions
+        two_phase_hatch : str  matplotlib hatch pattern ('' = no hatch)
         """
         self.system = system
         self.precomputed = precomputed
-        self._colors = _color_map(system.phases)
+        self._colors = colors if colors is not None else _color_map(system.phases)
+        self._two_phase_color = two_phase_color
+        self._two_phase_hatch = two_phase_hatch
         self._lowest_P = system.P_initial   # lowest pressure explored so far
         self._reveal_all = False
+        self._legend_loc = 'upper left'
 
         fig = Figure(tight_layout=True)
         super().__init__(fig)
@@ -307,11 +422,12 @@ class PxCanvas(FigureCanvasQTAgg):
             for p in self.system.phases
             if p.phase_type != 'end_member'
         ]
-        handles.append(Patch(facecolor=_TWO_PHASE_COLOR,
-                             hatch=_TWO_PHASE_HATCH,
-                             edgecolor='grey',
+        handles.append(Patch(facecolor=self._two_phase_color,
+                             hatch=self._two_phase_hatch or None,
+                             edgecolor='black' if self._two_phase_hatch else 'none',
+                             linewidth=0,
                              label='two-phase'))
-        ax.legend(handles=handles, loc='upper right', fontsize=8)
+        ax.legend(handles=handles, loc=self._legend_loc, fontsize=8)
 
     def _draw_full_diagram(self):
         """Render all pre-computed regions into the axes (called once at init)."""
@@ -332,9 +448,10 @@ class PxCanvas(FigureCanvasQTAgg):
                 if r['type'] == 'two_phase':
                     ax.broken_barh(
                         [(x0, width)], (P_bot, dP),
-                        facecolors=_TWO_PHASE_COLOR,
-                        edgecolors='grey',
-                        hatch=_TWO_PHASE_HATCH,
+                        facecolors=self._two_phase_color,
+                        edgecolors='black' if self._two_phase_hatch else 'none',
+                        linewidth=0,
+                        hatch=self._two_phase_hatch or None,
                         alpha=0.9)
                 else:
                     phase = self.system.phases[r['phases'][0]]
@@ -394,6 +511,33 @@ class PxCanvas(FigureCanvasQTAgg):
         self._cover.set_height(0 if flag else self._lowest_P - self.system.P_min)
         self.draw()
 
+    def recolor(self):
+        """Redraw the diagram with updated colors, preserving cover/reveal state."""
+        self.ax.cla()
+        self._setup_axes()
+        self._draw_full_diagram()
+        self._add_cover_and_cursor(self._lowest_P)
+        if self._reveal_all:
+            self._cover.set_height(0)
+        self.draw()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addSection('Legend position')
+        for loc in _LEGEND_LOCATIONS:
+            action = menu.addAction(loc)
+            action.setCheckable(True)
+            action.setChecked(loc == self._legend_loc)
+            action.triggered.connect(lambda checked, l=loc: self._set_legend_loc(l))
+        menu.exec(event.globalPos())
+
+    def _set_legend_loc(self, loc):
+        self._legend_loc = loc
+        leg = self.ax.get_legend()
+        if leg is not None:
+            leg.set_loc(loc)
+            self.draw()
+
 
 # ---------------------------------------------------------------------------
 # Background worker: full T-P-x grid
@@ -426,6 +570,157 @@ class FullGridWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Color selection dialog
+# ---------------------------------------------------------------------------
+
+def _swatch_style(hex_color):
+    """Return a stylesheet string for a color-swatch QPushButton."""
+    return (f'background-color: {hex_color}; '
+            'border: 1px solid #888; '
+            'min-width: 48px; min-height: 20px;')
+
+
+class ColorDialog(QDialog):
+    """Non-modal dialog for choosing per-phase colors and palette presets."""
+
+    colors_changed = Signal(dict, str, str)   # (phase_colors, two_phase_color, two_phase_hatch)
+
+    def __init__(self, system, phase_colors, two_phase_color,
+                 two_phase_hatch=_TWO_PHASE_HATCH, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Phase Colors')
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+
+        # Working copies (edits are applied immediately via the signal).
+        self._phase_colors    = dict(phase_colors)
+        self._two_phase_color = two_phase_color
+        self._two_phase_hatch = two_phase_hatch
+
+        # ---- palette row ----
+        palette_lbl  = QLabel('Palette:')
+        self._palette_cb  = QComboBox()
+        for name in _PALETTES:
+            self._palette_cb.addItem(name)
+        apply_btn = QPushButton('Apply palette')
+        apply_btn.clicked.connect(self._on_apply_palette)
+
+        palette_row = QHBoxLayout()
+        palette_row.addWidget(palette_lbl)
+        palette_row.addWidget(self._palette_cb)
+        palette_row.addWidget(apply_btn)
+        palette_row.addStretch()
+
+        # ---- per-phase swatch grid (skip end_members) ----
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        self._phase_btns = {}   # phase_name → QPushButton
+        col = 0
+        row = 0
+        for phase in system.phases:
+            if phase.phase_type == 'end_member':
+                continue
+            lbl = QLabel(phase.name)
+            btn = QPushButton()
+            btn.setStyleSheet(_swatch_style(self._phase_colors[phase.name]))
+            btn.setFixedWidth(56)
+            # Use default arg capture to bind phase.name correctly in closure.
+            btn.clicked.connect(lambda checked, n=phase.name: self._on_phase_swatch(n))
+            self._phase_btns[phase.name] = btn
+            grid.addWidget(lbl, row, col * 2)
+            grid.addWidget(btn, row, col * 2 + 1)
+            col += 1
+            if col >= 2:
+                col = 0
+                row += 1
+
+        # ---- two-phase swatch + hatch selector ----
+        two_phase_lbl = QLabel('Two-phase region:')
+        self._two_phase_btn = QPushButton()
+        self._two_phase_btn.setStyleSheet(_swatch_style(self._two_phase_color))
+        self._two_phase_btn.setFixedWidth(56)
+        self._two_phase_btn.clicked.connect(self._on_two_phase_swatch)
+
+        hatch_lbl = QLabel('Hatch:')
+        self._hatch_cb = QComboBox()
+        for name in _HATCH_OPTIONS:
+            self._hatch_cb.addItem(name)
+        # Set combobox to the current hatch value.
+        current_hatch_name = _HATCH_NAMES.get(self._two_phase_hatch, 'Diagonal')
+        self._hatch_cb.setCurrentText(current_hatch_name)
+        self._hatch_cb.currentTextChanged.connect(self._on_hatch_changed)
+
+        two_phase_row = QHBoxLayout()
+        two_phase_row.addWidget(two_phase_lbl)
+        two_phase_row.addWidget(self._two_phase_btn)
+        two_phase_row.addSpacing(16)
+        two_phase_row.addWidget(hatch_lbl)
+        two_phase_row.addWidget(self._hatch_cb)
+        two_phase_row.addStretch()
+
+        # ---- close button ----
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(self.close)
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_row.addWidget(close_btn)
+
+        # ---- assemble ----
+        root = QVBoxLayout()
+        root.addLayout(palette_row)
+        root.addLayout(grid)
+        root.addLayout(two_phase_row)
+        root.addLayout(close_row)
+        self.setLayout(root)
+
+    # ------------------------------------------------------------------
+    # Slots
+    # ------------------------------------------------------------------
+
+    def _emit(self):
+        """Emit colors_changed with current state."""
+        self.colors_changed.emit(
+            dict(self._phase_colors), self._two_phase_color, self._two_phase_hatch)
+
+    def _on_apply_palette(self):
+        name = self._palette_cb.currentText()
+        colors = _PALETTES[name]
+        # Apply to non-end-member phases in order.
+        phases = [p for p in self.parent().system.phases
+                  if p.phase_type != 'end_member']
+        for i, phase in enumerate(phases):
+            hex_color = colors[i % len(colors)]
+            self._phase_colors[phase.name] = hex_color
+            self._phase_btns[phase.name].setStyleSheet(_swatch_style(hex_color))
+        self._emit()
+
+    def _on_phase_swatch(self, phase_name):
+        from PySide6.QtGui import QColor
+        initial = QColor(self._phase_colors[phase_name])
+        color = QColorDialog.getColor(initial, self, f'Color for {phase_name}')
+        if not color.isValid():
+            return
+        hex_color = color.name()
+        self._phase_colors[phase_name] = hex_color
+        self._phase_btns[phase_name].setStyleSheet(_swatch_style(hex_color))
+        self._emit()
+
+    def _on_two_phase_swatch(self):
+        from PySide6.QtGui import QColor
+        initial = QColor(self._two_phase_color)
+        color = QColorDialog.getColor(initial, self, 'Color for two-phase region')
+        if not color.isValid():
+            return
+        self._two_phase_color = color.name()
+        self._two_phase_btn.setStyleSheet(_swatch_style(self._two_phase_color))
+        self._emit()
+
+    def _on_hatch_changed(self, name):
+        self._two_phase_hatch = _HATCH_OPTIONS[name]
+        self._emit()
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -440,8 +735,15 @@ class MainWindow(QMainWindow):
         self._precomputed_Px = precomputed_Px
 
         self._T_arr = np.array([r.T for r in precomputed_Tx])
-        self._P_arr = (np.array([r.P for r in precomputed_Px])
-                       if precomputed_Px is not None else None)
+        # If P-x was pre-computed, use its actual P values; otherwise build the
+        # array from linspace so the full-grid code paths have a valid _P_arr
+        # even before the P-x diagram is first computed.
+        if precomputed_Px is not None:
+            self._P_arr = np.array([r.P for r in precomputed_Px])
+        elif system.has_pressure:
+            self._P_arr = np.linspace(system.P_max, system.P_min, N_P_STEPS)
+        else:
+            self._P_arr = None
 
         # Current mode: 'fixed_P' (T is primary) or 'fixed_T' (P is primary).
         self._mode = 'fixed_P'
@@ -450,13 +752,25 @@ class MainWindow(QMainWindow):
         self._full_grid = None
         self._worker    = None   # kept alive to prevent GC during thread run
 
+        # ---- shared color state (shared dict propagates to all canvases) ----
+        self._colors          = _color_map(system.phases)
+        self._two_phase_color = _TWO_PHASE_COLOR
+        self._two_phase_hatch = _TWO_PHASE_HATCH
+        self._color_dialog    = None   # single dialog instance
+
         # ---- G-x y-limits from the Tx precomputed data ----
         y_lim = _compute_ylim(precomputed_Tx)
 
         # ---- canvases ----
-        self.gx_canvas = GxCanvas(system, y_lim)
-        self.tx_canvas = TxCanvas(system, precomputed_Tx)
-        self.px_canvas = (PxCanvas(system, precomputed_Px)
+        self.gx_canvas = GxCanvas(system, y_lim, colors=self._colors)
+        self.tx_canvas = TxCanvas(system, precomputed_Tx,
+                                  colors=self._colors,
+                                  two_phase_color=self._two_phase_color,
+                                  two_phase_hatch=self._two_phase_hatch)
+        self.px_canvas = (PxCanvas(system, precomputed_Px,
+                                   colors=self._colors,
+                                   two_phase_color=self._two_phase_color,
+                                   two_phase_hatch=self._two_phase_hatch)
                           if precomputed_Px is not None else None)
 
         # ---- right-panel stacked widget ----
@@ -479,7 +793,7 @@ class MainWindow(QMainWindow):
         # ---- P slider (only when has_pressure) ----
         self.P_slider = None
         self.P_label = None
-        if system.has_pressure and precomputed_Px is not None:
+        if system.has_pressure:
             self.P_slider = QSlider(Qt.Horizontal)
             self.P_slider.setMinimum(0)
             self.P_slider.setMaximum(N_P_STEPS - 1)
@@ -492,7 +806,7 @@ class MainWindow(QMainWindow):
         # ---- mode selector (only when has_pressure) ----
         self._mode_group = None
         mode_row = None
-        if system.has_pressure and precomputed_Px is not None:
+        if system.has_pressure:
             radio_fixed_P = QRadioButton('Fixed P  (T-x)')
             radio_fixed_T = QRadioButton('Fixed T  (P-x)')
             radio_fixed_P.setChecked(True)
@@ -510,7 +824,8 @@ class MainWindow(QMainWindow):
         canvas_row.addWidget(self.gx_canvas)
         canvas_row.addWidget(self._right_stack)
 
-        self._reveal_cb = QCheckBox('Reveal all')
+        self._reveal_cb  = QCheckBox('Reveal all')
+        self._colors_btn = QPushButton('Colors\u2026')
 
         T_slider_row = QHBoxLayout()
         T_slider_row.addWidget(QLabel(f'{system.T_min:.0f} K'))
@@ -518,6 +833,7 @@ class MainWindow(QMainWindow):
         T_slider_row.addWidget(QLabel(f'{system.T_max:.0f} K'))
         T_slider_row.addWidget(self.T_label)
         T_slider_row.addWidget(self._reveal_cb)
+        T_slider_row.addWidget(self._colors_btn)
 
         root = QVBoxLayout()
         if mode_row is not None:
@@ -566,6 +882,7 @@ class MainWindow(QMainWindow):
         if self._precompute_btn is not None:
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
         self._reveal_cb.toggled.connect(self._on_reveal_all_toggled)
+        self._colors_btn.clicked.connect(self._on_colors_clicked)
 
         # Render initial state.
         self._on_T_changed(int(system.T_initial))
@@ -690,6 +1007,22 @@ class MainWindow(QMainWindow):
             self.tx_canvas.set_cursor(T)
         else:
             self._mode = 'fixed_T'
+            if self.px_canvas is None:
+                # Lazy first-time computation of the P-x diagram.
+                T = self._current_T()
+                print(f'Computing P-x diagram at T={T:.1f} K...',
+                      end=' ', flush=True)
+                new_Px = precompute_Px_diagram(self.system, T)
+                print('done.')
+                self._precomputed_Px = new_Px
+                self._P_arr = np.array([r.P for r in new_Px])
+                self.gx_canvas._y_lim = _compute_ylim(new_Px)
+                self.px_canvas = PxCanvas(self.system, new_Px,
+                                          colors=self._colors,
+                                          two_phase_color=self._two_phase_color,
+                                          two_phase_hatch=self._two_phase_hatch)
+                self._right_stack.addWidget(self.px_canvas)
+                self.px_canvas.set_reveal_all(self._reveal_cb.isChecked())
             self._right_stack.setCurrentIndex(1)
             P = self._current_P()
             self.px_canvas.reset(self._precomputed_Px, current_P=P)
@@ -702,6 +1035,41 @@ class MainWindow(QMainWindow):
         self.tx_canvas.set_reveal_all(checked)
         if self.px_canvas is not None:
             self.px_canvas.set_reveal_all(checked)
+
+    def _current_result(self):
+        """Return the EqResult nearest to the current slider position."""
+        if self._mode == 'fixed_P':
+            idx = int(np.argmin(np.abs(self._T_arr - self._current_T())))
+            return self._precomputed_Tx[idx]
+        else:
+            idx = int(np.argmin(np.abs(self._P_arr - self._current_P())))
+            return self._precomputed_Px[idx]
+
+    def _apply_colors(self, phase_colors, two_phase_color, two_phase_hatch):
+        """Update shared color/hatch state and redraw all canvases live."""
+        self._colors.update(phase_colors)
+        self._two_phase_color = two_phase_color
+        self._two_phase_hatch = two_phase_hatch
+        self.tx_canvas._two_phase_color = two_phase_color
+        self.tx_canvas._two_phase_hatch = two_phase_hatch
+        if self.px_canvas is not None:
+            self.px_canvas._two_phase_color = two_phase_color
+            self.px_canvas._two_phase_hatch = two_phase_hatch
+        self.tx_canvas.recolor()
+        if self.px_canvas is not None:
+            self.px_canvas.recolor()
+        self.gx_canvas.redraw(self._current_result())
+
+    def _on_colors_clicked(self):
+        """Open (or raise) the color selection dialog."""
+        if self._color_dialog is not None and self._color_dialog.isVisible():
+            self._color_dialog.raise_()
+            return
+        self._color_dialog = ColorDialog(
+            self.system, self._colors, self._two_phase_color,
+            self._two_phase_hatch, parent=self)
+        self._color_dialog.colors_changed.connect(self._apply_colors)
+        self._color_dialog.show()
 
     def _on_precompute_clicked(self):
         """Start background computation of the full T-P-x grid."""
@@ -757,11 +1125,10 @@ def launch_ui(system):
     if system.has_pressure:
         print(
             f'Pre-computing T-x diagram at P={system.P_initial:.3g} '
-            f'and P-x diagram at T={system.T_initial:.1f} K '
-            f'({N_T_STEPS + N_P_STEPS} evaluations)...',
+            f'({N_T_STEPS} evaluations)...',
             end=' ', flush=True)
         precomputed_Tx = precompute_Tx_diagram(system, system.P_initial)
-        precomputed_Px = precompute_Px_diagram(system, system.T_initial)
+        precomputed_Px = None
         print('done.')
     else:
         print('Pre-computing phase diagram...', end=' ', flush=True)
