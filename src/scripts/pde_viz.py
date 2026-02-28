@@ -752,6 +752,20 @@ class MainWindow(QMainWindow):
 
     def __init__(self, system, precomputed_Tx, precomputed_Px=None):
         super().__init__()
+        self._builder      = None   # BuilderWindow (single instance, persists across reloads)
+        self._worker       = None
+        self._worker_state = 'idle'
+        self._color_dialog = None
+        self._init_system_state(system, precomputed_Tx, precomputed_Px)
+        self._build_central_widget()
+
+    # ------------------------------------------------------------------
+    # Init helpers
+    # ------------------------------------------------------------------
+
+    def _init_system_state(self, system, precomputed_Tx, precomputed_Px=None):
+        """Set all non-widget instance variables from a new system + precomputed data."""
+        self._n_steps = N_T_STEPS
         self.system = system
         self.setWindowTitle(system.title)
 
@@ -759,44 +773,46 @@ class MainWindow(QMainWindow):
         self._precomputed_Px = precomputed_Px
 
         self._T_arr = np.array([r.T for r in precomputed_Tx])
-        # If P-x was pre-computed, use its actual P values; otherwise build the
-        # array from linspace so the full-grid code paths have a valid _P_arr
-        # even before the P-x diagram is first computed.
         if precomputed_Px is not None:
             self._P_arr = np.array([r.P for r in precomputed_Px])
         elif system.has_pressure:
-            self._P_arr = np.linspace(system.P_max, system.P_min, N_P_STEPS)
+            self._P_arr = np.linspace(system.P_max, system.P_min, self._n_steps)
         else:
             self._P_arr = None
 
-        # Current mode: 'fixed_P' (T is primary) or 'fixed_T' (P is primary).
-        self._mode = 'fixed_P'
-
-        # Full T-P-x grid cache (None until background worker finishes).
+        self._mode         = 'fixed_P'
         self._full_grid    = None
-        self._worker       = None   # kept alive to prevent GC during thread run
-        self._worker_state = 'idle'  # 'idle' | 'running' | 'paused' | 'done'
+        self._worker       = None
+        self._worker_state = 'idle'
 
-        # ---- shared color state (shared dict propagates to all canvases) ----
         self._colors          = _color_map(system.phases)
         self._two_phase_color = _TWO_PHASE_COLOR
         self._two_phase_hatch = _TWO_PHASE_HATCH
-        self._color_dialog    = None   # single dialog instance
+        self._color_dialog    = None
+
+    def _build_central_widget(self):
+        """Build (or rebuild) all Qt widgets, canvases, layouts, signal connections.
+
+        Safe to call multiple times — setCentralWidget() replaces the old
+        central widget and Qt automatically deletes it along with all its
+        children.
+        """
+        system = self.system
 
         # ---- G-x y-limits from the Tx precomputed data ----
-        y_lim = _compute_ylim(precomputed_Tx)
+        y_lim = _compute_ylim(self._precomputed_Tx)
 
         # ---- canvases ----
         self.gx_canvas = GxCanvas(system, y_lim, colors=self._colors)
-        self.tx_canvas = TxCanvas(system, precomputed_Tx,
+        self.tx_canvas = TxCanvas(system, self._precomputed_Tx,
                                   colors=self._colors,
                                   two_phase_color=self._two_phase_color,
                                   two_phase_hatch=self._two_phase_hatch)
-        self.px_canvas = (PxCanvas(system, precomputed_Px,
+        self.px_canvas = (PxCanvas(system, self._precomputed_Px,
                                    colors=self._colors,
                                    two_phase_color=self._two_phase_color,
                                    two_phase_hatch=self._two_phase_hatch)
-                          if precomputed_Px is not None else None)
+                          if self._precomputed_Px is not None else None)
 
         # ---- right-panel stacked widget ----
         self._right_stack = QStackedWidget()
@@ -817,14 +833,14 @@ class MainWindow(QMainWindow):
 
         # ---- P slider (only when has_pressure) ----
         self.P_slider = None
-        self.P_label = None
+        self.P_label  = None
         if system.has_pressure:
             self.P_slider = QSlider(Qt.Horizontal)
             self.P_slider.setMinimum(0)
-            self.P_slider.setMaximum(N_P_STEPS - 1)
+            self.P_slider.setMaximum(self._n_steps - 1)
             P_range = max(system.P_max - system.P_min, 1e-30)
             P_frac = (system.P_initial - system.P_min) / P_range
-            self.P_slider.setValue(int(round(P_frac * (N_P_STEPS - 1))))
+            self.P_slider.setValue(int(round(P_frac * (self._n_steps - 1))))
             self.P_label = QLabel(f'P = {system.P_initial:.3g} {system.P_unit}'.strip())
             self.P_label.setMinimumWidth(90)
 
@@ -841,6 +857,12 @@ class MainWindow(QMainWindow):
         # ---- shared controls ----
         self._reveal_cb  = QCheckBox('Reveal all')
         self._colors_btn = QPushButton('Colors\u2026')
+        self._res_combo  = QComboBox()
+        for _label, _n in [('Very Low (25)', 25), ('Low (50)', 50),
+                            ('Medium (100)', 100), ('High (200)', 200),
+                            ('Very High (500)', 500)]:
+            self._res_combo.addItem(_label, _n)
+        self._res_combo.setCurrentIndex(3)   # default: High (200)
 
         # ---- pre-compute widgets (only when pressure is active) ----
         self._precompute_btn    = None
@@ -848,15 +870,19 @@ class MainWindow(QMainWindow):
         self._precompute_status = None
         if system.has_pressure:
             self._precompute_btn = QPushButton('Pre-compute full T-P-x')
-            n_total = N_T_STEPS * N_P_STEPS
+            n_total = self._n_steps ** 2
             self._precompute_bar = QProgressBar()
             self._precompute_bar.setRange(0, n_total)
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(False)
             self._precompute_status = QLabel('')
 
+        # ---- Builder button ----
+        self._builder_btn = QPushButton('Builder\u2026')
+        self._builder_btn.clicked.connect(self._open_builder)
+
         # ---- layout ----
-        # Top row: mode toggles (if pressure) | Reveal all | Colors… | precompute (if pressure)
+        # Top row: mode toggles (if pressure) | Reveal all | Colors… | precompute (if pressure) | Builder…
         top_row = QHBoxLayout()
         if system.has_pressure:
             top_row.addWidget(radio_fixed_P)
@@ -864,11 +890,16 @@ class MainWindow(QMainWindow):
             top_row.addSpacing(16)
         top_row.addWidget(self._reveal_cb)
         top_row.addWidget(self._colors_btn)
+        top_row.addSpacing(8)
+        top_row.addWidget(QLabel('Resolution:'))
+        top_row.addWidget(self._res_combo)
         if system.has_pressure:
             top_row.addSpacing(16)
             top_row.addWidget(self._precompute_btn)
             top_row.addWidget(self._precompute_bar, stretch=1)
             top_row.addWidget(self._precompute_status)
+        top_row.addSpacing(16)
+        top_row.addWidget(self._builder_btn)
         top_row.addStretch()
 
         canvas_row = QHBoxLayout()
@@ -911,17 +942,45 @@ class MainWindow(QMainWindow):
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
         self._reveal_cb.toggled.connect(self._on_reveal_all_toggled)
         self._colors_btn.clicked.connect(self._on_colors_clicked)
+        self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
 
         # Render initial state.
         self._on_T_changed(int(system.T_initial))
+
+    # ------------------------------------------------------------------
+    # Builder integration
+    # ------------------------------------------------------------------
+
+    def reload_system(self, system):
+        """Rebuild the entire UI for a new system (called by the builder on Apply)."""
+        if self._worker is not None:
+            self._worker.abort()
+            self._worker.wait()
+        if self._color_dialog is not None:
+            self._color_dialog.close()
+        print('Applying builder changes...', end=' ', flush=True)
+        P = system.P_initial if system.has_pressure else 0.0
+        precomputed_Tx = precompute_Tx_diagram(system, P)
+        print('done.')
+        self._init_system_state(system, precomputed_Tx, None)
+        self._build_central_widget()
+
+    def _open_builder(self):
+        """Open (or raise) the builder window, pre-populated with the current system."""
+        if self._builder is None or not self._builder.isVisible():
+            from pde_builder import BuilderWindow
+            self._builder = BuilderWindow(system=self.system)
+            self._builder.system_applied.connect(self.reload_system)
+        self._builder.raise_()
+        self._builder.show()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _P_from_tick(self, tick):
-        """Map slider tick 0…N_P_STEPS-1 → pressure value."""
-        frac = tick / (N_P_STEPS - 1)
+        """Map slider tick 0…n_steps-1 → pressure value."""
+        frac = tick / (self._n_steps - 1)
         return self.system.P_min + frac * (self.system.P_max - self.system.P_min)
 
     def _current_P(self):
@@ -947,7 +1006,7 @@ class MainWindow(QMainWindow):
         elif self._full_grid is not None:
             # T is the secondary slider and grid is cached — instant update.
             T_idx = int(np.argmin(np.abs(self._T_arr - T)))
-            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(N_P_STEPS)]
+            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(self._n_steps)]
             self._precomputed_Px = new_Px
             self._P_arr = np.array([r.P for r in new_Px])
             self.gx_canvas._y_lim = _compute_ylim(new_Px)
@@ -966,10 +1025,10 @@ class MainWindow(QMainWindow):
         T = self._current_T()
         if self._full_grid is not None:
             T_idx = int(np.argmin(np.abs(self._T_arr - T)))
-            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(N_P_STEPS)]
+            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(self._n_steps)]
         else:
             print(f'Recomputing P-x diagram at T = {T:.1f} K...', end=' ', flush=True)
-            new_Px = precompute_Px_diagram(self.system, T)
+            new_Px = precompute_Px_diagram(self.system, T, n_steps=self._n_steps)
             print('done.')
         self._precomputed_Px = new_Px
         self._P_arr = np.array([r.P for r in new_Px])
@@ -991,7 +1050,7 @@ class MainWindow(QMainWindow):
         elif self._full_grid is not None:
             # P is the secondary slider and grid is cached — instant update.
             P_idx = int(np.argmin(np.abs(self._P_arr - P)))
-            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(N_T_STEPS)]
+            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(self._n_steps)]
             self._precomputed_Tx = new_Tx
             self._T_arr = np.array([r.T for r in new_Tx])
             self.gx_canvas._y_lim = _compute_ylim(new_Tx)
@@ -1010,10 +1069,10 @@ class MainWindow(QMainWindow):
         P = self._P_from_tick(self.P_slider.value())
         if self._full_grid is not None:
             P_idx = int(np.argmin(np.abs(self._P_arr - P)))
-            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(N_T_STEPS)]
+            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(self._n_steps)]
         else:
             print(f'Recomputing T-x diagram at P = {P:.3g}...', end=' ', flush=True)
-            new_Tx = precompute_Tx_diagram(self.system, P)
+            new_Tx = precompute_Tx_diagram(self.system, P, n_steps=self._n_steps)
             print('done.')
         self._precomputed_Tx = new_Tx
         self._T_arr = np.array([r.T for r in new_Tx])
@@ -1124,12 +1183,12 @@ class MainWindow(QMainWindow):
         """Toggle pre-computation: start → pause → resume → (done)."""
         if self._worker_state == 'idle':
             # Start a fresh computation.
-            n_total = N_T_STEPS * N_P_STEPS
+            n_total = self._n_steps ** 2
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(True)
             self._precompute_status.setText('Computing... 0%')
-            T_values = np.linspace(self.system.T_max, self.system.T_min, N_T_STEPS)
-            P_values = np.linspace(self.system.P_max, self.system.P_min, N_P_STEPS)
+            T_values = np.linspace(self.system.T_max, self.system.T_min, self._n_steps)
+            P_values = np.linspace(self.system.P_max, self.system.P_min, self._n_steps)
             self._worker = FullGridWorker(self.system, T_values, P_values)
             self._worker.progress.connect(self._on_grid_progress)
             self._worker.finished.connect(self._on_grid_ready)
@@ -1158,10 +1217,64 @@ class MainWindow(QMainWindow):
         self._full_grid = grid
         self._worker_state = 'done'
         self._precompute_bar.setVisible(False)
-        n_total = N_T_STEPS * N_P_STEPS
+        n_total = self._n_steps ** 2
         self._precompute_status.setText(f'Cached ({n_total:,} evaluations)')
         self._precompute_btn.setText('Full T-P-x cached')
         self._precompute_btn.setEnabled(False)
+
+    def _on_resolution_changed(self, idx):
+        """Recompute diagrams at a new step count chosen from the resolution combo."""
+        n_steps = self._res_combo.itemData(idx)
+        if n_steps == self._n_steps:
+            return
+
+        # Abort any running background worker.
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.abort()
+            self._worker.wait()
+        self._worker = None
+        self._worker_state = 'idle'
+        self._full_grid = None
+
+        self._n_steps = n_steps
+
+        # Update P slider range to match the new step count (preserves current P value).
+        if self.P_slider is not None:
+            P_cur = self._current_P()
+            self.P_slider.setMaximum(n_steps - 1)
+            P_range = max(self.system.P_max - self.system.P_min, 1e-30)
+            P_frac = (P_cur - self.system.P_min) / P_range
+            self.P_slider.setValue(int(round(P_frac * (n_steps - 1))))
+
+        # Reset precompute button and progress bar.
+        if self._precompute_btn is not None:
+            self._precompute_btn.setText('Pre-compute full T-P-x')
+            self._precompute_btn.setEnabled(True)
+            self._precompute_bar.setRange(0, n_steps ** 2)
+            self._precompute_bar.setValue(0)
+            self._precompute_bar.setVisible(False)
+            self._precompute_status.setText('')
+
+        # Recompute T-x at the current P.
+        P = self._current_P() if self.P_slider is not None else 0.0
+        T = self._current_T()
+        self._precomputed_Tx = precompute_Tx_diagram(self.system, P, n_steps=n_steps)
+        self._T_arr = np.array([r.T for r in self._precomputed_Tx])
+        self.gx_canvas._y_lim = _compute_ylim(self._precomputed_Tx)
+
+        # Recompute P-x only if it was already lazily computed.
+        if self._precomputed_Px is not None:
+            self._precomputed_Px = precompute_Px_diagram(self.system, T, n_steps=n_steps)
+            self._P_arr = np.array([r.P for r in self._precomputed_Px])
+        elif self.system.has_pressure:
+            self._P_arr = np.linspace(self.system.P_max, self.system.P_min, n_steps)
+
+        # Redraw all canvases.
+        self.tx_canvas.reset(self._precomputed_Tx, current_T=T)
+        if self._precomputed_Px is not None and self.px_canvas is not None:
+            self.px_canvas.reset(self._precomputed_Px, current_P=P)
+        nearest = int(np.argmin(np.abs(self._T_arr - T)))
+        self.gx_canvas.redraw(self._precomputed_Tx[nearest])
 
     def closeEvent(self, event):
         """Abort any running/paused background worker before closing."""
@@ -1211,4 +1324,28 @@ def launch_ui(system):
     window = MainWindow(system, precomputed_Tx, precomputed_Px)
     window.resize(1200, 650)
     window.show()
+    sys.exit(app.exec())
+
+
+def _make_default_system():
+    """Return a minimal single-phase System for use when no input file is given."""
+    from pde_energy import HSModel
+    from pde_phase import Phase, System
+    liq = Phase('liquid', 'liquid',
+                HSModel([8.0, -2.0, 2.0], [0.01]),
+                0.0, 1.0)
+    return System(['A', 'B'], [liq], 'HS', 500, 1500, 1500, title='New System')
+
+
+def launch_ui_empty():
+    """Launch with a minimal default system and open the builder automatically."""
+    system = _make_default_system()
+    print('Pre-computing default phase diagram...', end=' ', flush=True)
+    precomputed_Tx = precompute_Tx_diagram(system)
+    print('done.')
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = MainWindow(system, precomputed_Tx)
+    window.resize(1200, 650)
+    window.show()
+    window._open_builder()   # auto-open builder with default system
     sys.exit(app.exec())

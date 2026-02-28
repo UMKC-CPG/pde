@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**PDE** (Phase Diagram Energy) is a Python tool for defining phase energy curves and visualizing the resulting phase diagrams. The intended output format is HDF5 + XDMF.
+**PDE** (Phase Diagram Explorer) is a Python tool for defining phase energy curves and visualizing the resulting phase diagrams. The intended output format is HDF5 + XDMF.
 
 ## Environment Setup
 
@@ -55,6 +55,7 @@ src/scripts/pde_energy.py   Energy model classes (HSModel, PolyModel)
 src/scripts/pde_phase.py    Phase and System data structures
 src/scripts/pde_compute.py  Equilibrium computation (convex hull) → EqResult
 src/scripts/pde_viz.py      PySide6 + matplotlib interactive UI
+src/scripts/pde_builder.py  Graphical input builder (QDialog) + data model
 src/scripts/pde.1.py        Standalone vedo + PySide6 prototype (not installed)
 .pde/pderc                  Bash environment setup script
 .pde/pderc.py               Python resource control file template
@@ -74,7 +75,7 @@ XML input
 
 - `ScriptSettings.__init__()` — loads `pderc.py`, parses CLI args (`-i`/`-o`), reconciles them, logs invocation to `command`.
 - `ScriptSettings.read_input_file()` — delegates to `pde_input.parse_system()`; stores the result as `self.system`.
-- `main()` — calls `settings.read_input_file()` then `start_program(settings)`.
+- `main()` — if input file exists, calls `settings.read_input_file()` then `start_program(settings)`; if the default `pde.in.xml` is absent, calls `pde_viz.launch_ui_empty()` which opens the main window with a default system and auto-opens the builder; if an explicit `-i` file is missing, prints an error and exits.
 - `start_program()` — calls `pde_viz.launch_ui(settings.system)`.
 
 ### `pde_input.py`
@@ -162,6 +163,32 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - Secondary slider (`sliderReleased`) → recomputes the opposite sweep at the new secondary value (or performs an instant index lookup if the full grid is cached). The cover is initialized at the current primary slider position, not reset to `T_initial`/`P_initial`.
 - `actionTriggered` signal connected to `_on_T_action` / `_on_P_action`: handles discrete slider actions (bar-click, arrow keys, Home/End) that do not fire `sliderReleased`. Uses `QTimer.singleShot(0, ...)` to defer into the event loop so `valueChanged` has already updated the slider value before the released handler reads it. `isSliderDown()` guards against double-firing during thumb drags.
 - Mode switch → cover is initialized at the current primary slider position.
+
+**`MainWindow` refactor for builder support:**
+- `__init__` delegates to `_init_system_state()` (sets all non-widget state) and `_build_central_widget()` (creates all Qt widgets/layouts/signals; calls `setCentralWidget()` so it can be safely called again on reload).
+- `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`.
+- `_open_builder()` — opens (or raises) the builder window; creates a new `BuilderWindow` each time the old one is not visible; connects its `system_applied` signal to `reload_system`.
+- **"Builder…" button** is always present in the top row (before the final stretch).
+- `launch_ui_empty()` / `_make_default_system()` — entry point when no input file is found; creates a single-liquid-phase default system and auto-opens the builder.
+
+### `pde_builder.py`
+
+Graphical input builder. Non-modal `QDialog`; emits `system_applied(System)` on Apply.
+
+**Data model (pure Python, no Qt):**
+- `PhaseData` — one phase: name, phase_type, xmin/xmax, ideal_gas, hs_H/S/V lists, poly list.
+- `SystemData` — full system fields (mirrors `System` + phase list). Methods:
+  - `to_system() → System` — build live objects using `pde_energy`/`pde_phase`.
+  - `to_xml_str() → str` — serialize to lxml XML parseable by `pde_input`.
+  - `from_system(cls, system)` — round-trip from live System.
+  - `from_xml(cls, path)` — delegate to `pde_input.parse_system()` then `from_system()`.
+
+**UI widgets:**
+- `_FloatSpinBox` — QDoubleSpinBox ±1e9, 6 decimals, step 0.001.
+- `CoeffRowWidget` — labelled row of float spinboxes with dynamic +/− buttons; `get_coeffs()`/`set_coeffs()`.
+- `PolyPhaseCoeffWidget` — 2D grid for polynomial coefficients (x-power rows × T-power columns); rows and columns dynamically resizable.
+- `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, ideal_gas, remove button) + QStackedWidget (HS page: H/S/V rows; poly page: PolyPhaseCoeffWidget); `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
+- `BuilderWindow(QDialog)` — top-level builder: system group (title, components, form), temperature group, pressure group, scroll area of `PhaseEditorWidget`s, Load XML / Save XML / Apply / Close buttons.
 
 ### `pde.1.py`
 

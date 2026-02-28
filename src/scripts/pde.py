@@ -135,11 +135,19 @@ def main():
     #   and parameters given by the user on the command line.
     settings = ScriptSettings()
 
-    # Parse the input file to build the thermodynamic system.
-    settings.read_input_file()
-
-    # Start executing the main activities of the program.
-    start_program(settings)
+    infile = settings.infile
+    if os.path.isfile(infile):
+        # Normal path: input file present → parse and visualize.
+        settings.read_input_file()
+        start_program(settings)
+    else:
+        if infile != 'pde.in.xml':
+            # User explicitly specified -i <file> but it doesn't exist → error.
+            print(f'Error: input file not found: {infile}', file=sys.stderr)
+            sys.exit(1)
+        # Default input file absent → open empty UI with builder.
+        from pde_viz import launch_ui_empty
+        launch_ui_empty()
 
     # Finalize the program activities and quit.
 

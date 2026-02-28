@@ -13,6 +13,7 @@ pde_phase.py
 pde_input.py
 pde_compute.py
 pde_viz.py
+pde_builder.py
 )
 
 install (PROGRAMS ${SCRIPTS} DESTINATION bin)
