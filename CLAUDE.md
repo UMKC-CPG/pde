@@ -82,9 +82,9 @@ XML input
 Parses the XML input file using `lxml.etree`. The system-level `<energy_form>` tag (`'HS'` or `'polynomial'`) selects which energy model parser is used for all phases; mixing forms within one file is not supported. Returns a `System` object.
 
 Optional XML elements parsed:
-- `<pressure>` block — sets `has_pressure`, `P_min`, `P_max`, `P_initial`, `R_gas`, `P_ref` on the System.
+- `<pressure>` block — sets pressure fields on the System (see `pde_phase.py`).
 - `<V x0=... x1=.../>` inside `<energy>` — optional molar volume polynomial for the PV term.
-- `ideal_gas="true"` attribute on `<phase>` — enables the R·T·ln(P/P°) ideal-gas correction.
+- `ideal_gas="true"` attribute on `<phase>` — enables the ideal-gas chemical potential term (see `pde_energy.py`).
 
 ### `pde_energy.py`
 
@@ -95,9 +95,9 @@ Abstract base `EnergyModel` with two concrete subclasses. All models accept an o
 
 Both use ascending-order coefficient conventions: `[c0, c1, c2, ...]` means `c0 + c1·x + c2·x² + ...`
 
-Pressure terms:
+Pressure terms (mutually exclusive for a pure gas — combining both double-counts):
 - `V_coeffs` present → adds `P·V(x)` (Poynting correction for condensed phases).
-- `ideal_gas=True` → adds `R_gas·T·ln(P/P_ref)` (ideal-gas chemical potential). Do **not** combine with `V_coeffs` for a pure ideal gas — that double-counts.
+- `ideal_gas=True` → adds `R_gas·T·ln(P/P_ref)` (ideal-gas chemical potential).
 - `R_gas`, `P_ref` are passed down from the system-level `<pressure>` block by the parser.
 
 ### `pde_phase.py`
@@ -143,7 +143,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - Right-clicking any canvas shows a context menu ("Legend position") listing all nine standard matplotlib locations; the current selection is checked. Choosing one moves the legend immediately. Each canvas stores its own `_legend_loc`; `GxCanvas` rerenders via `redraw()`, `TxCanvas`/`PxCanvas` call `legend.set_loc()` directly.
 
 **Two-phase region rendering:**
-- Drawn as 200 thin `broken_barh` strips (one per T/P step) with `linewidth=0` to suppress visible bar-boundary lines.
+- Drawn as one thin `broken_barh` strip per T/P step with `linewidth=0` to suppress visible bar-boundary lines.
 - When hatch is active: `edgecolors='black'` (hatch lines are drawn in the edge color by matplotlib; hatch line width comes from `rcParams['hatch.linewidth']`, not the patch `linewidth`).
 - When hatch is `''` (None): `edgecolors='none'` for a clean solid fill.
 - Legend swatch mirrors the same `edgecolor`/`linewidth` logic.
