@@ -125,13 +125,18 @@ Interactive PySide6 + matplotlib window with full pressure support:
 - **`TxCanvas`** (right, Fixed P mode): T-x phase diagram revealed incrementally top-down; white cover rectangle shrinks as T slider moves down (O(1) updates).
 - **`PxCanvas`** (right, Fixed T mode): P-x phase diagram, symmetric to `TxCanvas` but revealed bottom-up as P slider moves down. Created lazily on first mode switch.
 
+**Layout:**
+All controls sit in a single **top row** above the canvas area:
+`[Fixed P | Fixed T]` (if pressure) — `Reveal all` — `Colors…` — `[Pre-compute | Progress | Status]` (if pressure).
+Below the canvas: T slider row; then P slider row (when `has_pressure`).
+
 **Controls:**
 - **Mode selector** (only when `system.has_pressure`): "Fixed P (T-x)" / "Fixed T (P-x)" radio buttons swap the right canvas and reassign primary/secondary roles to the sliders.
 - **T slider**: integer kelvin ticks; always visible.
 - **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max.
 - **"Reveal all" checkbox**: when checked, hides the cover rectangle on both canvases so the full phase diagram is visible regardless of slider position. Unchecking restores the cover to the current slider position. State is preserved across diagram regens triggered by the secondary slider.
 - **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): launches `FullGridWorker` (a `QThread`) to compute the full N_T_STEPS × N_P_STEPS grid in the background. Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute).
-- **"Colors…" button**: opens `ColorDialog` — a non-modal dialog for per-phase color swatches, palette presets (`_PALETTES`), two-phase region color, and hatch style (`_HATCH_OPTIONS`). Changes apply live to all canvases.
+- **"Colors…" button**: opens `ColorDialog` — a non-modal dialog for per-phase color swatches, palette presets (`_PALETTES`), two-phase region color, and hatch style (`_HATCH_OPTIONS`). Changes apply live to all canvases. The palette dropdown defaults to `'Muted'`.
 
 **Legend positioning:**
 - Default location is `'upper left'` on all three canvases.
@@ -146,6 +151,7 @@ Interactive PySide6 + matplotlib window with full pressure support:
 **Slider interaction logic:**
 - Primary slider (`valueChanged`) → fast O(1) update: nearest pre-computed result looked up by index.
 - Secondary slider (`sliderReleased`) → recomputes the opposite sweep at the new secondary value (or performs an instant index lookup if the full grid is cached). The cover is initialized at the current primary slider position, not reset to `T_initial`/`P_initial`.
+- `actionTriggered` signal connected to `_on_T_action` / `_on_P_action`: handles discrete slider actions (bar-click, arrow keys, Home/End) that do not fire `sliderReleased`. Uses `QTimer.singleShot(0, ...)` to defer into the event loop so `valueChanged` has already updated the slider value before the released handler reads it. `isSliderDown()` guards against double-firing during thumb drags.
 - Mode switch → cover is initialized at the current primary slider position.
 
 ### `pde.1.py`

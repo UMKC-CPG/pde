@@ -34,7 +34,7 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch, Rectangle as MplRectangle
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                                 QColorDialog, QComboBox, QDialog, QGridLayout,
                                 QHBoxLayout, QLabel, QMainWindow, QMenu,
@@ -53,14 +53,14 @@ N_P_STEPS = 200     # pressure steps for the pre-computed P-x diagram
 
 # One colour per phase (assigned by position in system.phases)
 _COLOR_PALETTE = [
-    '#E8A020',  # amber  — gas
-    '#3A7DBC',  # blue   — liquid
-    '#C94040',  # red    — alpha
-    '#3AA85A',  # green  — beta
-    '#C9A030',  # gold   — gamma
-    '#8A40C9',  # purple — delta
-    '#C97030',  # orange — epsilon
-    '#40B8C9',  # teal   — zeta
+    '#4878CF',  # blue       — gas
+    '#6ACC65',  # green      — liquid
+    '#D65F5F',  # red        — alpha
+    '#B47CC7',  # purple     — beta
+    '#C4AD66',  # gold       — gamma
+    '#77BEDB',  # sky blue   — delta
+    '#8C8C8C',  # grey       — epsilon
+    '#A2C7A5',  # sage       — zeta
 ]
 
 _TWO_PHASE_COLOR = '#D8D8D8'    # light grey fill for two-phase regions
@@ -601,6 +601,7 @@ class ColorDialog(QDialog):
         self._palette_cb  = QComboBox()
         for name in _PALETTES:
             self._palette_cb.addItem(name)
+        self._palette_cb.setCurrentText('Muted')
         apply_btn = QPushButton('Apply palette')
         apply_btn.clicked.connect(self._on_apply_palette)
 
@@ -805,7 +806,6 @@ class MainWindow(QMainWindow):
 
         # ---- mode selector (only when has_pressure) ----
         self._mode_group = None
-        mode_row = None
         if system.has_pressure:
             radio_fixed_P = QRadioButton('Fixed P  (T-x)')
             radio_fixed_T = QRadioButton('Fixed T  (P-x)')
@@ -813,43 +813,12 @@ class MainWindow(QMainWindow):
             self._mode_group = QButtonGroup()
             self._mode_group.addButton(radio_fixed_P, 0)
             self._mode_group.addButton(radio_fixed_T, 1)
-            mode_row = QHBoxLayout()
-            mode_row.addStretch()
-            mode_row.addWidget(radio_fixed_P)
-            mode_row.addWidget(radio_fixed_T)
-            mode_row.addStretch()
 
-        # ---- layout ----
-        canvas_row = QHBoxLayout()
-        canvas_row.addWidget(self.gx_canvas)
-        canvas_row.addWidget(self._right_stack)
-
+        # ---- shared controls ----
         self._reveal_cb  = QCheckBox('Reveal all')
         self._colors_btn = QPushButton('Colors\u2026')
 
-        T_slider_row = QHBoxLayout()
-        T_slider_row.addWidget(QLabel(f'{system.T_min:.0f} K'))
-        T_slider_row.addWidget(self.T_slider)
-        T_slider_row.addWidget(QLabel(f'{system.T_max:.0f} K'))
-        T_slider_row.addWidget(self.T_label)
-        T_slider_row.addWidget(self._reveal_cb)
-        T_slider_row.addWidget(self._colors_btn)
-
-        root = QVBoxLayout()
-        if mode_row is not None:
-            root.addLayout(mode_row)
-        root.addLayout(canvas_row)
-        root.addLayout(T_slider_row)
-
-        if self.P_slider is not None:
-            P_slider_row = QHBoxLayout()
-            P_slider_row.addWidget(QLabel(f'{system.P_min:.3g}'))
-            P_slider_row.addWidget(self.P_slider)
-            P_slider_row.addWidget(QLabel(f'{system.P_max:.3g}'))
-            P_slider_row.addWidget(self.P_label)
-            root.addLayout(P_slider_row)
-
-        # ---- pre-compute row (only when pressure is active) ----
+        # ---- pre-compute widgets (only when pressure is active) ----
         self._precompute_btn    = None
         self._precompute_bar    = None
         self._precompute_status = None
@@ -862,11 +831,44 @@ class MainWindow(QMainWindow):
             self._precompute_bar.setVisible(False)
             self._precompute_status = QLabel('')
 
-            precompute_row = QHBoxLayout()
-            precompute_row.addWidget(self._precompute_btn)
-            precompute_row.addWidget(self._precompute_bar, stretch=1)
-            precompute_row.addWidget(self._precompute_status)
-            root.addLayout(precompute_row)
+        # ---- layout ----
+        # Top row: mode toggles (if pressure) | Reveal all | Colors… | precompute (if pressure)
+        top_row = QHBoxLayout()
+        if system.has_pressure:
+            top_row.addWidget(radio_fixed_P)
+            top_row.addWidget(radio_fixed_T)
+            top_row.addSpacing(16)
+        top_row.addWidget(self._reveal_cb)
+        top_row.addWidget(self._colors_btn)
+        if system.has_pressure:
+            top_row.addSpacing(16)
+            top_row.addWidget(self._precompute_btn)
+            top_row.addWidget(self._precompute_bar, stretch=1)
+            top_row.addWidget(self._precompute_status)
+        top_row.addStretch()
+
+        canvas_row = QHBoxLayout()
+        canvas_row.addWidget(self.gx_canvas)
+        canvas_row.addWidget(self._right_stack)
+
+        T_slider_row = QHBoxLayout()
+        T_slider_row.addWidget(QLabel(f'{system.T_min:.0f} K'))
+        T_slider_row.addWidget(self.T_slider)
+        T_slider_row.addWidget(QLabel(f'{system.T_max:.0f} K'))
+        T_slider_row.addWidget(self.T_label)
+
+        root = QVBoxLayout()
+        root.addLayout(top_row)
+        root.addLayout(canvas_row)
+        root.addLayout(T_slider_row)
+
+        if self.P_slider is not None:
+            P_slider_row = QHBoxLayout()
+            P_slider_row.addWidget(QLabel(f'{system.P_min:.3g}'))
+            P_slider_row.addWidget(self.P_slider)
+            P_slider_row.addWidget(QLabel(f'{system.P_max:.3g}'))
+            P_slider_row.addWidget(self.P_label)
+            root.addLayout(P_slider_row)
 
         container = QWidget()
         container.setLayout(root)
@@ -875,9 +877,11 @@ class MainWindow(QMainWindow):
         # ---- signal connections ----
         self.T_slider.valueChanged.connect(self._on_T_changed)
         self.T_slider.sliderReleased.connect(self._on_T_released)
+        self.T_slider.actionTriggered.connect(self._on_T_action)
         if self.P_slider is not None:
             self.P_slider.valueChanged.connect(self._on_P_changed)
             self.P_slider.sliderReleased.connect(self._on_P_released)
+            self.P_slider.actionTriggered.connect(self._on_P_action)
             self._mode_group.idClicked.connect(self._on_mode_changed)
         if self._precompute_btn is not None:
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
@@ -995,6 +999,27 @@ class MainWindow(QMainWindow):
         idx = int(np.argmin(np.abs(self._T_arr - T)))
         self.gx_canvas.redraw(new_Tx[idx])
         self.tx_canvas.set_cursor(T)
+
+    def _on_T_action(self, action):
+        """Trigger recompute on bar-click / key-press of the T slider.
+
+        Qt fires sliderReleased only at the end of a drag; for discrete
+        actions (page-step bar click, arrow keys, Home/End) it fires only
+        actionTriggered.  isSliderDown() is True only while the thumb is
+        held — False for bar clicks — so we use it to distinguish the two
+        cases without fragile enum comparisons.  We defer via singleShot so
+        that valueChanged has already updated the slider value before the
+        released handler reads _current_T().
+        """
+        if self.T_slider.isSliderDown():
+            return  # drag in progress — sliderReleased will handle it
+        QTimer.singleShot(0, self._on_T_released)
+
+    def _on_P_action(self, action):
+        """Trigger recompute on bar-click / key-press of the P slider."""
+        if self.P_slider.isSliderDown():
+            return  # drag in progress — sliderReleased will handle it
+        QTimer.singleShot(0, self._on_P_released)
 
     def _on_mode_changed(self, button_id):
         if button_id == 0:
