@@ -83,6 +83,7 @@ Parses the XML input file using `lxml.etree`. The system-level `<energy_form>` t
 
 Optional XML elements parsed:
 - `<pressure>` block — sets pressure fields on the System (see `pde_phase.py`).
+  - `<unit>` child (e.g. `<unit>atm</unit>`) — optional pressure unit string displayed in slider labels; omitting it leaves labels as bare numbers.
 - `<V x0=... x1=.../>` inside `<energy>` — optional molar volume polynomial for the PV term.
 - `ideal_gas="true"` attribute on `<phase>` — enables the ideal-gas chemical potential term (see `pde_energy.py`).
 
@@ -103,7 +104,7 @@ Pressure terms (mutually exclusive for a pure gas — combining both double-coun
 ### `pde_phase.py`
 
 - **`Phase`** — name, phase_type (`'gas'`, `'liquid'`, `'solid'`, `'end_member'`), energy model, xmin/xmax. Key methods: `gibbs(x, T, P=0.0)`, `composition_grid(n_points=500)`, `is_point` (property, True when xmin==xmax).
-- **`System`** — components list, all phases, energy_form, T_min/T_max/T_initial, plus pressure fields: `has_pressure`, `P_min`, `P_max`, `P_initial`, `R_gas`, `P_ref`. Convenience properties: `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`.
+- **`System`** — components list, all phases, energy_form, T_min/T_max/T_initial, plus pressure fields: `has_pressure`, `P_min`, `P_max`, `P_initial`, `R_gas`, `P_ref`, `P_unit` (str, `''` if unspecified). Convenience properties: `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`.
 
 ### `pde_compute.py`
 
@@ -133,7 +134,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 **Controls:**
 - **Mode selector** (only when `system.has_pressure`): "Fixed P (T-x)" / "Fixed T (P-x)" radio buttons swap the right canvas and reassign primary/secondary roles to the sliders.
 - **T slider**: integer kelvin ticks; always visible.
-- **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max.
+- **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max. Endpoint labels and live label include `system.P_unit` (e.g. "0.5 atm" / "5 atm" / "P = 2 atm"); bare numbers when `P_unit=''`.
 - **"Reveal all" checkbox**: when checked, hides the cover rectangle on both canvases so the full phase diagram is visible regardless of slider position. Unchecking restores the cover to the current slider position. State is preserved across diagram regens triggered by the secondary slider.
 - **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): launches `FullGridWorker` (a `QThread`) to compute the full N_T_STEPS × N_P_STEPS grid in the background. Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute).
 - **"Colors…" button**: opens `ColorDialog` — a non-modal dialog for per-phase color swatches, palette presets (`_PALETTES`), two-phase region color, and hatch style (`_HATCH_OPTIONS`). Changes apply live to all canvases. The palette dropdown defaults to `'Muted'`.
