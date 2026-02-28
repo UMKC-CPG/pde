@@ -28,7 +28,7 @@ from lxml import etree
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QScrollArea, QStackedWidget,
     QVBoxLayout, QWidget,
 )
@@ -275,31 +275,47 @@ class _FloatSpinBox(QDoubleSpinBox):
         self.setRange(-1e9, 1e9)
         self.setDecimals(6)
         self.setSingleStep(0.001)
-        self.setMinimumWidth(90)
+        self.setMinimumWidth(70)
 
 
 class CoeffRowWidget(QWidget):
     """One labelled row of coefficient spinboxes with dynamic +/- buttons.
 
-    Layout:  [label]  [c0]  [c1]  …  [+]  [−]
+    If *coeff_name* is given (e.g. ``'H'``), Unicode subscript headers
+    (H₀, H₁, H₂, …) are shown above each spinbox so the user can see which
+    coefficient of the polynomial each spinbox represents.
+
+    Layout without coeff_name:
+        [label]  [c0]  [c1]  …  [+]  [−]
+
+    Layout with coeff_name='H', label='H(x) =':
+        H(x) =    H₀        H₁        H₂       [+] [−]
+                [spinbox] [spinbox] [spinbox]
     """
 
-    def __init__(self, label, coeffs=None, parent=None):
-        super().__init__(parent)
-        self._spinboxes = []
+    _SUB = str.maketrans('0123456789', '₀₁₂₃₄₅₆₇₈₉')
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+    def __init__(self, label, coeffs=None, coeff_name='', parent=None):
+        super().__init__(parent)
+        self._spinboxes  = []
+        self._sub_labels = []
+        self._coeff_name = coeff_name
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
 
         lbl = QLabel(label)
-        lbl.setMinimumWidth(20)
-        layout.addWidget(lbl)
+        lbl.setMinimumWidth(52)
+        outer.addWidget(lbl)
 
+        # Spin grid: row 0 = subscript labels (when coeff_name is set),
+        #            row 1 = spinboxes  (row 0 when coeff_name is empty)
         self._spin_container = QWidget()
-        self._spin_layout = QHBoxLayout(self._spin_container)
+        self._spin_layout = QGridLayout(self._spin_container)
         self._spin_layout.setContentsMargins(0, 0, 0, 0)
         self._spin_layout.setSpacing(2)
-        layout.addWidget(self._spin_container)
+        outer.addWidget(self._spin_container)
 
         add_btn = QPushButton('+')
         rem_btn = QPushButton('\u2212')   # minus sign
@@ -309,16 +325,26 @@ class CoeffRowWidget(QWidget):
         rem_btn.setToolTip('Remove last coefficient')
         add_btn.clicked.connect(lambda: self._add_spinbox(0.0))
         rem_btn.clicked.connect(self._remove_spinbox)
-        layout.addWidget(add_btn)
-        layout.addWidget(rem_btn)
+        outer.addWidget(add_btn)
+        outer.addWidget(rem_btn)
 
         for c in (coeffs or [0.0]):
             self._add_spinbox(float(c))
 
     def _add_spinbox(self, value=0.0):
+        col = len(self._spinboxes)
+        if self._coeff_name:
+            sub_text = self._coeff_name + str(col).translate(self._SUB)
+            lbl = QLabel(sub_text)
+            lbl.setAlignment(Qt.AlignCenter)
+            self._spin_layout.addWidget(lbl, 0, col)
+            self._sub_labels.append(lbl)
+            spin_row = 1
+        else:
+            spin_row = 0
         sb = _FloatSpinBox()
         sb.setValue(value)
-        self._spin_layout.addWidget(sb)
+        self._spin_layout.addWidget(sb, spin_row, col)
         self._spinboxes.append(sb)
 
     def _remove_spinbox(self):
@@ -326,6 +352,10 @@ class CoeffRowWidget(QWidget):
             sb = self._spinboxes.pop()
             self._spin_layout.removeWidget(sb)
             sb.setParent(None)
+            if self._coeff_name and self._sub_labels:
+                lbl = self._sub_labels.pop()
+                self._spin_layout.removeWidget(lbl)
+                lbl.setParent(None)
 
     def get_coeffs(self):
         return [sb.value() for sb in self._spinboxes]
@@ -364,7 +394,6 @@ class PolyPhaseCoeffWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
 
         self._grid_widget = QWidget()
-        from PySide6.QtWidgets import QGridLayout
         self._grid = QGridLayout(self._grid_widget)
         self._grid.setSpacing(2)
         root.addWidget(self._grid_widget)
@@ -540,11 +569,18 @@ class PhaseEditorWidget(QFrame):
         hs_widget = QWidget()
         hs_layout = QVBoxLayout(hs_widget)
         hs_layout.setContentsMargins(0, 0, 0, 0)
-        hs_layout.setSpacing(2)
-        self._H_row = CoeffRowWidget('H:', [0.0])
-        self._S_row = CoeffRowWidget('S:', [0.0])
-        self._V_enable_cb = QCheckBox('Enable PV term (V coeff.):')
-        self._V_row = CoeffRowWidget('V:', [0.0])
+        hs_layout.setSpacing(4)
+        # Hint: show the polynomial form so users see what each coefficient means
+        hint_lbl = QLabel(
+            'H(x) = H\u2080 + H\u2081\u00b7x + H\u2082\u00b7x\u00b2 + \u2026'
+            '   \u2502   '
+            'S(x) = S\u2080 + S\u2081\u00b7x + S\u2082\u00b7x\u00b2 + \u2026')
+        hint_lbl.setStyleSheet('color: #777; font-style: italic;')
+        hs_layout.addWidget(hint_lbl)
+        self._H_row = CoeffRowWidget('H(x) =', [0.0], coeff_name='H')
+        self._S_row = CoeffRowWidget('S(x) =', [0.0], coeff_name='S')
+        self._V_enable_cb = QCheckBox('Enable PV term:')
+        self._V_row = CoeffRowWidget('V(x) =', [0.0], coeff_name='V')
         self._V_row.setVisible(False)
         self._V_enable_cb.toggled.connect(self._V_row.setVisible)
         hs_layout.addWidget(self._H_row)

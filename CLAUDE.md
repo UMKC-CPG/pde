@@ -185,9 +185,9 @@ Graphical input builder. Non-modal `QDialog`; emits `system_applied(System)` on 
 
 **UI widgets:**
 - `_FloatSpinBox` — QDoubleSpinBox ±1e9, 6 decimals, step 0.001.
-- `CoeffRowWidget` — labelled row of float spinboxes with dynamic +/− buttons; `get_coeffs()`/`set_coeffs()`.
+- `CoeffRowWidget` — labelled row of float spinboxes with dynamic +/− buttons; `get_coeffs()`/`set_coeffs()`. Optional `coeff_name` parameter (e.g. `'H'`) adds Unicode subscript headers (H₀, H₁, H₂, …) above each spinbox using a two-row `QGridLayout` (row 0 = subscript labels, row 1 = spinboxes).
 - `PolyPhaseCoeffWidget` — 2D grid for polynomial coefficients (x-power rows × T-power columns); rows and columns dynamically resizable.
-- `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, ideal_gas, remove button) + QStackedWidget (HS page: H/S/V rows; poly page: PolyPhaseCoeffWidget); `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
+- `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, ideal_gas, remove button) + QStackedWidget (HS page: H/S/V rows with subscript headers and italic polynomial hint label; poly page: PolyPhaseCoeffWidget); `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
 - `BuilderWindow(QDialog)` — top-level builder: system group (title, components, form), temperature group, pressure group, scroll area of `PhaseEditorWidget`s, Load XML / Save XML / Apply / Close buttons.
 
 ### `pde.1.py`
