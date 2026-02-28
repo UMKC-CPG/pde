@@ -55,6 +55,7 @@
     <initial>2.0</initial>
     <R_gas>8.314e-3</R_gas>
     <P_ref>1.0</P_ref>
+    <unit>atm</unit>
   </pressure>
 
   <!-- Vapor phase: ideal gas.  Pressure dependence comes entirely from

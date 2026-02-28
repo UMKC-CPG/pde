@@ -801,7 +801,7 @@ class MainWindow(QMainWindow):
             P_range = max(system.P_max - system.P_min, 1e-30)
             P_frac = (system.P_initial - system.P_min) / P_range
             self.P_slider.setValue(int(round(P_frac * (N_P_STEPS - 1))))
-            self.P_label = QLabel(f'P = {system.P_initial:.3g}')
+            self.P_label = QLabel(f'P = {system.P_initial:.3g} {system.P_unit}'.strip())
             self.P_label.setMinimumWidth(90)
 
         # ---- mode selector (only when has_pressure) ----
@@ -864,9 +864,9 @@ class MainWindow(QMainWindow):
 
         if self.P_slider is not None:
             P_slider_row = QHBoxLayout()
-            P_slider_row.addWidget(QLabel(f'{system.P_min:.3g}'))
+            P_slider_row.addWidget(QLabel(f'{system.P_min:.3g} {system.P_unit}'.strip()))
             P_slider_row.addWidget(self.P_slider)
-            P_slider_row.addWidget(QLabel(f'{system.P_max:.3g}'))
+            P_slider_row.addWidget(QLabel(f'{system.P_max:.3g} {system.P_unit}'.strip()))
             P_slider_row.addWidget(self.P_label)
             root.addLayout(P_slider_row)
 
@@ -958,7 +958,7 @@ class MainWindow(QMainWindow):
 
     def _on_P_changed(self, tick):
         P = self._P_from_tick(tick)
-        self.P_label.setText(f'P = {P:.3g}')
+        self.P_label.setText(f'P = {P:.3g} {self.system.P_unit}'.strip())
         if self._mode == 'fixed_T':
             # P is the primary slider — fast O(1) canvas update.
             idx = int(np.argmin(np.abs(self._P_arr - P)))

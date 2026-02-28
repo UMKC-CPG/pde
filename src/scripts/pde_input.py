@@ -236,11 +236,14 @@ def parse_system(infile):
         R_gas = float(R_gas_el.text) if R_gas_el is not None else 0.0
         P_ref_el = pres_el.find('P_ref')
         P_ref = float(P_ref_el.text) if P_ref_el is not None else 1.0
+        unit_el = pres_el.find('unit')
+        P_unit = unit_el.text.strip() if unit_el is not None else ''
     else:
         has_pressure = False
         P_min = P_max = P_initial = 1.0
         R_gas = 0.0
         P_ref = 1.0
+        P_unit = ''
 
     # Phases (preserve document order)
     phases = [_parse_phase(ph_el, energy_form, R_gas, P_ref)
@@ -259,4 +262,5 @@ def parse_system(infile):
         P_initial=P_initial,
         R_gas=R_gas,
         P_ref=P_ref,
+        P_unit=P_unit,
     )

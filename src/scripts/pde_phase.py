@@ -62,12 +62,13 @@ class System:
     P_initial    : float       — starting pressure for the visualization
     R_gas        : float       — gas constant in user energy units (0 → inactive)
     P_ref        : float       — reference pressure for ideal-gas term
+    P_unit       : str         — pressure unit label (e.g. 'atm'); '' if unspecified
     """
 
     def __init__(self, components, phases, energy_form, T_min, T_max, T_initial,
                  has_pressure=False,
                  P_min=1.0, P_max=1.0, P_initial=1.0,
-                 R_gas=0.0, P_ref=1.0):
+                 R_gas=0.0, P_ref=1.0, P_unit=''):
         self.components = components
         self.phases = phases
         self.energy_form = energy_form
@@ -80,6 +81,7 @@ class System:
         self.P_initial = P_initial
         self.R_gas = R_gas
         self.P_ref = P_ref
+        self.P_unit = P_unit
 
     @property
     def n_components(self):
