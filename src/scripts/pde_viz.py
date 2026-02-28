@@ -36,10 +36,10 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch, Rectangle as MplRectangle
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox,
                                 QColorDialog, QComboBox, QDialog, QGridLayout,
                                 QHBoxLayout, QLabel, QMainWindow, QMenu,
-                                QProgressBar, QPushButton, QRadioButton,
+                                QProgressBar, QPushButton,
                                 QSlider, QStackedWidget, QVBoxLayout, QWidget)
 
 from pde_compute import compute_equilibrium
@@ -845,14 +845,12 @@ class MainWindow(QMainWindow):
             self.P_label.setMinimumWidth(90)
 
         # ---- mode selector (only when has_pressure) ----
-        self._mode_group = None
+        self._mode_combo = None
         if system.has_pressure:
-            radio_fixed_P = QRadioButton('Fixed P  (T-x)')
-            radio_fixed_T = QRadioButton('Fixed T  (P-x)')
-            radio_fixed_P.setChecked(True)
-            self._mode_group = QButtonGroup()
-            self._mode_group.addButton(radio_fixed_P, 0)
-            self._mode_group.addButton(radio_fixed_T, 1)
+            self._mode_combo = QComboBox()
+            self._mode_combo.addItem('Fixed P  (T-x)')   # index 0
+            self._mode_combo.addItem('Fixed T  (P-x)')   # index 1
+            self._mode_combo.setCurrentIndex(0)
 
         # ---- shared controls ----
         self._reveal_cb  = QCheckBox('Reveal all')
@@ -882,11 +880,12 @@ class MainWindow(QMainWindow):
         self._builder_btn.clicked.connect(self._open_builder)
 
         # ---- layout ----
-        # Top row: mode toggles (if pressure) | Reveal all | Colors… | precompute (if pressure) | Builder…
+        # Top row: Builder… | mode combo (if pressure) | Reveal all | Colors… | Resolution | precompute (if pressure)
         top_row = QHBoxLayout()
+        top_row.addWidget(self._builder_btn)
+        top_row.addSpacing(16)
         if system.has_pressure:
-            top_row.addWidget(radio_fixed_P)
-            top_row.addWidget(radio_fixed_T)
+            top_row.addWidget(self._mode_combo)
             top_row.addSpacing(16)
         top_row.addWidget(self._reveal_cb)
         top_row.addWidget(self._colors_btn)
@@ -898,8 +897,6 @@ class MainWindow(QMainWindow):
             top_row.addWidget(self._precompute_btn)
             top_row.addWidget(self._precompute_bar, stretch=1)
             top_row.addWidget(self._precompute_status)
-        top_row.addSpacing(16)
-        top_row.addWidget(self._builder_btn)
         top_row.addStretch()
 
         canvas_row = QHBoxLayout()
@@ -937,7 +934,7 @@ class MainWindow(QMainWindow):
             self.P_slider.valueChanged.connect(self._on_P_changed)
             self.P_slider.sliderReleased.connect(self._on_P_released)
             self.P_slider.actionTriggered.connect(self._on_P_action)
-            self._mode_group.idClicked.connect(self._on_mode_changed)
+            self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         if self._precompute_btn is not None:
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
         self._reveal_cb.toggled.connect(self._on_reveal_all_toggled)
