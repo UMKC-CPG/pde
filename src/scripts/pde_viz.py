@@ -29,6 +29,7 @@ Strategy
 """
 
 import sys
+import threading
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -544,16 +545,35 @@ class PxCanvas(FigureCanvasQTAgg):
 # ---------------------------------------------------------------------------
 
 class FullGridWorker(QThread):
-    """Compute the full N_T_STEPS × N_P_STEPS grid in a background thread."""
+    """Compute the full N_T_STEPS × N_P_STEPS grid in a background thread.
+
+    Supports pause/resume via a threading.Event and clean abort via a flag.
+    """
 
     progress = Signal(int, int)   # (n_done, n_total)
     finished = Signal(object)     # grid: list[list[EqResult]]
 
     def __init__(self, system, T_values, P_values):
         super().__init__()
-        self._system   = system
-        self._T_values = T_values
-        self._P_values = P_values
+        self._system      = system
+        self._T_values    = T_values
+        self._P_values    = P_values
+        self._run_event   = threading.Event()
+        self._run_event.set()   # start in the running state
+        self._abort       = False
+
+    def pause(self):
+        """Block the worker at the next loop iteration."""
+        self._run_event.clear()
+
+    def resume(self):
+        """Unblock the worker."""
+        self._run_event.set()
+
+    def abort(self):
+        """Ask the worker to stop; unblocks it if currently paused."""
+        self._abort = True
+        self._run_event.set()
 
     def run(self):
         n_total = len(self._T_values) * len(self._P_values)
@@ -562,6 +582,9 @@ class FullGridWorker(QThread):
         for T in self._T_values:        # outer: N_T_STEPS rows
             row = []
             for P in self._P_values:    # inner: N_P_STEPS cols
+                self._run_event.wait()  # blocks here while paused
+                if self._abort:
+                    return
                 row.append(compute_equilibrium(self._system, T, P))
                 done += 1
                 self.progress.emit(done, n_total)
@@ -750,8 +773,9 @@ class MainWindow(QMainWindow):
         self._mode = 'fixed_P'
 
         # Full T-P-x grid cache (None until background worker finishes).
-        self._full_grid = None
-        self._worker    = None   # kept alive to prevent GC during thread run
+        self._full_grid    = None
+        self._worker       = None   # kept alive to prevent GC during thread run
+        self._worker_state = 'idle'  # 'idle' | 'running' | 'paused' | 'done'
 
         # ---- shared color state (shared dict propagates to all canvases) ----
         self._colors          = _color_map(system.phases)
@@ -1097,20 +1121,33 @@ class MainWindow(QMainWindow):
         self._color_dialog.show()
 
     def _on_precompute_clicked(self):
-        """Start background computation of the full T-P-x grid."""
-        self._precompute_btn.setEnabled(False)
-        n_total = N_T_STEPS * N_P_STEPS
-        self._precompute_bar.setValue(0)
-        self._precompute_bar.setVisible(True)
-        self._precompute_status.setText('Computing... 0%')
+        """Toggle pre-computation: start → pause → resume → (done)."""
+        if self._worker_state == 'idle':
+            # Start a fresh computation.
+            n_total = N_T_STEPS * N_P_STEPS
+            self._precompute_bar.setValue(0)
+            self._precompute_bar.setVisible(True)
+            self._precompute_status.setText('Computing... 0%')
+            T_values = np.linspace(self.system.T_max, self.system.T_min, N_T_STEPS)
+            P_values = np.linspace(self.system.P_max, self.system.P_min, N_P_STEPS)
+            self._worker = FullGridWorker(self.system, T_values, P_values)
+            self._worker.progress.connect(self._on_grid_progress)
+            self._worker.finished.connect(self._on_grid_ready)
+            self._worker.start()
+            self._worker_state = 'running'
+            self._precompute_btn.setText('Pause Computation')
 
-        T_values = np.linspace(self.system.T_max, self.system.T_min, N_T_STEPS)
-        P_values = np.linspace(self.system.P_max, self.system.P_min, N_P_STEPS)
+        elif self._worker_state == 'running':
+            # Pause the running worker.
+            self._worker.pause()
+            self._worker_state = 'paused'
+            self._precompute_btn.setText('Restart Computation')
 
-        self._worker = FullGridWorker(self.system, T_values, P_values)
-        self._worker.progress.connect(self._on_grid_progress)
-        self._worker.finished.connect(self._on_grid_ready)
-        self._worker.start()
+        elif self._worker_state == 'paused':
+            # Resume from where we left off.
+            self._worker.resume()
+            self._worker_state = 'running'
+            self._precompute_btn.setText('Pause Computation')
 
     def _on_grid_progress(self, done, total):
         self._precompute_bar.setValue(done)
@@ -1119,10 +1156,19 @@ class MainWindow(QMainWindow):
 
     def _on_grid_ready(self, grid):
         self._full_grid = grid
+        self._worker_state = 'done'
         self._precompute_bar.setVisible(False)
         n_total = N_T_STEPS * N_P_STEPS
         self._precompute_status.setText(f'Cached ({n_total:,} evaluations)')
         self._precompute_btn.setText('Full T-P-x cached')
+        self._precompute_btn.setEnabled(False)
+
+    def closeEvent(self, event):
+        """Abort any running/paused background worker before closing."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.abort()
+            self._worker.wait()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
