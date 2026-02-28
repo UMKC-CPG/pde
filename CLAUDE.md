@@ -82,6 +82,7 @@ XML input
 Parses the XML input file using `lxml.etree`. The system-level `<energy_form>` tag (`'HS'` or `'polynomial'`) selects which energy model parser is used for all phases; mixing forms within one file is not supported. Returns a `System` object.
 
 Optional XML elements parsed:
+- `<title>` — optional top-level element; sets the window title bar text. If absent, the title is derived from the input filename with path and extensions (`.xml`, `.in`) stripped (e.g. `pde.in.xml` → `pde`, `isomorphous.xml` → `isomorphous`).
 - `<pressure>` block — sets pressure fields on the System (see `pde_phase.py`).
   - `<unit>` child (e.g. `<unit>atm</unit>`) — optional pressure unit string displayed in slider labels; omitting it leaves labels as bare numbers.
 - `<V x0=... x1=.../>` inside `<energy>` — optional molar volume polynomial for the PV term.
@@ -104,7 +105,7 @@ Pressure terms (mutually exclusive for a pure gas — combining both double-coun
 ### `pde_phase.py`
 
 - **`Phase`** — name, phase_type (`'gas'`, `'liquid'`, `'solid'`, `'end_member'`), energy model, xmin/xmax. Key methods: `gibbs(x, T, P=0.0)`, `composition_grid(n_points=500)`, `is_point` (property, True when xmin==xmax).
-- **`System`** — components list, all phases, energy_form, T_min/T_max/T_initial, plus pressure fields: `has_pressure`, `P_min`, `P_max`, `P_initial`, `R_gas`, `P_ref`, `P_unit` (str, `''` if unspecified). Convenience properties: `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`.
+- **`System`** — components list, all phases, energy_form, T_min/T_max/T_initial, plus pressure fields: `has_pressure`, `P_min`, `P_max`, `P_initial`, `R_gas`, `P_ref`, `P_unit` (str, `''` if unspecified), and `title` (str, `''` if unset — viz derives title from filename in that case). Convenience properties: `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`.
 
 ### `pde_compute.py`
 
@@ -136,7 +137,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - **T slider**: integer kelvin ticks; always visible.
 - **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max. Endpoint labels and live label include `system.P_unit` (e.g. "0.5 atm" / "5 atm" / "P = 2 atm"); bare numbers when `P_unit=''`.
 - **"Reveal all" checkbox**: when checked, hides the cover rectangle on both canvases so the full phase diagram is visible regardless of slider position. Unchecking restores the cover to the current slider position. State is preserved across diagram regens triggered by the secondary slider.
-- **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): launches `FullGridWorker` (a `QThread`) to compute the full N_T_STEPS × N_P_STEPS grid in the background. Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute).
+- **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): toggles background computation of the full N_T_STEPS × N_P_STEPS grid. Label cycles: "Pre-compute full T-P-x" → "Pause Computation" → "Restart Computation" → (repeats) → "Full T-P-x cached" (disabled when done). Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute). While paused or in-progress, the secondary slider falls back to on-demand recompute (unchanged from no-grid behavior).
 - **"Colors…" button**: opens `ColorDialog` — a non-modal dialog for per-phase color swatches, palette presets (`_PALETTES`), two-phase region color, and hatch style (`_HATCH_OPTIONS`). Changes apply live to all canvases. The palette dropdown defaults to `'Muted'`.
 
 **Legend positioning:**
@@ -148,6 +149,13 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - When hatch is active: `edgecolors='black'` (hatch lines are drawn in the edge color by matplotlib; hatch line width comes from `rcParams['hatch.linewidth']`, not the patch `linewidth`).
 - When hatch is `''` (None): `edgecolors='none'` for a clean solid fill.
 - Legend swatch mirrors the same `edgecolor`/`linewidth` logic.
+
+**`FullGridWorker` internals:**
+- `threading.Event` (`_run_event`, initially set) + `_abort` flag.
+- `run()` calls `_run_event.wait()` then checks `_abort` before each `compute_equilibrium` call — blocks immediately on pause, negligible overhead when running.
+- `pause()` clears the event; `resume()` sets it; `abort()` sets `_abort=True` then sets the event (unblocks a paused worker).
+- `MainWindow._worker_state`: `'idle'` → `'running'` → `'paused'` ↔ `'running'` → `'done'`.
+- `MainWindow.closeEvent` calls `abort()` + `wait()` before window teardown.
 
 **Slider interaction logic:**
 - Primary slider (`valueChanged`) → fast O(1) update: nearest pre-computed result looked up by index.

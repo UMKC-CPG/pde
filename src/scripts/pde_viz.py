@@ -753,7 +753,7 @@ class MainWindow(QMainWindow):
     def __init__(self, system, precomputed_Tx, precomputed_Px=None):
         super().__init__()
         self.system = system
-        self.setWindowTitle('PDE — Phase Diagram Energy')
+        self.setWindowTitle(system.title)
 
         self._precomputed_Tx = precomputed_Tx
         self._precomputed_Px = precomputed_Px

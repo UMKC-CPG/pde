@@ -61,6 +61,8 @@ Coefficient conventions (both forms)
   T-polynomial ascending order: a0 is the constant term, a1 the linear, etc.
 """
 
+import pathlib
+
 from lxml import etree
 
 from pde_energy import HSModel, PolyModel
@@ -245,6 +247,17 @@ def parse_system(infile):
         P_ref = 1.0
         P_unit = ''
 
+    # Title (optional <title> element; fall back to stripped filename)
+    title_el = root.find('title')
+    if title_el is not None and title_el.text:
+        title = title_el.text.strip()
+    else:
+        name = pathlib.Path(infile).name
+        for ext in ('.xml', '.in'):
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+        title = name
+
     # Phases (preserve document order)
     phases = [_parse_phase(ph_el, energy_form, R_gas, P_ref)
               for ph_el in root.findall('phase')]
@@ -263,4 +276,5 @@ def parse_system(infile):
         R_gas=R_gas,
         P_ref=P_ref,
         P_unit=P_unit,
+        title=title,
     )

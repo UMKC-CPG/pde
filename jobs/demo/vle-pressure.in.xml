@@ -38,6 +38,8 @@
 -->
 <pde>
 
+  <title>Vapor-Liquid Equilibrium (A-B, variable P)</title>
+
   <system>
     <components>A B</components>
     <energy_form>HS</energy_form>
