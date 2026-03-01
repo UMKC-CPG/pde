@@ -1220,6 +1220,7 @@ class MainWindow(QMainWindow):
         self._full_grid    = None
         self._worker       = None
         self._worker_state = 'idle'
+        self._viz3d_window = None
 
         self._colors          = _color_map(system.phases)
         self._two_phase_color = _TWO_PHASE_COLOR
@@ -1315,11 +1316,24 @@ class MainWindow(QMainWindow):
         self._builder_btn = QPushButton('Builder\u2026')
         self._builder_btn.clicked.connect(self._open_builder)
 
+        # ---- 3D View button (only when has_pressure) ----
+        self._viz3d_btn = None
+        if system.has_pressure:
+            self._viz3d_btn = QPushButton('3D View\u2026')
+            self._viz3d_btn.setEnabled(self._full_grid is not None)
+            self._viz3d_btn.setToolTip(
+                'Opens 3D T-P-x phase diagram.\n'
+                'Requires full grid \u2014 click \u201cPre-compute full T-P-x\u201d first.'
+            )
+
         # ---- layout ----
-        # Top row: Builder… | mode combo (if pressure) | Reveal all | Colors… | Resolution | precompute (if pressure)
+        # Top row: Builder… | 3D View… (if pressure) | mode combo (if pressure) | Reveal all | Colors… | Resolution | precompute (if pressure)
         top_row = QHBoxLayout()
         top_row.addWidget(self._builder_btn)
         top_row.addSpacing(16)
+        if self._viz3d_btn is not None:
+            top_row.addWidget(self._viz3d_btn)
+            top_row.addSpacing(8)
         if system.has_pressure:
             top_row.addWidget(self._mode_combo)
             top_row.addSpacing(16)
@@ -1373,6 +1387,8 @@ class MainWindow(QMainWindow):
             self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         if self._precompute_btn is not None:
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
+        if self._viz3d_btn is not None:
+            self._viz3d_btn.clicked.connect(self._on_3d_view_clicked)
         self._reveal_cb.toggled.connect(self._on_reveal_all_toggled)
         self._colors_btn.clicked.connect(self._on_colors_clicked)
         self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
@@ -1391,6 +1407,9 @@ class MainWindow(QMainWindow):
             self._worker.wait()
         if self._color_dialog is not None:
             self._color_dialog.close()
+        if self._viz3d_window is not None:
+            self._viz3d_window.close()
+            self._viz3d_window = None
         print('Applying builder changes...', end=' ', flush=True)
         P = system.P_initial if system.has_pressure else 0.0
         precomputed_Tx = precompute_Tx_diagram(system, P)
@@ -1433,6 +1452,18 @@ class MainWindow(QMainWindow):
 
         self._builder.raise_()
         self._builder.show()
+
+    def _on_3d_view_clicked(self):
+        """Open (or raise) the 3D T-P-x phase diagram window."""
+        if (self._viz3d_window is not None
+                and self._viz3d_window.isVisible()):
+            self._viz3d_window.raise_()
+            return
+        from pde_3d import PhaseDiagram3D, Viz3DWindow
+        diagram = PhaseDiagram3D.from_grid(
+            self._full_grid, self._T_arr, self._P_arr, self.system)
+        self._viz3d_window = Viz3DWindow(diagram, colors=self._colors)
+        self._viz3d_window.show()
 
     def _on_builder_closed(self, result=None):
         """Deactivate handle-drag edit mode when the builder window closes."""
@@ -1715,6 +1746,8 @@ class MainWindow(QMainWindow):
         self._precompute_status.setText(f'Cached ({n_total:,} evaluations)')
         self._precompute_btn.setText('Full T-P-x cached')
         self._precompute_btn.setEnabled(False)
+        if self._viz3d_btn is not None:
+            self._viz3d_btn.setEnabled(True)
 
     def _on_resolution_changed(self, idx):
         """Recompute diagrams at a new step count chosen from the resolution combo."""
@@ -1748,6 +1781,8 @@ class MainWindow(QMainWindow):
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(False)
             self._precompute_status.setText('')
+        if self._viz3d_btn is not None:
+            self._viz3d_btn.setEnabled(False)
 
         # Recompute T-x at the current P.
         P = self._current_P() if self.P_slider is not None else 0.0

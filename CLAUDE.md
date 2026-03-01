@@ -56,6 +56,7 @@ src/scripts/pde_phase.py    Phase and System data structures
 src/scripts/pde_compute.py  Equilibrium computation (convex hull) → EqResult
 src/scripts/pde_viz.py      PySide6 + matplotlib interactive UI
 src/scripts/pde_builder.py  Graphical input builder (QDialog) + data model
+src/scripts/pde_3d.py       3D T-P-x visualization (PhaseDiagram3D + Viz3DWindow)
 src/scripts/pde.1.py        Standalone vedo + PySide6 prototype (not installed)
 .pde/pderc                  Bash environment setup script
 .pde/pderc.py               Python resource control file template
@@ -130,7 +131,7 @@ Interactive PySide6 + matplotlib window with full pressure support:
 
 **Layout:**
 All controls sit in a single **top row** above the canvas area:
-`[Fixed P | Fixed T]` (if pressure) — `Reveal all` — `Colors…` — `[Pre-compute | Progress | Status]` (if pressure).
+`Builder…` — `3D View…` (if pressure) — `[Fixed P | Fixed T]` (if pressure) — `Reveal all` — `Colors…` — `[Pre-compute | Progress | Status]` (if pressure).
 Below the canvas: T slider row; then P slider row (when `has_pressure`).
 
 **Controls:**
@@ -140,6 +141,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - **"Reveal all" checkbox**: when checked, hides the cover rectangle on both canvases so the full phase diagram is visible regardless of slider position. Unchecking restores the cover to the current slider position. State is preserved across diagram regens triggered by the secondary slider.
 - **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): toggles background computation of the full N_T_STEPS × N_P_STEPS grid. Label cycles: "Pre-compute full T-P-x" → "Pause Computation" → "Restart Computation" → (repeats) → "Full T-P-x cached" (disabled when done). Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute). While paused or in-progress, the secondary slider falls back to on-demand recompute (unchanged from no-grid behavior).
 - **"Colors…" button**: opens `ColorDialog` — a non-modal dialog for per-phase color swatches, palette presets (`_PALETTES`), two-phase region color, and hatch style (`_HATCH_OPTIONS`). Changes apply live to all canvases. The palette dropdown defaults to `'Muted'`.
+- **"3D View…" button** (only when `system.has_pressure`): disabled until the full T-P-x grid is cached; clicking opens `Viz3DWindow` (non-modal). Becomes disabled again when resolution changes (grid cleared) or `reload_system()` fires (grid cleared + old window closed). Raising the button when the window is already visible brings it to front.
 
 **Legend positioning:**
 - Default location is `'upper left'` on all three canvases.
@@ -166,7 +168,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 
 **`MainWindow` refactor for builder support:**
 - `__init__` delegates to `_init_system_state()` (sets all non-widget state) and `_build_central_widget()` (creates all Qt widgets/layouts/signals; calls `setCentralWidget()` so it can be safely called again on reload).
-- `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`; re-activates handle-drag edit mode on the fresh canvas if the builder is still visible.
+- `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, closes `_viz3d_window` if open, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`; re-activates handle-drag edit mode on the fresh canvas if the builder is still visible.
 - `_open_builder()` — opens (or raises) the builder window; creates a new `BuilderWindow` each time the old one is not visible; connects its `system_applied` signal to `reload_system`; activates `GxCanvas` handle-drag edit mode and wires `phase_edited` → `_on_phase_edited`.
 - `_on_builder_closed()` — deactivates `GxCanvas` edit mode when the builder window closes.
 - `_on_phase_edited(name, new_pd)` — calls `BuilderWindow.update_phase_data()` to sync spinboxes, then builds a temporary `System` with the edited phase and recomputes equilibrium at the current T/P, then redraws `GxCanvas` (live hull update after every drag without waiting for Apply).
@@ -185,6 +187,20 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
   - `_on_motion()` — determines drag direction on first motion (≥3 px threshold; endpoint handles only go horizontal); **vertical**: calls `apply_handle_drag()` live (3-point quadratic H fit, curvature updates immediately); **horizontal**: extends/contracts the phase line and moves endpoint + midpoint handles.
   - `_on_release()` — routes to `apply_xrange_drag()` (horizontal) or `apply_handle_drag()` (vertical); updates `_live_phase_data`; emits `phase_edited`.
 - Edit mode is only active for HS-form systems (PolyModel phases render handles but fitting functions return unchanged `PhaseData`).
+
+### `pde_3d.py`
+
+3-D T-P-x phase diagram visualization. New dependencies: `pyvista`, `pyvistaqt` (lazy-imported in `Viz3DWindow.__init__` so the rest of the app works when they are absent).
+
+**`PhaseDiagram3D`** dataclass — `T_arr`/`P_arr` (ascending), `system`, `two_phase_surfaces` (list of dicts with `'label'`, `'phases'`, `'x_left'`, `'x_right'`):
+- `from_grid(grid, T_arr, P_arr, system)` — walks `grid[i_T][i_P]` (descending, from `FullGridWorker`); remaps to ascending via `j_T = N_T-1-i_T`; fills per-region NaN arrays keyed by phase-index tuple.
+- `to_pyvista_surfaces()` — returns `list[pyvista.StructuredGrid]`, two per two-phase region (x_left, x_right); axis: x=composition, y=T (K), z=P; `dimensions=[N_P, N_T, 1]`.
+- `to_pyvista_volume()` / `to_xdmf()` — stubs; raise `NotImplementedError`.
+
+**`Viz3DWindow(QMainWindow)`** — non-modal:
+- Top row: per-region visibility checkboxes, opacity slider (0–100, default 60), disabled Export… stub, Close.
+- `_actors` dict: key `f"{label}|{side}"` → VTK actor; `SetVisibility()` / `GetProperty().SetOpacity()`.
+- `closeEvent` calls `self._plotter.close()` to release VTK resources.
 
 ### `pde_builder.py`
 
@@ -233,4 +249,5 @@ All in `jobs/demo/`:
 ## Dependencies
 
 `lxml`, `numpy`, `h5py`, `scipy`, `PySide6`, `matplotlib` — plus `argparse`, `abc` (stdlib).
+`pde_3d.py` additionally requires `pyvista` and `pyvistaqt` (lazy-imported; app works without them).
 `pde.1.py` additionally requires `vedo`.
