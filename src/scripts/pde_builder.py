@@ -22,6 +22,7 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
+import copy
 from dataclasses import dataclass, field
 
 from lxml import etree
@@ -261,6 +262,72 @@ class SystemData:
         from pde_input import parse_system
         system = parse_system(path)
         return cls.from_system(system)
+
+
+# ---------------------------------------------------------------------------
+# Fitting layer — pure Python, no Qt
+# ---------------------------------------------------------------------------
+
+def apply_handle_drag(phase_data, drag_handle_idx,
+                      handles_x, handles_G, T, energy_form):
+    """Return updated PhaseData after a G(x) handle drag (Strategy 1: H-only).
+
+    The function is a standalone, Qt-free fitting layer designed to be
+    swappable as the interactive editing feature matures:
+
+    Current implementation — Phase 2 (uniform translation):
+        Any single-handle vertical drag shifts the whole G(x) curve by ΔG,
+        implemented as H₀  +=  ΔG  (S held constant).
+
+    Planned extensions (same signature, different body):
+        Phase 4 — full 3-handle quadratic fit:
+            Solve  H(xᵢ) = Gᵢ + T·S(xᵢ)  for i = 0,1,2  →  H₀, H₁, H₂
+        Phase 8 — two-temperature H+S decomposition (Strategy 3):
+            Collect drag snapshots at two T values, solve uniquely for ΔH, ΔS.
+
+    Parameters
+    ----------
+    phase_data      : PhaseData   — original data (not modified in place)
+    drag_handle_idx : int         — which handle was dragged (0=left, 1=mid, 2=right)
+    handles_x       : list[float] — x positions of all handles (fixed during drag)
+    handles_G       : list[float] — target G values after drag (new G at drag handle;
+                                    original G at the others for Phase 4 constraints)
+    T               : float       — temperature at which the drag occurred
+    energy_form     : str         — 'HS' or 'polynomial'
+
+    Returns
+    -------
+    PhaseData — deep copy of phase_data with updated coefficients.
+    """
+    import numpy as np
+
+    new_data = copy.deepcopy(phase_data)
+
+    if energy_form != 'HS':
+        # Polynomial form editing deferred to a later phase.
+        return new_data
+
+    # ---- Phase 2: uniform translation of the G(x) curve ----
+    # G(x, T) = H(x) − T·S(x).  Holding S fixed and dragging by ΔG means
+    # absorbing ΔG entirely into H₀ (the constant term of H(x)).
+    x_drag   = handles_x[drag_handle_idx]
+    G_target = handles_G[drag_handle_idx]
+
+    # Evaluate current G at the dragged x using the live coefficients.
+    H_coeffs = np.asarray(phase_data.hs_H or [0.0])
+    S_coeffs = np.asarray(phase_data.hs_S or [0.0])
+    H_at_x   = np.polynomial.polynomial.polyval(x_drag, H_coeffs)
+    S_at_x   = np.polynomial.polynomial.polyval(x_drag, S_coeffs)
+    G_old    = H_at_x - T * S_at_x
+
+    # Shift H₀ by the net ΔG so the curve translates uniformly.
+    # TODO Phase 4: replace with a 3-point polynomial solve for H₀, H₁, H₂.
+    delta_G    = G_target - G_old
+    new_H      = list(phase_data.hs_H or [0.0])
+    new_H[0]   = new_H[0] + delta_G
+    new_data.hs_H = new_H
+
+    return new_data
 
 
 # ---------------------------------------------------------------------------
@@ -922,3 +989,18 @@ class BuilderWindow(QDialog):
             self.system_applied.emit(system)
         except Exception as exc:
             QMessageBox.warning(self, 'Apply Error', str(exc))
+
+    # ------------------------------------------------------------------
+    # Canvas-edit integration (called by GxCanvas via MainWindow)
+    # ------------------------------------------------------------------
+
+    def update_phase_data(self, name: str, data: PhaseData):
+        """Update the spinboxes for phase *name* with fresh PhaseData.
+
+        Called by the G-x canvas (via MainWindow._on_phase_edited) whenever
+        the user drags a handle.  Silently no-ops when the phase is not found.
+        """
+        for editor in self._phase_editors:
+            if editor._name_edit.text() == name:
+                editor.set_phase_data(data)
+                return

@@ -30,6 +30,7 @@ Strategy
 
 import sys
 import threading
+from dataclasses import dataclass
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -139,12 +140,66 @@ def _compute_ylim(precomputed):
     return (all_G.min() - margin, all_G.max() + margin)
 
 
+def _G_from_phase_data(pd, x, T):
+    """Evaluate G(x, T) = H(x) − T·S(x) directly from a PhaseData object.
+
+    Uses the same ascending-order coefficient convention as HSModel.
+    x may be a scalar or a numpy array.  Only HS form is supported; returns
+    zeros for any other form (callers should guard with energy_form check).
+    """
+    H_coeffs = pd.hs_H if pd.hs_H else [0.0]
+    S_coeffs = pd.hs_S if pd.hs_S else [0.0]
+    return (np.polynomial.polynomial.polyval(x, H_coeffs)
+            - T * np.polynomial.polynomial.polyval(x, S_coeffs))
+
+
+# ---------------------------------------------------------------------------
+# Interactive edit-mode state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _DragState:
+    """All state for one in-progress G(x) handle drag.
+
+    Fields are sized for future extension:
+      snapshot  — PhaseData copy before the drag → enables Ctrl+Z undo (Phase 5)
+      T_ref     — temperature at drag start → two-temperature H+S solve (Phase 8)
+      P_ref     — pressure at drag start    → Phase 8 extension
+      handle_idx — which of the 3 handles is being dragged;
+                   −1 is reserved for whole-curve drag (Interaction B, future)
+    """
+    phase_name:   str
+    handle_idx:   int     # 0 = left endpoint, 1 = midpoint, 2 = right endpoint
+    y_press_data: float   # data-y at button_press_event (drag reference origin)
+    snapshot:     object  # deep copy of PhaseData BEFORE the drag (for Phase 5 undo)
+    T_ref:        float   # temperature when drag started (for Phase 8)
+    P_ref:        float   # pressure when drag started (for Phase 8)
+
+
 # ---------------------------------------------------------------------------
 # G-x canvas
 # ---------------------------------------------------------------------------
 
 class GxCanvas(FigureCanvasQTAgg):
-    """Left panel: Gibbs energy curves vs. composition at the current T (and P)."""
+    """Left panel: Gibbs energy curves vs. composition at the current T (and P).
+
+    Edit mode
+    ---------
+    When set_edit_mode('handles') is called (by MainWindow when the builder
+    opens), diamond drag handles appear on each HS-form G(x) curve.  Dragging
+    a handle vertically translates that phase's curve by ΔG and emits
+    phase_edited(phase_name, updated_PhaseData).
+
+    Edit modes stored in _edit_mode
+    --------------------------------
+    'off'     : normal display, no handles, matplotlib navigation active
+    'handles' : 3 diamond handles per HS phase; vertical drag → translate (Phase 2)
+    'direct'  : future — direct curve grab with modifier keys (Interaction B)
+    'anchors' : future — anchor-point least-squares fitting (Interaction C)
+    """
+
+    # Emitted on drag release: (phase_name: str, updated_data: PhaseData)
+    phase_edited = Signal(str, object)
 
     def __init__(self, system, y_lim=None, colors=None):
         self.system = system
@@ -156,19 +211,64 @@ class GxCanvas(FigureCanvasQTAgg):
         self._legend_loc = 'upper left'
         self._last_result = None
 
+        # ---- edit-mode state ----
+        # _edit_mode     : current mode string (see class docstring)
+        # _live_phase_data: dict[name, PhaseData] kept live by handle drags;
+        #                   G curves are recomputed from this dict in redraw()
+        #                   so edits persist across T-slider moves (hull will lag
+        #                   behind until the user clicks Apply in the builder)
+        # _phase_line_artists / _phase_orig_y: matplotlib Line2D + its original
+        #                   y-data, rebuilt each redraw() for use by _on_motion
+        # _handle_info   : {phase_name: [{'x':, 'G':, 'artist':}, ...]}
+        #                   rebuilt each redraw() from _live_phase_data
+        # _drag_state    : _DragState while a drag is in progress, else None
+        # _*_cid         : mpl event connection IDs (None when disconnected)
+        self._edit_mode          = 'off'
+        self._live_phase_data    = None
+        self._phase_line_artists = {}
+        self._phase_orig_y       = {}
+        self._handle_info        = {}
+        self._drag_state         = None
+        self._press_cid          = None
+        self._move_cid           = None
+        self._release_cid        = None
+
     def redraw(self, result):
         self._last_result = result
         ax = self.ax
         ax.cla()
 
+        # Reset per-draw artist storage (all artists destroyed by cla()).
+        self._phase_line_artists.clear()
+        self._phase_orig_y.clear()
+        self._handle_info.clear()
+
         # Draw each phase's G(x) curve.
         for x, G, phase in result.phase_curves:
             c = self._colors[phase.name]
+
+            # In edit mode, replace G with values from _live_phase_data so the
+            # displayed curves always reflect handle drags even across T-slider
+            # moves.  The convex hull will lag behind until Apply is clicked
+            # (acceptable Phase 2 limitation; fixed in Phase 4 via live recompute).
+            G_plot = G
+            if (self._edit_mode != 'off'
+                    and self._live_phase_data is not None
+                    and not phase.is_point
+                    and self.system.energy_form == 'HS'):
+                pd = self._live_phase_data.get(phase.name)
+                if pd is not None:
+                    G_plot = _G_from_phase_data(pd, x, result.T)
+
             if phase.is_point:
-                ax.plot(x, G, 'o', color=c, markersize=9,
+                ax.plot(x, G_plot, 'o', color=c, markersize=9,
                         label=phase.name, zorder=3)
             else:
-                ax.plot(x, G, '-', color=c, linewidth=2.5, label=phase.name)
+                line, = ax.plot(x, G_plot, '-', color=c,
+                                linewidth=2.5, label=phase.name)
+                if self._edit_mode != 'off':
+                    self._phase_line_artists[phase.name] = line
+                    self._phase_orig_y[phase.name] = np.asarray(G_plot).copy()
 
         # Lower convex envelope (dashed black).
         ax.plot(result.hull_x, result.hull_G, 'k--',
@@ -189,6 +289,11 @@ class GxCanvas(FigureCanvasQTAgg):
         if self._y_lim is not None:
             ax.set_ylim(self._y_lim)
         ax.legend(loc=self._legend_loc, fontsize=8)
+
+        # Draw drag handles on top of everything when edit mode is active.
+        if self._edit_mode != 'off':
+            self._draw_edit_overlay(result)
+
         self.draw()
 
     def contextMenuEvent(self, event):
@@ -205,6 +310,229 @@ class GxCanvas(FigureCanvasQTAgg):
         self._legend_loc = loc
         if self._last_result is not None:
             self.redraw(self._last_result)
+
+    # ------------------------------------------------------------------
+    # Interactive edit mode (Phase 2 — handle-drag framework)
+    # ------------------------------------------------------------------
+
+    def set_edit_mode(self, mode: str, live_phase_data=None):
+        """Switch between display-only and interactive editing modes.
+
+        Parameters
+        ----------
+        mode : str
+            'off'     — normal display, no handles (default)
+            'handles' — 3 diamond handles per HS phase (Phase 2, current)
+            'direct'  — reserved for future Interaction B (direct curve grab)
+            'anchors' — reserved for future Interaction C (anchor-point fit)
+        live_phase_data : dict[str, PhaseData] or None
+            Initial live PhaseData per phase.  When None and switching into a
+            non-off mode, data is initialised from self.system automatically.
+            Passing live_phase_data explicitly lets the caller preserve edits
+            across reloads (e.g. after MainWindow.reload_system).
+        """
+        if live_phase_data is not None:
+            self._live_phase_data = dict(live_phase_data)
+
+        if mode == self._edit_mode:
+            # Same mode: refresh live data and redraw handles if supplied.
+            if live_phase_data is not None and self._last_result is not None:
+                self.redraw(self._last_result)
+            return
+
+        self._edit_mode  = mode
+        self._drag_state = None
+
+        if mode == 'off':
+            # Disconnect all event handlers.
+            for attr in ('_press_cid', '_move_cid', '_release_cid'):
+                cid = getattr(self, attr)
+                if cid is not None:
+                    self.mpl_disconnect(cid)
+                    setattr(self, attr, None)
+            self._live_phase_data = None
+            if self._last_result is not None:
+                self.redraw(self._last_result)
+            return
+
+        # Entering a non-off mode — initialise live data if not provided.
+        if self._live_phase_data is None:
+            from pde_builder import SystemData
+            sd = SystemData.from_system(self.system)
+            self._live_phase_data = {pd.name: pd for pd in sd.phases}
+
+        # Connect event handlers (guard against double-connection).
+        if self._press_cid is None:
+            self._press_cid   = self.mpl_connect('button_press_event',
+                                                  self._on_press)
+            self._move_cid    = self.mpl_connect('motion_notify_event',
+                                                  self._on_motion)
+            self._release_cid = self.mpl_connect('button_release_event',
+                                                  self._on_release)
+
+        if self._last_result is not None:
+            self.redraw(self._last_result)
+
+    def _draw_edit_overlay(self, result):
+        """Draw diamond handles for each editable HS phase (called from redraw).
+
+        Three handles per phase at x = xmin, midpoint, xmax.  G values are
+        computed from _live_phase_data at result.T so they stay consistent
+        with the overridden G curves drawn earlier in redraw().
+
+        Fills self._handle_info so that _on_press / _on_motion / _on_release
+        can find and move the correct artist by index.
+
+        Extension notes for future phases:
+          Phase 3  — add horizontal-drag tabs at the endpoints for xmin/xmax.
+          Phase 4  — extend to N handles for degree-N−1 H polynomial fitting.
+          'direct' — _draw_edit_overlay delegates to a separate overlay method.
+          'anchors'— same; anchor positions are stored in a separate dict.
+        """
+        if self._live_phase_data is None:
+            return
+        T = result.T
+        for phase in self.system.phases:
+            if phase.is_point or self.system.energy_form != 'HS':
+                continue
+            pd = self._live_phase_data.get(phase.name)
+            if pd is None:
+                continue
+            xmin = pd.xmin
+            xmax = pd.xmax
+            xmid = 0.5 * (xmin + xmax)
+            handle_xs = [xmin, xmid, xmax]
+            c = self._colors.get(phase.name, 'k')
+            self._handle_info[phase.name] = []
+            for hx in handle_xs:
+                G_val = float(_G_from_phase_data(pd, hx, T))
+                artist, = self.ax.plot(
+                    hx, G_val, 'D',
+                    color=c, markersize=10,
+                    markeredgecolor='white', markeredgewidth=1.5,
+                    zorder=10, clip_on=False)
+                self._handle_info[phase.name].append(
+                    {'x': hx, 'G': G_val, 'artist': artist})
+
+    # --- drag event handlers -----------------------------------------------
+
+    def _on_press(self, event):
+        """Begin a handle drag when the user clicks near a diamond."""
+        if event.inaxes is not self.ax or event.button != 1:
+            return
+        if event.ydata is None or not self._handle_info:
+            return
+
+        HIT_RADIUS_PX = 12
+        best_dist  = HIT_RADIUS_PX
+        best_phase = None
+        best_idx   = None
+
+        for phase_name, info_list in self._handle_info.items():
+            for idx, info in enumerate(info_list):
+                disp = self.ax.transData.transform((info['x'], info['G']))
+                dist = np.hypot(event.x - disp[0], event.y - disp[1])
+                if dist < best_dist:
+                    best_dist  = dist
+                    best_phase = phase_name
+                    best_idx   = idx
+
+        if best_phase is None:
+            return
+
+        import copy
+        pd = (self._live_phase_data.get(best_phase)
+              if self._live_phase_data else None)
+        self._drag_state = _DragState(
+            phase_name   = best_phase,
+            handle_idx   = best_idx,
+            y_press_data = event.ydata,
+            snapshot     = copy.deepcopy(pd),   # stored for Ctrl+Z undo (Phase 5)
+            T_ref        = self._last_result.T if self._last_result else 0.0,
+            P_ref        = self._last_result.P if self._last_result else 0.0,
+        )
+
+    def _on_motion(self, event):
+        """Translate the dragged phase's curve and handles during mouse motion.
+
+        Provides live visual feedback only — PhaseData is not updated here.
+        Phase 2: the entire G(x) curve shifts uniformly by ΔG (vertical only).
+        Phase 3 TODO: horizontal drag of endpoint handles → xmin / xmax.
+        Phase 4 TODO: per-handle drag with polynomial re-fit drawn live.
+        """
+        if self._drag_state is None or event.inaxes is not self.ax:
+            return
+        if event.ydata is None:
+            return
+
+        delta_G    = event.ydata - self._drag_state.y_press_data
+        phase_name = self._drag_state.phase_name
+
+        # Shift the phase curve line artist.
+        line   = self._phase_line_artists.get(phase_name)
+        orig_y = self._phase_orig_y.get(phase_name)
+        if line is not None and orig_y is not None:
+            line.set_ydata(orig_y + delta_G)
+
+        # Shift all handle artists for this phase by the same ΔG.
+        for info in self._handle_info.get(phase_name, []):
+            info['artist'].set_ydata([info['G'] + delta_G])
+
+        self.draw_idle()
+
+    def _on_release(self, event):
+        """Finalise the drag: apply to PhaseData and emit phase_edited.
+
+        Passes the dragged handle's new G (and unchanged G for the others)
+        to apply_handle_drag().  Non-dragged handles are at original positions
+        so that Phase 4 can use them as polynomial constraints without any
+        API change here.
+        """
+        if self._drag_state is None or event.button != 1:
+            self._drag_state = None
+            return
+
+        ds               = self._drag_state
+        self._drag_state = None
+
+        delta_G = (event.ydata - ds.y_press_data
+                   if event.ydata is not None else 0.0)
+
+        if abs(delta_G) < 1e-12:
+            # No net movement — reset visuals from the last clean result.
+            if self._last_result is not None:
+                self.redraw(self._last_result)
+            return
+
+        pd = (self._live_phase_data.get(ds.phase_name)
+              if self._live_phase_data else None)
+        if pd is None:
+            return
+
+        # Build the updated handle G positions:
+        #   dragged handle → new target G
+        #   other handles  → unchanged G  (constraints for Phase 4 polynomial fit)
+        info_list = self._handle_info.get(ds.phase_name, [])
+        handles_x = [info['x'] for info in info_list]
+        handles_G = [info['G'] + (delta_G if i == ds.handle_idx else 0.0)
+                     for i, info in enumerate(info_list)]
+
+        from pde_builder import apply_handle_drag
+        try:
+            new_pd = apply_handle_drag(
+                pd, ds.handle_idx, handles_x, handles_G,
+                ds.T_ref, self.system.energy_form)
+        except Exception:
+            if self._last_result is not None:
+                self.redraw(self._last_result)
+            return
+
+        if self._live_phase_data is not None:
+            self._live_phase_data[ds.phase_name] = new_pd
+
+        # Notify the main window — it will update the builder spinboxes and
+        # trigger a live equilibrium recompute to refresh the hull.
+        self.phase_edited.emit(ds.phase_name, new_pd)
 
 
 # ---------------------------------------------------------------------------
@@ -962,14 +1290,75 @@ class MainWindow(QMainWindow):
         self._init_system_state(system, precomputed_Tx, None)
         self._build_central_widget()
 
+        # Re-activate edit mode on the fresh canvas if the builder is still open.
+        if self._builder is not None and self._builder.isVisible():
+            from pde_builder import SystemData
+            sd        = SystemData.from_system(system)
+            live_data = {pd.name: pd for pd in sd.phases}
+            self.gx_canvas.set_edit_mode('handles', live_data)
+            self.gx_canvas.phase_edited.connect(self._on_phase_edited)
+
     def _open_builder(self):
-        """Open (or raise) the builder window, pre-populated with the current system."""
+        """Open (or raise) the builder window, pre-populated with the current system.
+
+        Also activates handle-drag edit mode on GxCanvas so the user can
+        directly manipulate G(x) curves while the builder is open.
+        """
         if self._builder is None or not self._builder.isVisible():
-            from pde_builder import BuilderWindow
+            from pde_builder import BuilderWindow, SystemData
             self._builder = BuilderWindow(system=self.system)
             self._builder.system_applied.connect(self.reload_system)
+            self._builder.finished.connect(self._on_builder_closed)
+
+            # Activate edit mode on the canvas with fresh live data.
+            sd        = SystemData.from_system(self.system)
+            live_data = {pd.name: pd for pd in sd.phases}
+            self.gx_canvas.set_edit_mode('handles', live_data)
+
+            # Connect phase_edited → live spinbox update + equilibrium refresh.
+            # Disconnect first to guard against stale connections after reload.
+            try:
+                self.gx_canvas.phase_edited.disconnect(self._on_phase_edited)
+            except RuntimeError:
+                pass
+            self.gx_canvas.phase_edited.connect(self._on_phase_edited)
+
         self._builder.raise_()
         self._builder.show()
+
+    def _on_builder_closed(self, result=None):
+        """Deactivate handle-drag edit mode when the builder window closes."""
+        self.gx_canvas.set_edit_mode('off')
+
+    def _on_phase_edited(self, name, new_pd):
+        """Live-update after a G(x) handle drag.
+
+        1. Pushes the new PhaseData into the builder's spinboxes so the two
+           UIs stay in sync.
+        2. Recomputes equilibrium with a temporary system that has the edited
+           phase, giving a correct hull at the current T and P without waiting
+           for the user to click Apply.
+
+        The T-x / P-x canvases are NOT updated here — they remain valid for
+        the pre-Apply system and are refreshed only when Apply is clicked.
+        """
+        # Sync builder spinboxes.
+        if self._builder is not None and self._builder.isVisible():
+            self._builder.update_phase_data(name, new_pd)
+
+        # Build a temporary system with the edited phase.
+        from pde_builder import SystemData
+        sd = SystemData.from_system(self.system)
+        for i, pd in enumerate(sd.phases):
+            if pd.name == name:
+                sd.phases[i] = new_pd
+                break
+        tmp_system = sd.to_system()
+
+        T      = self._current_T()
+        P      = self._current_P()
+        result = compute_equilibrium(tmp_system, T, P)
+        self.gx_canvas.redraw(result)
 
     # ------------------------------------------------------------------
     # Helpers
