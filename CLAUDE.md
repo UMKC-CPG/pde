@@ -166,10 +166,25 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 
 **`MainWindow` refactor for builder support:**
 - `__init__` delegates to `_init_system_state()` (sets all non-widget state) and `_build_central_widget()` (creates all Qt widgets/layouts/signals; calls `setCentralWidget()` so it can be safely called again on reload).
-- `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`.
-- `_open_builder()` — opens (or raises) the builder window; creates a new `BuilderWindow` each time the old one is not visible; connects its `system_applied` signal to `reload_system`.
+- `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`; re-activates handle-drag edit mode on the fresh canvas if the builder is still visible.
+- `_open_builder()` — opens (or raises) the builder window; creates a new `BuilderWindow` each time the old one is not visible; connects its `system_applied` signal to `reload_system`; activates `GxCanvas` handle-drag edit mode and wires `phase_edited` → `_on_phase_edited`.
+- `_on_builder_closed()` — deactivates `GxCanvas` edit mode when the builder window closes.
+- `_on_phase_edited(name, new_pd)` — calls `BuilderWindow.update_phase_data()` to sync spinboxes, then builds a temporary `System` with the edited phase and recomputes equilibrium at the current T/P, then redraws `GxCanvas` (live hull update after every drag without waiting for Apply).
 - **"Builder…" button** is always present in the top row (before the final stretch).
 - `launch_ui_empty()` / `_make_default_system()` — entry point when no input file is found; creates a single-liquid-phase default system and auto-opens the builder.
+
+**Interactive G(x) handle-drag editing:**
+- `_G_from_phase_data(pd, x, T, P=0.0, R_gas=0.0, P_ref=1.0)` — module-level helper; evaluates full `G = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P₀)]` from a live `PhaseData` object; mirrors `HSModel.gibbs()`; pressure params default to zero for backward compatibility.
+- `_DragState` — `@dataclass`: `phase_name`, `handle_idx` (0/1/2 = left/mid/right), `y_press_data`, `snapshot` (Phase-5 undo), `T_ref`/`P_ref` (Phase-8); plus `x_press_data`, `x_press_px`, `y_press_px`, `drag_axis` (None/'vertical'/'horizontal') for Phase-3 direction detection.
+- `GxCanvas` extended:
+  - `phase_edited = Signal(str, object)` class attribute.
+  - `set_edit_mode(mode, live_phase_data=None)` — `'off'` deactivates and disconnects mpl event handlers; `'handles'` activates; initialises `_live_phase_data` from `SystemData.from_system()` if not supplied; guards double-connection with `if self._press_cid is None`.
+  - `redraw()` overrides G curves from `_live_phase_data` (with full pressure terms) when `_edit_mode != 'off'`; calls `_draw_edit_overlay()` after drawing.
+  - `_draw_edit_overlay(result)` — draws 3 diamond handle artists per HS phase at xmin, xmid, xmax (zorder=10); handle G positions computed with full pressure terms; fills `_handle_info` dict.
+  - `_on_press()` — hit-tests handles within 12 px; creates `_DragState` including pixel coordinates for direction detection.
+  - `_on_motion()` — determines drag direction on first motion (≥3 px threshold; endpoint handles only go horizontal); **vertical**: calls `apply_handle_drag()` live (3-point quadratic H fit, curvature updates immediately); **horizontal**: extends/contracts the phase line and moves endpoint + midpoint handles.
+  - `_on_release()` — routes to `apply_xrange_drag()` (horizontal) or `apply_handle_drag()` (vertical); updates `_live_phase_data`; emits `phase_edited`.
+- Edit mode is only active for HS-form systems (PolyModel phases render handles but fitting functions return unchanged `PhaseData`).
 
 ### `pde_builder.py`
 
@@ -189,6 +204,11 @@ Graphical input builder. Non-modal `QDialog`; emits `system_applied(System)` on 
 - `PolyPhaseCoeffWidget` — 2D grid for polynomial coefficients (x-power rows × T-power columns); rows and columns dynamically resizable.
 - `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, ideal_gas, remove button) + QStackedWidget (HS page: H/S/V rows with subscript headers and italic polynomial hint label; poly page: PolyPhaseCoeffWidget); `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
 - `BuilderWindow(QDialog)` — top-level builder: system group (title, components, form), temperature group, pressure group, scroll area of `PhaseEditorWidget`s, Load XML / Save XML / Apply / Close buttons.
+
+**Canvas ↔ builder sync:**
+- `apply_handle_drag(phase_data, drag_handle_idx, handles_x, handles_G, T, energy_form, P=0.0, R_gas=0.0, P_ref=1.0) → PhaseData` — Phase-4: 3×3 Vandermonde solve for H₀, H₁, H₂ so that `G(xᵢ) = handles_G[i]` at all three handle positions; correctly inverts full G including pressure terms (`H = G + T·S − P·V − R·T·ln(P/P₀)`); falls back to uniform H₀ shift on `LinAlgError`. Phase-8 TODO: two-temperature H+S decomposition. Returns unchanged `PhaseData` for non-HS forms.
+- `apply_xrange_drag(phase_data, handle_idx, new_x) → PhaseData` — Phase-3: deep copy with updated `xmin` (handle 0) or `xmax` (handle 2); clamped to [0, xmax−0.02] or [xmin+0.02, 1].
+- `BuilderWindow.update_phase_data(name, data)` — walks `_phase_editors` to find the editor whose name matches, then calls `set_phase_data(data)` on it; called by `MainWindow._on_phase_edited()` to keep spinbox values in sync after a canvas drag.
 
 ### `pde.1.py`
 

@@ -269,19 +269,21 @@ class SystemData:
 # ---------------------------------------------------------------------------
 
 def apply_handle_drag(phase_data, drag_handle_idx,
-                      handles_x, handles_G, T, energy_form):
-    """Return updated PhaseData after a G(x) handle drag (Strategy 1: H-only).
+                      handles_x, handles_G, T, energy_form,
+                      P=0.0, R_gas=0.0, P_ref=1.0):
+    """Return updated PhaseData after a vertical G(x) handle drag (Strategy 1: H-only).
 
     The function is a standalone, Qt-free fitting layer designed to be
     swappable as the interactive editing feature matures:
 
-    Current implementation — Phase 2 (uniform translation):
-        Any single-handle vertical drag shifts the whole G(x) curve by ΔG,
-        implemented as H₀  +=  ΔG  (S held constant).
+    Current implementation — Phase 4 (quadratic fit):
+        Solve the 3×3 Vandermonde system  H(xᵢ) = Gᵢ + T·S(xᵢ) − P·V(xᵢ) − R·T·ln(P/P₀)
+        for i = 0,1,2, fitting H₀, H₁, H₂ so the full G(x) curve passes through
+        all three handle positions simultaneously.  Higher-order H terms are
+        discarded (documented limitation).  Falls back to a uniform H₀ shift when
+        the system is degenerate (e.g. coincident handles).
 
     Planned extensions (same signature, different body):
-        Phase 4 — full 3-handle quadratic fit:
-            Solve  H(xᵢ) = Gᵢ + T·S(xᵢ)  for i = 0,1,2  →  H₀, H₁, H₂
         Phase 8 — two-temperature H+S decomposition (Strategy 3):
             Collect drag snapshots at two T values, solve uniquely for ΔH, ΔS.
 
@@ -290,10 +292,14 @@ def apply_handle_drag(phase_data, drag_handle_idx,
     phase_data      : PhaseData   — original data (not modified in place)
     drag_handle_idx : int         — which handle was dragged (0=left, 1=mid, 2=right)
     handles_x       : list[float] — x positions of all handles (fixed during drag)
-    handles_G       : list[float] — target G values after drag (new G at drag handle;
-                                    original G at the others for Phase 4 constraints)
+    handles_G       : list[float] — target full G values after drag (including pressure
+                                    terms), new G at drag handle; original G at the
+                                    other two as polynomial constraints
     T               : float       — temperature at which the drag occurred
     energy_form     : str         — 'HS' or 'polynomial'
+    P               : float       — pressure at drag time (default 0; backward-compatible)
+    R_gas           : float       — ideal-gas constant for the system (default 0)
+    P_ref           : float       — reference pressure for ideal-gas term (default 1)
 
     Returns
     -------
@@ -307,26 +313,69 @@ def apply_handle_drag(phase_data, drag_handle_idx,
         # Polynomial form editing deferred to a later phase.
         return new_data
 
-    # ---- Phase 2: uniform translation of the G(x) curve ----
-    # G(x, T) = H(x) − T·S(x).  Holding S fixed and dragging by ΔG means
-    # absorbing ΔG entirely into H₀ (the constant term of H(x)).
-    x_drag   = handles_x[drag_handle_idx]
-    G_target = handles_G[drag_handle_idx]
-
-    # Evaluate current G at the dragged x using the live coefficients.
-    H_coeffs = np.asarray(phase_data.hs_H or [0.0])
+    # ---- Phase 4: 3-point Vandermonde solve for H₀, H₁, H₂ ----
+    # Full G = H - T·S + P·V + R·T·ln(P/P₀)
+    # Invert to get H target:  H = G + T·S - P·V - R·T·ln(P/P₀)
     S_coeffs = np.asarray(phase_data.hs_S or [0.0])
-    H_at_x   = np.polynomial.polynomial.polyval(x_drag, H_coeffs)
-    S_at_x   = np.polynomial.polynomial.polyval(x_drag, S_coeffs)
-    G_old    = H_at_x - T * S_at_x
+    xs       = np.asarray(handles_x, dtype=float)
+    S_vals   = np.polynomial.polynomial.polyval(xs, S_coeffs)
+    H_target = np.asarray(handles_G, dtype=float) + T * S_vals
+    if phase_data.hs_V and P != 0.0:
+        V_vals   = np.polynomial.polynomial.polyval(xs, np.asarray(phase_data.hs_V))
+        H_target = H_target - P * V_vals
+    if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
+        H_target = H_target - R_gas * T * np.log(P / P_ref)
 
-    # Shift H₀ by the net ΔG so the curve translates uniformly.
-    # TODO Phase 4: replace with a 3-point polynomial solve for H₀, H₁, H₂.
-    delta_G    = G_target - G_old
-    new_H      = list(phase_data.hs_H or [0.0])
-    new_H[0]   = new_H[0] + delta_G
-    new_data.hs_H = new_H
+    # Vandermonde matrix [1, x, x²] for each handle position.
+    A = np.column_stack([np.ones(3), xs, xs ** 2])
 
+    try:
+        H_coeffs = np.linalg.solve(A, H_target)
+        new_data.hs_H = list(H_coeffs)
+    except np.linalg.LinAlgError:
+        # Degenerate geometry — fall back to uniform H₀ shift.
+        H_old  = np.asarray(phase_data.hs_H or [0.0])
+        S_old  = np.asarray(phase_data.hs_S or [0.0])
+        x_drag = handles_x[drag_handle_idx]
+        G_old  = (np.polynomial.polynomial.polyval(x_drag, H_old)
+                  - T * np.polynomial.polynomial.polyval(x_drag, S_old))
+        if phase_data.hs_V and P != 0.0:
+            G_old += P * np.polynomial.polynomial.polyval(
+                x_drag, np.asarray(phase_data.hs_V))
+        if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
+            G_old += R_gas * T * np.log(P / P_ref)
+        delta_G   = handles_G[drag_handle_idx] - G_old
+        new_H     = list(phase_data.hs_H or [0.0])
+        new_H[0] += delta_G
+        new_data.hs_H = new_H
+
+    return new_data
+
+
+def apply_xrange_drag(phase_data, handle_idx, new_x):
+    """Return updated PhaseData after a horizontal endpoint-handle drag (Phase 3).
+
+    Adjusts xmin (handle_idx == 0) or xmax (handle_idx == 2) to *new_x*,
+    clamped to keep a minimum separation of 0.02 between xmin and xmax and
+    to stay within [0, 1].  The midpoint handle (idx 1) is not a valid target
+    for horizontal drag and is silently ignored.
+
+    Parameters
+    ----------
+    phase_data : PhaseData — original data (not modified in place)
+    handle_idx : int       — 0 = left endpoint, 2 = right endpoint
+    new_x      : float     — new x position from the drag
+
+    Returns
+    -------
+    PhaseData — deep copy with updated xmin or xmax.
+    """
+    import numpy as np
+    new_data = copy.deepcopy(phase_data)
+    if handle_idx == 0:
+        new_data.xmin = float(np.clip(new_x, 0.0, phase_data.xmax - 0.02))
+    elif handle_idx == 2:
+        new_data.xmax = float(np.clip(new_x, phase_data.xmin + 0.02, 1.0))
     return new_data
 
 

@@ -140,17 +140,27 @@ def _compute_ylim(precomputed):
     return (all_G.min() - margin, all_G.max() + margin)
 
 
-def _G_from_phase_data(pd, x, T):
-    """Evaluate G(x, T) = H(x) − T·S(x) directly from a PhaseData object.
+def _G_from_phase_data(pd, x, T, P=0.0, R_gas=0.0, P_ref=1.0):
+    """Evaluate G(x, T[, P]) directly from a PhaseData object.
+
+    Mirrors HSModel.gibbs():
+        G = H(x) − T·S(x)  [+ P·V(x)]  [+ R·T·ln(P/P₀)]
 
     Uses the same ascending-order coefficient convention as HSModel.
     x may be a scalar or a numpy array.  Only HS form is supported; returns
     zeros for any other form (callers should guard with energy_form check).
+    All pressure-related parameters default to 0/0/1 so that callers without
+    pressure support remain backward-compatible and produce the same result.
     """
     H_coeffs = pd.hs_H if pd.hs_H else [0.0]
     S_coeffs = pd.hs_S if pd.hs_S else [0.0]
-    return (np.polynomial.polynomial.polyval(x, H_coeffs)
-            - T * np.polynomial.polynomial.polyval(x, S_coeffs))
+    G = (np.polynomial.polynomial.polyval(x, H_coeffs)
+         - T * np.polynomial.polynomial.polyval(x, S_coeffs))
+    if pd.hs_V and P != 0.0:
+        G = G + P * np.polynomial.polynomial.polyval(x, pd.hs_V)
+    if pd.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
+        G = G + R_gas * T * np.log(P / P_ref)
+    return G
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +184,10 @@ class _DragState:
     snapshot:     object  # deep copy of PhaseData BEFORE the drag (for Phase 5 undo)
     T_ref:        float   # temperature when drag started (for Phase 8)
     P_ref:        float   # pressure when drag started (for Phase 8)
+    x_press_data: float = 0.0   # data-x at press (Phase 3 horizontal reference)
+    x_press_px:   float = 0.0   # pixel-x at press (direction detection)
+    y_press_px:   float = 0.0   # pixel-y at press (direction detection)
+    drag_axis:    object = None  # None=undetermined | 'vertical' | 'horizontal'
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +201,15 @@ class GxCanvas(FigureCanvasQTAgg):
     ---------
     When set_edit_mode('handles') is called (by MainWindow when the builder
     opens), diamond drag handles appear on each HS-form G(x) curve.  Dragging
-    a handle vertically translates that phase's curve by ΔG and emits
-    phase_edited(phase_name, updated_PhaseData).
+    a handle vertically fits H₀, H₁, H₂ via a 3-point quadratic solve and
+    emits phase_edited(phase_name, updated_PhaseData).  Dragging an endpoint
+    handle horizontally updates xmin or xmax and emits the same signal.
 
     Edit modes stored in _edit_mode
     --------------------------------
     'off'     : normal display, no handles, matplotlib navigation active
-    'handles' : 3 diamond handles per HS phase; vertical drag → translate (Phase 2)
+    'handles' : 3 diamond handles per HS phase; vertical drag → quadratic H fit (Phase 4);
+                endpoint horizontal drag → xmin/xmax (Phase 3)
     'direct'  : future — direct curve grab with modifier keys (Interaction B)
     'anchors' : future — anchor-point least-squares fitting (Interaction C)
     """
@@ -258,7 +274,9 @@ class GxCanvas(FigureCanvasQTAgg):
                     and self.system.energy_form == 'HS'):
                 pd = self._live_phase_data.get(phase.name)
                 if pd is not None:
-                    G_plot = _G_from_phase_data(pd, x, result.T)
+                    G_plot = _G_from_phase_data(
+                        pd, x, result.T, result.P,
+                        self.system.R_gas, self.system.P_ref)
 
             if phase.is_point:
                 ax.plot(x, G_plot, 'o', color=c, markersize=9,
@@ -312,7 +330,7 @@ class GxCanvas(FigureCanvasQTAgg):
             self.redraw(self._last_result)
 
     # ------------------------------------------------------------------
-    # Interactive edit mode (Phase 2 — handle-drag framework)
+    # Interactive edit mode (Phases 2–4 — handle-drag framework)
     # ------------------------------------------------------------------
 
     def set_edit_mode(self, mode: str, live_phase_data=None):
@@ -322,7 +340,7 @@ class GxCanvas(FigureCanvasQTAgg):
         ----------
         mode : str
             'off'     — normal display, no handles (default)
-            'handles' — 3 diamond handles per HS phase (Phase 2, current)
+            'handles' — 3 diamond handles per HS phase (Phases 3+4, current)
             'direct'  — reserved for future Interaction B (direct curve grab)
             'anchors' — reserved for future Interaction C (anchor-point fit)
         live_phase_data : dict[str, PhaseData] or None
@@ -383,15 +401,18 @@ class GxCanvas(FigureCanvasQTAgg):
         Fills self._handle_info so that _on_press / _on_motion / _on_release
         can find and move the correct artist by index.
 
-        Extension notes for future phases:
-          Phase 3  — add horizontal-drag tabs at the endpoints for xmin/xmax.
-          Phase 4  — extend to N handles for degree-N−1 H polynomial fitting.
+        Extension notes:
+          Phase 3  — DONE: horizontal drag of endpoint handles for xmin/xmax.
+          Phase 4  — DONE: 3-point quadratic H fit on vertical drag.
           'direct' — _draw_edit_overlay delegates to a separate overlay method.
           'anchors'— same; anchor positions are stored in a separate dict.
         """
         if self._live_phase_data is None:
             return
         T = result.T
+        P = result.P
+        R_gas = self.system.R_gas
+        P_ref = self.system.P_ref
         for phase in self.system.phases:
             if phase.is_point or self.system.energy_form != 'HS':
                 continue
@@ -405,7 +426,7 @@ class GxCanvas(FigureCanvasQTAgg):
             c = self._colors.get(phase.name, 'k')
             self._handle_info[phase.name] = []
             for hx in handle_xs:
-                G_val = float(_G_from_phase_data(pd, hx, T))
+                G_val = float(_G_from_phase_data(pd, hx, T, P, R_gas, P_ref))
                 artist, = self.ax.plot(
                     hx, G_val, 'D',
                     color=c, markersize=10,
@@ -450,43 +471,111 @@ class GxCanvas(FigureCanvasQTAgg):
             snapshot     = copy.deepcopy(pd),   # stored for Ctrl+Z undo (Phase 5)
             T_ref        = self._last_result.T if self._last_result else 0.0,
             P_ref        = self._last_result.P if self._last_result else 0.0,
+            x_press_data = event.xdata if event.xdata is not None else 0.0,
+            x_press_px   = event.x,
+            y_press_px   = event.y,
+            drag_axis    = None,
         )
 
     def _on_motion(self, event):
-        """Translate the dragged phase's curve and handles during mouse motion.
+        """Live visual feedback during a G(x) handle drag.
 
-        Provides live visual feedback only — PhaseData is not updated here.
-        Phase 2: the entire G(x) curve shifts uniformly by ΔG (vertical only).
-        Phase 3 TODO: horizontal drag of endpoint handles → xmin / xmax.
-        Phase 4 TODO: per-handle drag with polynomial re-fit drawn live.
+        Phase 3: horizontal drag of endpoint handles (idx 0 or 2) updates
+                 xmin/xmax — the curve is extended/contracted along x.
+        Phase 4: vertical drag of any handle → 3-point quadratic H fit drawn
+                 live; G(x) curve curvature changes with the dragged position.
+
+        Direction is determined on first motion after press by comparing the
+        magnitude of horizontal vs. vertical pixel displacement.  The midpoint
+        handle (idx 1) always resolves to vertical regardless of motion direction.
         """
         if self._drag_state is None or event.inaxes is not self.ax:
             return
-        if event.ydata is None:
+        if event.ydata is None or event.xdata is None:
             return
 
-        delta_G    = event.ydata - self._drag_state.y_press_data
-        phase_name = self._drag_state.phase_name
+        ds = self._drag_state
 
-        # Shift the phase curve line artist.
-        line   = self._phase_line_artists.get(phase_name)
-        orig_y = self._phase_orig_y.get(phase_name)
-        if line is not None and orig_y is not None:
-            line.set_ydata(orig_y + delta_G)
+        # ---- Step 1: direction detection (on first motion after press) ----
+        if ds.drag_axis is None:
+            dx_px = abs(event.x - ds.x_press_px)
+            dy_px = abs(event.y - ds.y_press_px)
+            if dx_px < 3 and dy_px < 3:
+                return   # too small to determine direction yet
+            if dx_px > dy_px and ds.handle_idx in (0, 2):
+                ds.drag_axis = 'horizontal'
+            else:
+                ds.drag_axis = 'vertical'
 
-        # Shift all handle artists for this phase by the same ΔG.
-        for info in self._handle_info.get(phase_name, []):
-            info['artist'].set_ydata([info['G'] + delta_G])
+        phase_name = ds.phase_name
+        pd = (self._live_phase_data.get(phase_name)
+              if self._live_phase_data else None)
+        if pd is None:
+            return
+        line = self._phase_line_artists.get(phase_name)
+        if line is None:
+            return
+        T     = ds.T_ref
+        P     = ds.P_ref
+        R_gas = self.system.R_gas
+        P_ref = self.system.P_ref
+
+        if ds.drag_axis == 'vertical':
+            # ---- Phase 4: live 3-point quadratic H fit ----
+            delta_G   = event.ydata - ds.y_press_data
+            info_list = self._handle_info.get(phase_name, [])
+            handles_x = [info['x'] for info in info_list]
+            handles_G = [info['G'] + (delta_G if i == ds.handle_idx else 0.0)
+                         for i, info in enumerate(info_list)]
+            from pde_builder import apply_handle_drag
+            try:
+                new_pd = apply_handle_drag(
+                    pd, ds.handle_idx, handles_x, handles_G,
+                    T, self.system.energy_form, P, R_gas, P_ref)
+            except Exception:
+                return
+            xs = line.get_xdata()
+            line.set_ydata(_G_from_phase_data(new_pd, xs, T, P, R_gas, P_ref))
+            # Update all 3 handle artists to their fitted G values.
+            for info in info_list:
+                fitted_G = float(
+                    _G_from_phase_data(new_pd, info['x'], T, P, R_gas, P_ref))
+                info['artist'].set_ydata([fitted_G])
+
+        else:
+            # ---- Phase 3: horizontal drag → update xmin or xmax ----
+            new_x = float(np.clip(event.xdata, 0.0, 1.0))
+            if ds.handle_idx == 0:
+                new_xmin = float(np.clip(new_x, 0.0, pd.xmax - 0.02))
+                new_xmax = pd.xmax
+            else:  # handle_idx == 2
+                new_xmin = pd.xmin
+                new_xmax = float(np.clip(new_x, pd.xmin + 0.02, 1.0))
+            xs      = np.linspace(new_xmin, new_xmax, len(line.get_xdata()))
+            G_vals  = _G_from_phase_data(pd, xs, T, P, R_gas, P_ref)
+            line.set_xdata(xs)
+            line.set_ydata(G_vals)
+            # Move dragged endpoint handle.
+            dragged_x = new_xmin if ds.handle_idx == 0 else new_xmax
+            dragged_G = float(
+                _G_from_phase_data(pd, dragged_x, T, P, R_gas, P_ref))
+            self._handle_info[phase_name][ds.handle_idx]['artist'].set_xdata(
+                [dragged_x])
+            self._handle_info[phase_name][ds.handle_idx]['artist'].set_ydata(
+                [dragged_G])
+            # Move midpoint handle.
+            xmid  = 0.5 * (new_xmin + new_xmax)
+            G_mid = float(_G_from_phase_data(pd, xmid, T, P, R_gas, P_ref))
+            self._handle_info[phase_name][1]['artist'].set_xdata([xmid])
+            self._handle_info[phase_name][1]['artist'].set_ydata([G_mid])
 
         self.draw_idle()
 
     def _on_release(self, event):
         """Finalise the drag: apply to PhaseData and emit phase_edited.
 
-        Passes the dragged handle's new G (and unchanged G for the others)
-        to apply_handle_drag().  Non-dragged handles are at original positions
-        so that Phase 4 can use them as polynomial constraints without any
-        API change here.
+        Routes to apply_xrange_drag (Phase 3 horizontal) or apply_handle_drag
+        (Phase 4 vertical) depending on the drag axis determined during motion.
         """
         if self._drag_state is None or event.button != 1:
             self._drag_state = None
@@ -495,11 +584,8 @@ class GxCanvas(FigureCanvasQTAgg):
         ds               = self._drag_state
         self._drag_state = None
 
-        delta_G = (event.ydata - ds.y_press_data
-                   if event.ydata is not None else 0.0)
-
-        if abs(delta_G) < 1e-12:
-            # No net movement — reset visuals from the last clean result.
+        # No movement detected — reset visuals and return.
+        if ds.drag_axis is None:
             if self._last_result is not None:
                 self.redraw(self._last_result)
             return
@@ -509,23 +595,45 @@ class GxCanvas(FigureCanvasQTAgg):
         if pd is None:
             return
 
-        # Build the updated handle G positions:
-        #   dragged handle → new target G
-        #   other handles  → unchanged G  (constraints for Phase 4 polynomial fit)
-        info_list = self._handle_info.get(ds.phase_name, [])
-        handles_x = [info['x'] for info in info_list]
-        handles_G = [info['G'] + (delta_G if i == ds.handle_idx else 0.0)
-                     for i, info in enumerate(info_list)]
+        if ds.drag_axis == 'horizontal':
+            # Phase 3: apply xmin / xmax change.
+            if event.xdata is None:
+                if self._last_result is not None:
+                    self.redraw(self._last_result)
+                return
+            new_x = float(np.clip(event.xdata, 0.0, 1.0))
+            from pde_builder import apply_xrange_drag
+            try:
+                new_pd = apply_xrange_drag(pd, ds.handle_idx, new_x)
+            except Exception:
+                if self._last_result is not None:
+                    self.redraw(self._last_result)
+                return
 
-        from pde_builder import apply_handle_drag
-        try:
-            new_pd = apply_handle_drag(
-                pd, ds.handle_idx, handles_x, handles_G,
-                ds.T_ref, self.system.energy_form)
-        except Exception:
-            if self._last_result is not None:
-                self.redraw(self._last_result)
-            return
+        else:
+            # Phase 4: apply vertical G shift with 3-point quadratic fit.
+            delta_G = (event.ydata - ds.y_press_data
+                       if event.ydata is not None else 0.0)
+            if abs(delta_G) < 1e-12:
+                if self._last_result is not None:
+                    self.redraw(self._last_result)
+                return
+            # Build target handle G positions:
+            #   dragged handle → new G;  others → original G (quadratic constraints)
+            info_list = self._handle_info.get(ds.phase_name, [])
+            handles_x = [info['x'] for info in info_list]
+            handles_G = [info['G'] + (delta_G if i == ds.handle_idx else 0.0)
+                         for i, info in enumerate(info_list)]
+            from pde_builder import apply_handle_drag
+            try:
+                new_pd = apply_handle_drag(
+                    pd, ds.handle_idx, handles_x, handles_G,
+                    ds.T_ref, self.system.energy_form,
+                    ds.P_ref, self.system.R_gas, self.system.P_ref)
+            except Exception:
+                if self._last_result is not None:
+                    self.redraw(self._last_result)
+                return
 
         if self._live_phase_data is not None:
             self._live_phase_data[ds.phase_name] = new_pd
