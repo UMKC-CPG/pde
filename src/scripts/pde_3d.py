@@ -231,14 +231,22 @@ class Viz3DWindow(QMainWindow):
                 )
                 self._actors[f'{label}|{side}'] = actor
 
+        # Scale all three axes to equal visual length so the view looks cubic
+        # rather than a thin sliver (composition 0-1, T 250-500 K, P 0.5-5 atm
+        # would otherwise differ by two orders of magnitude).
+        T_span = max(diagram.T_arr[-1] - diagram.T_arr[0], 1e-9)
+        P_span = max(diagram.P_arr[-1] - diagram.P_arr[0], 1e-9)
+        # x (composition) is always [0, 1]; scale the other two axes relative to it.
+        self._plotter.set_scale(xscale=T_span, yscale=1.0, zscale=T_span / P_span)
+
         # Axis labels and bounds.
         self._plotter.add_axes()
         P_unit  = getattr(system, 'P_unit', '')
         P_label = f'P ({P_unit})' if P_unit else 'P'
         self._plotter.show_bounds(
-            xlabel='x',
-            ylabel='T (K)',
-            zlabel=P_label,
+            xtitle='x',
+            ytitle='T (K)',
+            ztitle=P_label,
             show_xaxis=True,
             show_yaxis=True,
             show_zaxis=True,

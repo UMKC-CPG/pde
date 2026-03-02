@@ -158,7 +158,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - `run()` calls `_run_event.wait()` then checks `_abort` before each `compute_equilibrium` call — blocks immediately on pause, negligible overhead when running.
 - `pause()` clears the event; `resume()` sets it; `abort()` sets `_abort=True` then sets the event (unblocks a paused worker).
 - `MainWindow._worker_state`: `'idle'` → `'running'` → `'paused'` ↔ `'running'` → `'done'`.
-- `MainWindow.closeEvent` calls `abort()` + `wait()` before window teardown.
+- `MainWindow.closeEvent` calls `abort()` + `wait()` before window teardown; also closes `_builder` and `_viz3d_window` if open.
 
 **Slider interaction logic:**
 - Primary slider (`valueChanged`) → fast O(1) update: nearest pre-computed result looked up by index.
@@ -170,7 +170,7 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 - `__init__` delegates to `_init_system_state()` (sets all non-widget state) and `_build_central_widget()` (creates all Qt widgets/layouts/signals; calls `setCentralWidget()` so it can be safely called again on reload).
 - `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, closes `_viz3d_window` if open, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`; re-activates handle-drag edit mode on the fresh canvas if the builder is still visible.
 - `_open_builder()` — opens (or raises) the builder window; creates a new `BuilderWindow` each time the old one is not visible; connects its `system_applied` signal to `reload_system`; activates `GxCanvas` handle-drag edit mode and wires `phase_edited` → `_on_phase_edited`.
-- `_on_builder_closed()` — deactivates `GxCanvas` edit mode when the builder window closes.
+- `_on_builder_closed()` — deactivates `GxCanvas` edit mode and disconnects `phase_edited` from `_on_phase_edited` when the builder window closes.
 - `_on_phase_edited(name, new_pd)` — calls `BuilderWindow.update_phase_data()` to sync spinboxes, then builds a temporary `System` with the edited phase and recomputes equilibrium at the current T/P, then redraws `GxCanvas` (live hull update after every drag without waiting for Apply).
 - **"Builder…" button** is always present in the top row (before the final stretch).
 - `launch_ui_empty()` / `_make_default_system()` — entry point when no input file is found; creates a single-liquid-phase default system and auto-opens the builder.
@@ -200,6 +200,8 @@ Below the canvas: T slider row; then P slider row (when `has_pressure`).
 **`Viz3DWindow(QMainWindow)`** — non-modal:
 - Top row: per-region visibility checkboxes, opacity slider (0–100, default 60), disabled Export… stub, Close.
 - `_actors` dict: key `f"{label}|{side}"` → VTK actor; `SetVisibility()` / `GetProperty().SetOpacity()`.
+- `set_scale(xscale=T_span, yscale=1.0, zscale=T_span/P_span)` normalizes the three axes to equal visual length (composition ∈ [0,1], T in K, P in user units differ wildly otherwise).
+- `show_bounds()` uses `xtitle`/`ytitle`/`ztitle` keyword arguments (pyvista API).
 - `closeEvent` calls `self._plotter.close()` to release VTK resources.
 
 ### `pde_builder.py`
@@ -216,9 +218,12 @@ Graphical input builder. Non-modal `QDialog`; emits `system_applied(System)` on 
 
 **UI widgets:**
 - `_FloatSpinBox` — QDoubleSpinBox ±1e9, 6 decimals, step 0.001.
-- `CoeffRowWidget` — labelled row of float spinboxes with dynamic +/− buttons; `get_coeffs()`/`set_coeffs()`. Optional `coeff_name` parameter (e.g. `'H'`) adds Unicode subscript headers (H₀, H₁, H₂, …) above each spinbox using a two-row `QGridLayout` (row 0 = subscript labels, row 1 = spinboxes).
+- `CoeffRowWidget` — labelled row of float spinboxes with dynamic +/− buttons; `get_coeffs()`/`set_coeffs()`. Optional `coeff_name` parameter (e.g. `'H'`) adds Unicode subscript headers (H₀, H₁, H₂, …) above each spinbox using a two-row `QGridLayout` (row 0 = subscript labels, row 1 = spinboxes). Label and +/− buttons are bottom-aligned (`Qt.AlignBottom`) to sit flush with the spinboxes.
 - `PolyPhaseCoeffWidget` — 2D grid for polynomial coefficients (x-power rows × T-power columns); rows and columns dynamically resizable.
-- `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, ideal_gas, remove button) + QStackedWidget (HS page: H/S/V rows with subscript headers and italic polynomial hint label; poly page: PolyPhaseCoeffWidget); `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
+- `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, Ideal gas checkbox, remove button) + QStackedWidget:
+  - HS page: H/S/V rows with subscript headers + dynamic hint label (`_hint_lbl`) updated by `_update_eq_label()` — shows `G(x,T) = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P₀)]` and updates live when the V-enable or Ideal-gas checkbox toggles.
+  - Poly page: static hint label (`G(x,T) = c₀(T) + c₁(T)·x + …`) + `PolyPhaseCoeffWidget`.
+  - `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
 - `BuilderWindow(QDialog)` — top-level builder: system group (title, components, form), temperature group, pressure group, scroll area of `PhaseEditorWidget`s, Load XML / Save XML / Apply / Close buttons.
 
 **Canvas ↔ builder sync:**

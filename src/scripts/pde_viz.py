@@ -1443,11 +1443,6 @@ class MainWindow(QMainWindow):
             self.gx_canvas.set_edit_mode('handles', live_data)
 
             # Connect phase_edited → live spinbox update + equilibrium refresh.
-            # Disconnect first to guard against stale connections after reload.
-            try:
-                self.gx_canvas.phase_edited.disconnect(self._on_phase_edited)
-            except RuntimeError:
-                pass
             self.gx_canvas.phase_edited.connect(self._on_phase_edited)
 
         self._builder.raise_()
@@ -1468,6 +1463,10 @@ class MainWindow(QMainWindow):
     def _on_builder_closed(self, result=None):
         """Deactivate handle-drag edit mode when the builder window closes."""
         self.gx_canvas.set_edit_mode('off')
+        try:
+            self.gx_canvas.phase_edited.disconnect(self._on_phase_edited)
+        except RuntimeError:
+            pass
 
     def _on_phase_edited(self, name, new_pd):
         """Live-update after a G(x) handle drag.
@@ -1810,6 +1809,10 @@ class MainWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._worker.abort()
             self._worker.wait()
+        if self._builder is not None:
+            self._builder.close()
+        if self._viz3d_window is not None:
+            self._viz3d_window.close()
         super().closeEvent(event)
 
 

@@ -423,7 +423,7 @@ class CoeffRowWidget(QWidget):
 
         lbl = QLabel(label)
         lbl.setMinimumWidth(52)
-        outer.addWidget(lbl)
+        outer.addWidget(lbl, 0, Qt.AlignBottom)
 
         # Spin grid: row 0 = subscript labels (when coeff_name is set),
         #            row 1 = spinboxes  (row 0 when coeff_name is empty)
@@ -441,8 +441,8 @@ class CoeffRowWidget(QWidget):
         rem_btn.setToolTip('Remove last coefficient')
         add_btn.clicked.connect(lambda: self._add_spinbox(0.0))
         rem_btn.clicked.connect(self._remove_spinbox)
-        outer.addWidget(add_btn)
-        outer.addWidget(rem_btn)
+        outer.addWidget(add_btn, 0, Qt.AlignBottom)
+        outer.addWidget(rem_btn, 0, Qt.AlignBottom)
 
         for c in (coeffs or [0.0]):
             self._add_spinbox(float(c))
@@ -665,7 +665,7 @@ class PhaseEditorWidget(QFrame):
         self._xmax_sb.setMaximumWidth(72)
         header.addWidget(self._xmax_sb)
 
-        self._ideal_gas_cb = QCheckBox('ideal gas')
+        self._ideal_gas_cb = QCheckBox('Ideal gas')
         header.addWidget(self._ideal_gas_cb)
 
         header.addStretch()
@@ -686,28 +686,39 @@ class PhaseEditorWidget(QFrame):
         hs_layout = QVBoxLayout(hs_widget)
         hs_layout.setContentsMargins(0, 0, 0, 0)
         hs_layout.setSpacing(4)
-        # Hint: show the polynomial form so users see what each coefficient means
-        hint_lbl = QLabel(
-            'H(x) = H\u2080 + H\u2081\u00b7x + H\u2082\u00b7x\u00b2 + \u2026'
-            '   \u2502   '
-            'S(x) = S\u2080 + S\u2081\u00b7x + S\u2082\u00b7x\u00b2 + \u2026')
-        hint_lbl.setStyleSheet('color: #777; font-style: italic;')
-        hs_layout.addWidget(hint_lbl)
+        # Primary equation label (text updated dynamically by _update_eq_label)
+        self._hint_lbl = QLabel()
+        self._hint_lbl.setStyleSheet('color: #777; font-style: italic;')
+        hs_layout.addWidget(self._hint_lbl)
         self._H_row = CoeffRowWidget('H(x) =', [0.0], coeff_name='H')
         self._S_row = CoeffRowWidget('S(x) =', [0.0], coeff_name='S')
         self._V_enable_cb = QCheckBox('Enable PV term:')
         self._V_row = CoeffRowWidget('V(x) =', [0.0], coeff_name='V')
         self._V_row.setVisible(False)
         self._V_enable_cb.toggled.connect(self._V_row.setVisible)
+        self._V_enable_cb.toggled.connect(self._update_eq_label)
+        self._ideal_gas_cb.toggled.connect(self._update_eq_label)
         hs_layout.addWidget(self._H_row)
         hs_layout.addWidget(self._S_row)
         hs_layout.addWidget(self._V_enable_cb)
         hs_layout.addWidget(self._V_row)
         self._stack.addWidget(hs_widget)   # index 0
+        self._update_eq_label()            # set initial text
 
         # Poly page
+        poly_page = QWidget()
+        poly_layout = QVBoxLayout(poly_page)
+        poly_layout.setContentsMargins(0, 0, 0, 0)
+        poly_layout.setSpacing(4)
+        poly_hint = QLabel(
+            'G(x,T) = c\u2080(T) + c\u2081(T)\u00b7x + c\u2082(T)\u00b7x\u00b2 + \u2026'
+            '   \u2502   '
+            'c\u1d62(T) = a\u2080 + a\u2081\u00b7T + a\u2082\u00b7T\u00b2 + \u2026')
+        poly_hint.setStyleSheet('color: #777; font-style: italic;')
+        poly_layout.addWidget(poly_hint)
         self._poly_widget = PolyPhaseCoeffWidget()
-        self._stack.addWidget(self._poly_widget)  # index 1
+        poly_layout.addWidget(self._poly_widget)
+        self._stack.addWidget(poly_page)  # index 1
 
         root.addWidget(self._stack)
         self.set_energy_form(energy_form)
@@ -717,6 +728,20 @@ class PhaseEditorWidget(QFrame):
     def set_energy_form(self, form):
         self._energy_form = form
         self._stack.setCurrentIndex(0 if form == 'HS' else 1)
+
+    def _update_eq_label(self, _=None):
+        text = 'G(x,T) = H(x) \u2212 T\u00b7S(x)'
+        if self._V_enable_cb.isChecked():
+            text += ' + P\u00b7V(x)'
+        if self._ideal_gas_cb.isChecked():
+            text += ' + R\u00b7T\u00b7ln(P/P\u2080)'
+        text += ('\n'
+                 'H(x) = H\u2080 + H\u2081\u00b7x + H\u2082\u00b7x\u00b2 + \u2026'
+                 '   \u2502   '
+                 'S(x) = S\u2080 + S\u2081\u00b7x + S\u2082\u00b7x\u00b2 + \u2026')
+        if self._V_enable_cb.isChecked():
+            text += '   \u2502   V(x) = V\u2080 + V\u2081\u00b7x + V\u2082\u00b7x\u00b2 + \u2026'
+        self._hint_lbl.setText(text)
 
     def get_phase_data(self) -> PhaseData:
         pd = PhaseData()
@@ -781,7 +806,8 @@ class BuilderWindow(QDialog):
 
         sys_layout.addWidget(QLabel('Title:'))
         self._title_edit = QLineEdit()
-        self._title_edit.setMaximumWidth(160)
+        self._title_edit.setMinimumWidth(260)
+        self._title_edit.setMaximumWidth(300)
         sys_layout.addWidget(self._title_edit)
 
         sys_layout.addSpacing(12)
@@ -850,7 +876,8 @@ class BuilderWindow(QDialog):
             pres_layout.addWidget(sb)
         pres_layout.addWidget(QLabel('Unit:'))
         self._P_unit_edit = QLineEdit()
-        self._P_unit_edit.setMaximumWidth(55)
+        self._P_unit_edit.setMinimumWidth(40)
+        self._P_unit_edit.setMaximumWidth(60)
         pres_layout.addWidget(self._P_unit_edit)
         pres_layout.addSpacing(8)
         pres_layout.addWidget(QLabel('R_gas:'))
