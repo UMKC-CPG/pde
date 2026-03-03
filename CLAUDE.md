@@ -148,51 +148,51 @@ Interactive PySide6 + matplotlib window with full pressure support:
 - **`TxCanvas`** (right, Fixed P mode): T-x phase diagram revealed incrementally top-down; white cover rectangle shrinks as T slider moves down (O(1) updates).
 - **`PxCanvas`** (right, Fixed T mode): P-x phase diagram, symmetric to `TxCanvas` but revealed bottom-up as P slider moves down. Created lazily on first mode switch.
 
-**Layout:**
+**Layout (Phase 3 — generalised):**
 All controls sit in a single **top row** above the canvas area:
-`Builder…` — `3D View…` (if pressure) — `[Fixed P | Fixed T]` (if pressure) — `Reveal all` — `Colors…` — `[Pre-compute | Progress | Status]` (if pressure).
-Below the canvas: T slider row; then P slider row (when `has_pressure`).
+`Builder…` — `3D View…` (if >1 field) — `[{sym}-x diagram combo]` (if >1 field) — `Reveal all` — `Colors…` — `Resolution` — `[Pre-compute | Progress | Status]` (if >1 field).
+Below the canvas: one slider row per field in `system.fields`.
 
 **Controls:**
-- **Mode selector** (only when `system.has_pressure`): "Fixed P (T-x)" / "Fixed T (P-x)" radio buttons swap the right canvas and reassign primary/secondary roles to the sliders.
-- **T slider**: integer kelvin ticks; always visible.
-- **P slider**: shown only when `system.has_pressure`; maps 0…N_P_STEPS-1 ticks linearly to P_min…P_max. Endpoint labels and live label include `system.P_unit` (e.g. "0.5 atm" / "5 atm" / "P = 2 atm"); bare numbers when `P_unit=''`.
-- **"Reveal all" checkbox**: when checked, hides the cover rectangle on both canvases so the full phase diagram is visible regardless of slider position. Unchecking restores the cover to the current slider position. State is preserved across diagram regens triggered by the secondary slider.
-- **"Pre-compute full T-P-x" button** (only when `system.has_pressure`): toggles background computation of the full N_T_STEPS × N_P_STEPS grid. Label cycles: "Pre-compute full T-P-x" → "Pause Computation" → "Restart Computation" → (repeats) → "Full T-P-x cached" (disabled when done). Progress bar and status label update via signals. Once cached, moving the secondary slider is instantaneous (index lookup instead of recompute). While paused or in-progress, the secondary slider falls back to on-demand recompute (unchanged from no-grid behavior).
-- **"Colors…" button**: opens `ColorDialog` — a non-modal dialog for per-phase color swatches, palette presets (`_PALETTES`), two-phase region color, and hatch style (`_HATCH_OPTIONS`). Changes apply live to all canvases. The palette dropdown defaults to `'Muted'`.
-- **"3D View…" button** (only when `system.has_pressure`): disabled until the full T-P-x grid is cached; clicking opens `Viz3DWindow` (non-modal). Becomes disabled again when resolution changes (grid cleared) or `reload_system()` fires (grid cleared + old window closed). Raising the button when the window is already visible brings it to front.
+- **Mode combo** (only when `len(system.fields) > 1`): one entry per field (`"{sym}-x diagram"`); selecting a field makes it the primary Y axis of `SweepCanvas` and swaps the sweep data lazily.
+- **Field sliders**: `_field_sliders[i]` / `_field_labels[i]` — one per field; all use 0…N_STEPS-1 ticks mapped linearly to `field.min_val…field.max_val`.
+- **"Reveal all" checkbox**: hides the cover rectangle on all `SweepCanvas` instances.
+- **"Pre-compute full T-P-x" button** (only when `len(system.fields) > 1`): same pause/resume cycle as before.
+- **"Colors…" button**: opens `ColorDialog`; applies live to all canvases.
+- **"3D View…" button** (only when `len(system.fields) > 1`): disabled until full grid cached.
 
-**Legend positioning:**
-- Default location is `'upper left'` on all three canvases.
-- Right-clicking any canvas shows a context menu ("Legend position") listing all nine standard matplotlib locations; the current selection is checked. Choosing one moves the legend immediately. Each canvas stores its own `_legend_loc`; `GxCanvas` rerenders via `redraw()`, `TxCanvas`/`PxCanvas` call `legend.set_loc()` directly.
+**Canvases:**
+- **`GxCanvas`** (left): unchanged except title is now field-driven (loops `system.fields`).
+- **`SweepCanvas`** (right, Phase 3): unified replacement for the old `TxCanvas`/`PxCanvas`. Accepts `primary_field: Field` and `precomputed: list[EqResult]` sorted descending. Y axis label/title/limits are all derived from `primary_field`. Methods: `set_cursor(val)`, `set_reveal_all(flag)`, `reset(precomputed, current_val)`, `recolor()`.
 
-**Two-phase region rendering:**
-- Drawn as one thin `broken_barh` strip per T/P step with `linewidth=0` to suppress visible bar-boundary lines.
-- When hatch is active: `edgecolors='black'` (hatch lines are drawn in the edge color by matplotlib; hatch line width comes from `rcParams['hatch.linewidth']`, not the patch `linewidth`).
-- When hatch is `''` (None): `edgecolors='none'` for a clean solid fill.
-- Legend swatch mirrors the same `edgecolor`/`linewidth` logic.
+**Key state (Phase 3 — generalised):**
+- `_precomputed[i]` / `_field_arr[i]`: list-indexed per field (replaces `_precomputed_Tx/Px`, `_T_arr/_P_arr`).
+- `_primary_idx: int`: which field is the Y axis of `SweepCanvas` (replaces `_mode = 'fixed_P'/'fixed_T'`).
+- `_sweep_canvases: dict[int, SweepCanvas]`: lazy dict; created on first mode switch to field `i`.
+
+**Key functions (Phase 3):**
+- `precompute_sweep_diagram(system, primary_field_idx, fixed_field_values, n_steps)` — sweeps primary field max→min at fixed others; returns `list[EqResult]`.
+- `precompute_Tx_diagram(system, P, n_steps)` / `precompute_Px_diagram(system, T, n_steps)` — backward-compat wrappers around `precompute_sweep_diagram`.
+- `_extract_field_values(precomputed, field) → np.array` — extracts T or P from `EqResult` list.
 
 **`FullGridWorker` internals:**
 - `threading.Event` (`_run_event`, initially set) + `_abort` flag.
-- `run()` calls `_run_event.wait()` then checks `_abort` before each `compute_equilibrium` call — blocks immediately on pause, negligible overhead when running.
-- `pause()` clears the event; `resume()` sets it; `abort()` sets `_abort=True` then sets the event (unblocks a paused worker).
+- `run()` calls `_run_event.wait()` then checks `_abort` before each `compute_equilibrium` call.
+- `pause()` clears the event; `resume()` sets it; `abort()` sets `_abort=True` then sets the event.
 - `MainWindow._worker_state`: `'idle'` → `'running'` → `'paused'` ↔ `'running'` → `'done'`.
 - `MainWindow.closeEvent` calls `abort()` + `wait()` before window teardown; also closes `_builder` and `_viz3d_window` if open.
 
 **Slider interaction logic:**
-- Primary slider (`valueChanged`) → fast O(1) update: nearest pre-computed result looked up by index.
-- Secondary slider (`sliderReleased`) → recomputes the opposite sweep at the new secondary value (or performs an instant index lookup if the full grid is cached). The cover is initialized at the current primary slider position, not reset to `T_initial`/`P_initial`.
-- `actionTriggered` signal connected to `_on_T_action` / `_on_P_action`: handles discrete slider actions (bar-click, arrow keys, Home/End) that do not fire `sliderReleased`. Uses `QTimer.singleShot(0, ...)` to defer into the event loop so `valueChanged` has already updated the slider value before the released handler reads it. `isSliderDown()` guards against double-firing during thumb drags.
-- Mode switch → cover is initialized at the current primary slider position.
+- Primary slider (`_on_slider_changed`) → fast O(1) lookup in `_precomputed[_primary_idx]`.
+- Secondary slider (`_on_slider_released`) → `precompute_sweep_diagram` recompute (or instant grid slice if cached). `_on_slider_action` fires `_on_slider_released` via `QTimer.singleShot(0, ...)` for bar-clicks/key-presses.
+- `_rebuild_primary_from_grid(sec_field_idx, sec_val)` — slices cached grid when secondary slider drags with full grid available (instant O(1) update).
+- Mode switch → cover initialized at current primary slider position.
 
-**`MainWindow` refactor for builder support:**
-- `__init__` delegates to `_init_system_state()` (sets all non-widget state) and `_build_central_widget()` (creates all Qt widgets/layouts/signals; calls `setCentralWidget()` so it can be safely called again on reload).
-- `reload_system(system)` — public slot called by the builder on Apply: aborts any running worker, closes the color dialog, closes `_viz3d_window` if open, pre-computes a new T-x diagram, calls `_init_system_state()` + `_build_central_widget()`; re-activates handle-drag edit mode on the fresh canvas if the builder is still visible.
-- `_open_builder()` — opens (or raises) the builder window; creates a new `BuilderWindow` each time the old one is not visible; connects its `system_applied` signal to `reload_system`; activates `GxCanvas` handle-drag edit mode and wires `phase_edited` → `_on_phase_edited`.
-- `_on_builder_closed()` — deactivates `GxCanvas` edit mode and disconnects `phase_edited` from `_on_phase_edited` when the builder window closes.
-- `_on_phase_edited(name, new_pd)` — calls `BuilderWindow.update_phase_data()` to sync spinboxes, then builds a temporary `System` with the edited phase and recomputes equilibrium at the current T/P, then redraws `GxCanvas` (live hull update after every drag without waiting for Apply).
-- **"Builder…" button** is always present in the top row (before the final stretch).
-- `launch_ui_empty()` / `_make_default_system()` — entry point when no input file is found; creates a single-liquid-phase default system and auto-opens the builder.
+**`MainWindow` refactor:**
+- `__init__` delegates to `_init_system_state()` + `_build_central_widget()`.
+- `reload_system(system)` — called by builder on Apply; uses `precompute_sweep_diagram`.
+- `_open_builder()`, `_on_builder_closed()`, `_on_phase_edited()` — builder integration unchanged in behaviour; `_on_phase_edited` now uses `_current_val(i)` dict instead of hardcoded `_current_T()`/`_current_P()`.
+- `launch_ui_empty()` / `_make_default_system()` — unchanged.
 
 **Interactive G(x) handle-drag editing:**
 - `_G_from_phase_data(pd, x, T, P=0.0, R_gas=0.0, P_ref=1.0)` — module-level helper; evaluates full `G = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P₀)]` from a live `PhaseData` object; mirrors `HSModel.gibbs()`; pressure params default to zero for backward compatibility.

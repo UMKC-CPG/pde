@@ -140,6 +140,15 @@ def _compute_ylim(precomputed):
     return (all_G.min() - margin, all_G.max() + margin)
 
 
+def _extract_field_values(precomputed, field):
+    """Extract the primary field values from a list of EqResult as a numpy array."""
+    if field.name == 'temperature':
+        return np.array([r.T for r in precomputed])
+    elif field.name == 'pressure':
+        return np.array([r.P for r in precomputed])
+    return np.array([r.T for r in precomputed])  # fallback for future fields
+
+
 def _G_from_phase_data(pd, x, T, P=0.0, R_gas=0.0, P_ref=1.0):
     """Evaluate G(x, T[, P]) directly from a PhaseData object.
 
@@ -302,7 +311,18 @@ class GxCanvas(FigureCanvasQTAgg):
 
         ax.set_xlabel('Composition  x(B)')
         ax.set_ylabel('Gibbs Energy  G')
-        ax.set_title(f'G vs x     T = {result.T:.1f} K   P = {result.P:.3g}')
+        parts = []
+        for f in self.system.fields:
+            if f.name == 'temperature':
+                val_str = f'{f.symbol} = {result.T:.3g}'
+            elif f.name == 'pressure':
+                val_str = f'{f.symbol} = {result.P:.3g}'
+            else:
+                continue
+            if f.unit:
+                val_str += f' {f.unit}'
+            parts.append(val_str)
+        ax.set_title('G vs x     ' + '   '.join(parts) if parts else 'G vs x')
         ax.set_xlim(-0.02, 1.02)
         if self._y_lim is not None:
             ax.set_ylim(self._y_lim)
@@ -644,29 +664,27 @@ class GxCanvas(FigureCanvasQTAgg):
 
 
 # ---------------------------------------------------------------------------
-# T-x canvas
+# Sweep canvas  (unified replacement for the old TxCanvas / PxCanvas)
 # ---------------------------------------------------------------------------
 
-class TxCanvas(FigureCanvasQTAgg):
-    """Right panel: T-x phase diagram with incremental top-down revelation."""
+class SweepCanvas(FigureCanvasQTAgg):
+    """Right panel: x-phase-diagram swept over one field, all others fixed.
 
-    def __init__(self, system, precomputed, colors=None,
+    Parameters
+    ----------
+    primary_field   : Field   — the field shown on the Y axis
+    precomputed     : list[EqResult]  sorted by primary field DESCENDING
+    """
+
+    def __init__(self, system, primary_field, precomputed, colors=None,
                  two_phase_color=_TWO_PHASE_COLOR, two_phase_hatch=_TWO_PHASE_HATCH):
-        """
-        Parameters
-        ----------
-        system          : System
-        precomputed     : list[EqResult]  sorted by T descending (T_max first)
-        colors          : dict {phase_name: color_str}  or None to use default
-        two_phase_color : str  hex color for two-phase regions
-        two_phase_hatch : str  matplotlib hatch pattern ('' = no hatch)
-        """
         self.system = system
+        self.primary_field = primary_field
         self.precomputed = precomputed
         self._colors = colors if colors is not None else _color_map(system.phases)
         self._two_phase_color = two_phase_color
         self._two_phase_hatch = two_phase_hatch
-        self._lowest_T = system.T_initial   # lowest temperature explored so far
+        self._lowest_val = primary_field.initial_val
         self._reveal_all = False
         self._legend_loc = 'upper left'
 
@@ -674,217 +692,46 @@ class TxCanvas(FigureCanvasQTAgg):
         super().__init__(fig)
         self.ax = fig.add_subplot(111)
 
+        self._prim_values = _extract_field_values(precomputed, primary_field)
         self._setup_axes()
         self._draw_full_diagram()
-        self._add_cover_and_cursor(system.T_initial)
+        self._add_cover_and_cursor(primary_field.initial_val)
         self.draw()
 
     def _setup_axes(self):
-        ax = self.ax
-        ax.set_xlabel('Composition  x(B)')
-        ax.set_ylabel('Temperature  (K)')
-        ax.set_title('T-x  Phase Diagram')
-        ax.set_xlim(-0.02, 1.02)
-        ax.set_ylim(self.system.T_min, self.system.T_max)
-
-        # Legend: one entry per non-end-member phase, plus two-phase.
+        f = self.primary_field
+        unit_str = f' ({f.unit})' if f.unit else ''
+        self.ax.set_xlabel('Composition  x(B)')
+        self.ax.set_ylabel(f'{f.name.capitalize()}{unit_str}')
+        self.ax.set_title(f'{f.symbol}-x  Phase Diagram')
+        self.ax.set_xlim(-0.02, 1.02)
+        self.ax.set_ylim(f.min_val, f.max_val)
         handles = [
             Patch(facecolor=self._colors[p.name], label=p.name)
-            for p in self.system.phases
-            if p.phase_type != 'end_member'
+            for p in self.system.phases if p.phase_type != 'end_member'
         ]
         handles.append(Patch(facecolor=self._two_phase_color,
                              hatch=self._two_phase_hatch or None,
                              edgecolor='black' if self._two_phase_hatch else 'none',
                              linewidth=0,
                              label='two-phase'))
-        ax.legend(handles=handles, loc=self._legend_loc, fontsize=8)
+        self.ax.legend(handles=handles, loc=self._legend_loc, fontsize=8)
 
     def _draw_full_diagram(self):
-        """Render all pre-computed regions into the axes (called once at init)."""
         ax = self.ax
         results = self.precomputed
-
+        prim_min = self.primary_field.min_val
         for i, result in enumerate(results):
-            T_top = result.T
-            T_bot = (results[i + 1].T
-                     if i + 1 < len(results)
-                     else self.system.T_min)
-            dT = T_top - T_bot
-
+            v_top = self._prim_values[i]
+            v_bot = (self._prim_values[i + 1]
+                     if i + 1 < len(results) else prim_min)
+            dv = v_top - v_bot
             for r in result.regions:
                 x0 = r['x0']
                 width = r['x1'] - r['x0']
-
                 if r['type'] == 'two_phase':
                     ax.broken_barh(
-                        [(x0, width)], (T_bot, dT),
-                        facecolors=self._two_phase_color,
-                        edgecolors='black' if self._two_phase_hatch else 'none',
-                        linewidth=0,
-                        hatch=self._two_phase_hatch or None,
-                        alpha=0.9)
-                else:
-                    phase = self.system.phases[r['phases'][0]]
-                    if phase.phase_type == 'end_member':
-                        continue    # zero-width; nothing meaningful to draw
-                    ax.broken_barh(
-                        [(x0, width)], (T_bot, dT),
-                        facecolors=self._colors[phase.name],
-                        edgecolors='none',
-                        alpha=0.85)
-
-    def _add_cover_and_cursor(self, T_initial):
-        """Add the white cover rectangle and cursor line at T_initial."""
-        cover_height = T_initial - self.system.T_min
-        self._cover = MplRectangle(
-            xy=(-0.1, self.system.T_min),
-            width=1.2,
-            height=cover_height,
-            facecolor='white', edgecolor='none', zorder=5)
-        self.ax.add_patch(self._cover)
-
-        self._cursor_line = self.ax.axhline(
-            T_initial, color='black',
-            linewidth=2.0, linestyle='--', zorder=10)
-
-    def reset(self, precomputed, current_T=None):
-        """Redraw canvas with new precomputed data (after secondary P-slider move).
-
-        current_T sets the cover position; defaults to T_initial so the diagram
-        starts fully covered when no primary slider has been moved yet.
-        The current _reveal_all state is preserved across resets.
-        """
-        if current_T is None:
-            current_T = self.system.T_initial
-        self.precomputed = precomputed
-        self._lowest_T = current_T
-        self.ax.cla()
-        self._setup_axes()
-        self._draw_full_diagram()
-        self._add_cover_and_cursor(current_T)
-        if self._reveal_all:
-            self._cover.set_height(0)
-        self.draw()
-
-    def set_cursor(self, T):
-        """Move cursor to T; shrink the cover if T is a new minimum."""
-        if T < self._lowest_T:
-            self._lowest_T = T
-            if not self._reveal_all:
-                self._cover.set_height(T - self.system.T_min)
-        self._cursor_line.set_ydata([T, T])
-        self.draw()
-
-    def set_reveal_all(self, flag):
-        """Show or hide the cover rectangle regardless of the slider position."""
-        self._reveal_all = flag
-        self._cover.set_height(0 if flag else self._lowest_T - self.system.T_min)
-        self.draw()
-
-    def recolor(self):
-        """Redraw the diagram with updated colors, preserving cover/reveal state."""
-        self.ax.cla()
-        self._setup_axes()
-        self._draw_full_diagram()
-        self._add_cover_and_cursor(self._lowest_T)
-        if self._reveal_all:
-            self._cover.set_height(0)
-        self.draw()
-
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.addSection('Legend position')
-        for loc in _LEGEND_LOCATIONS:
-            action = menu.addAction(loc)
-            action.setCheckable(True)
-            action.setChecked(loc == self._legend_loc)
-            action.triggered.connect(lambda checked, l=loc: self._set_legend_loc(l))
-        menu.exec(event.globalPos())
-
-    def _set_legend_loc(self, loc):
-        self._legend_loc = loc
-        leg = self.ax.get_legend()
-        if leg is not None:
-            leg.set_loc(loc)
-            self.draw()
-
-
-# ---------------------------------------------------------------------------
-# P-x canvas
-# ---------------------------------------------------------------------------
-
-class PxCanvas(FigureCanvasQTAgg):
-    """Right panel (Fixed T mode): P-x phase diagram with incremental revelation."""
-
-    def __init__(self, system, precomputed, colors=None,
-                 two_phase_color=_TWO_PHASE_COLOR, two_phase_hatch=_TWO_PHASE_HATCH):
-        """
-        Parameters
-        ----------
-        system          : System
-        precomputed     : list[EqResult]  sorted by P descending (P_max first)
-        colors          : dict {phase_name: color_str}  or None to use default
-        two_phase_color : str  hex color for two-phase regions
-        two_phase_hatch : str  matplotlib hatch pattern ('' = no hatch)
-        """
-        self.system = system
-        self.precomputed = precomputed
-        self._colors = colors if colors is not None else _color_map(system.phases)
-        self._two_phase_color = two_phase_color
-        self._two_phase_hatch = two_phase_hatch
-        self._lowest_P = system.P_initial   # lowest pressure explored so far
-        self._reveal_all = False
-        self._legend_loc = 'upper left'
-
-        fig = Figure(tight_layout=True)
-        super().__init__(fig)
-        self.ax = fig.add_subplot(111)
-
-        self._setup_axes()
-        self._draw_full_diagram()
-        self._add_cover_and_cursor(system.P_initial)
-        self.draw()
-
-    def _setup_axes(self):
-        ax = self.ax
-        ax.set_xlabel('Composition  x(B)')
-        ax.set_ylabel('Pressure')
-        ax.set_title('P-x  Phase Diagram')
-        ax.set_xlim(-0.02, 1.02)
-        ax.set_ylim(self.system.P_min, self.system.P_max)
-
-        handles = [
-            Patch(facecolor=self._colors[p.name], label=p.name)
-            for p in self.system.phases
-            if p.phase_type != 'end_member'
-        ]
-        handles.append(Patch(facecolor=self._two_phase_color,
-                             hatch=self._two_phase_hatch or None,
-                             edgecolor='black' if self._two_phase_hatch else 'none',
-                             linewidth=0,
-                             label='two-phase'))
-        ax.legend(handles=handles, loc=self._legend_loc, fontsize=8)
-
-    def _draw_full_diagram(self):
-        """Render all pre-computed regions into the axes (called once at init)."""
-        ax = self.ax
-        results = self.precomputed
-
-        for i, result in enumerate(results):
-            P_top = result.P
-            P_bot = (results[i + 1].P
-                     if i + 1 < len(results)
-                     else self.system.P_min)
-            dP = P_top - P_bot
-
-            for r in result.regions:
-                x0 = r['x0']
-                width = r['x1'] - r['x0']
-
-                if r['type'] == 'two_phase':
-                    ax.broken_barh(
-                        [(x0, width)], (P_bot, dP),
+                        [(x0, width)], (v_bot, dv),
                         facecolors=self._two_phase_color,
                         edgecolors='black' if self._two_phase_hatch else 'none',
                         linewidth=0,
@@ -895,65 +742,58 @@ class PxCanvas(FigureCanvasQTAgg):
                     if phase.phase_type == 'end_member':
                         continue
                     ax.broken_barh(
-                        [(x0, width)], (P_bot, dP),
+                        [(x0, width)], (v_bot, dv),
                         facecolors=self._colors[phase.name],
                         edgecolors='none',
                         alpha=0.85)
 
-    def _add_cover_and_cursor(self, P_initial):
-        """Add the white cover rectangle and cursor line at P_initial."""
-        cover_height = P_initial - self.system.P_min
+    def _add_cover_and_cursor(self, initial_val):
+        f = self.primary_field
         self._cover = MplRectangle(
-            xy=(-0.1, self.system.P_min),
-            width=1.2,
-            height=cover_height,
+            xy=(-0.1, f.min_val), width=1.2,
+            height=initial_val - f.min_val,
             facecolor='white', edgecolor='none', zorder=5)
         self.ax.add_patch(self._cover)
-
         self._cursor_line = self.ax.axhline(
-            P_initial, color='black',
-            linewidth=2.0, linestyle='--', zorder=10)
+            initial_val, color='black', linewidth=2.0, linestyle='--', zorder=10)
 
-    def reset(self, precomputed, current_P=None):
-        """Redraw canvas with new precomputed data (after secondary T-slider move).
-
-        current_P sets the cover position; defaults to P_initial so the diagram
-        starts fully covered when no primary slider has been moved yet.
-        The current _reveal_all state is preserved across resets.
-        """
-        if current_P is None:
-            current_P = self.system.P_initial
+    def reset(self, precomputed, current_val=None):
+        """Redraw with new precomputed data (after secondary-slider recompute)."""
+        if current_val is None:
+            current_val = self.primary_field.initial_val
         self.precomputed = precomputed
-        self._lowest_P = current_P
+        self._prim_values = _extract_field_values(precomputed, self.primary_field)
+        self._lowest_val = current_val
         self.ax.cla()
         self._setup_axes()
         self._draw_full_diagram()
-        self._add_cover_and_cursor(current_P)
+        self._add_cover_and_cursor(current_val)
         if self._reveal_all:
             self._cover.set_height(0)
         self.draw()
 
-    def set_cursor(self, P):
-        """Move cursor to P; shrink the cover if P is a new minimum."""
-        if P < self._lowest_P:
-            self._lowest_P = P
+    def set_cursor(self, val):
+        """Move cursor to val; shrink cover if val is a new minimum."""
+        if val < self._lowest_val:
+            self._lowest_val = val
             if not self._reveal_all:
-                self._cover.set_height(P - self.system.P_min)
-        self._cursor_line.set_ydata([P, P])
+                self._cover.set_height(val - self.primary_field.min_val)
+        self._cursor_line.set_ydata([val, val])
         self.draw()
 
     def set_reveal_all(self, flag):
         """Show or hide the cover rectangle regardless of the slider position."""
         self._reveal_all = flag
-        self._cover.set_height(0 if flag else self._lowest_P - self.system.P_min)
+        self._cover.set_height(
+            0 if flag else self._lowest_val - self.primary_field.min_val)
         self.draw()
 
     def recolor(self):
-        """Redraw the diagram with updated colors, preserving cover/reveal state."""
+        """Redraw with updated colors, preserving cover/reveal state."""
         self.ax.cla()
         self._setup_axes()
         self._draw_full_diagram()
-        self._add_cover_and_cursor(self._lowest_P)
+        self._add_cover_and_cursor(self._lowest_val)
         if self._reveal_all:
             self._cover.set_height(0)
         self.draw()
@@ -1205,18 +1045,29 @@ class MainWindow(QMainWindow):
         self.system = system
         self.setWindowTitle(system.title)
 
-        self._precomputed_Tx = precomputed_Tx
-        self._precomputed_Px = precomputed_Px
+        # Generalised sweep state — one entry per field in system.fields.
+        # _precomputed[i]: list[EqResult] for sweeping field i at other fields' initial
+        # _field_arr[i]:   numpy array of primary field values for _precomputed[i].
+        # None entries are filled lazily on the first mode switch to field i.
+        n_fields = len(system.fields)
+        self._precomputed = [None] * n_fields
+        self._field_arr   = [None] * n_fields
 
-        self._T_arr = np.array([r.T for r in precomputed_Tx])
-        if precomputed_Px is not None:
-            self._P_arr = np.array([r.P for r in precomputed_Px])
-        elif system.has_pressure:
-            self._P_arr = np.linspace(system.P_max, system.P_min, self._n_steps)
-        else:
-            self._P_arr = None
+        self._precomputed[0] = precomputed_Tx
+        self._field_arr[0]   = _extract_field_values(precomputed_Tx, system.fields[0])
 
-        self._mode         = 'fixed_P'
+        if n_fields > 1:
+            f1 = system.fields[1]
+            if precomputed_Px is not None:
+                self._precomputed[1] = precomputed_Px
+                self._field_arr[1]   = _extract_field_values(precomputed_Px, f1)
+            else:
+                # Placeholder until lazy computation.
+                self._field_arr[1] = np.linspace(f1.max_val, f1.min_val, self._n_steps)
+
+        # Which field is the primary sweep axis (Y axis of the sweep canvas).
+        self._primary_idx = 0
+
         self._full_grid    = None
         self._worker       = None
         self._worker_state = 'idle'
@@ -1236,74 +1087,68 @@ class MainWindow(QMainWindow):
         """
         system = self.system
 
-        # ---- G-x y-limits from the Tx precomputed data ----
-        y_lim = _compute_ylim(self._precomputed_Tx)
+        # ---- G-x y-limits ----
+        y_lim = _compute_ylim(self._precomputed[0])
 
-        # ---- canvases ----
+        # ---- G-x canvas ----
         self.gx_canvas = GxCanvas(system, y_lim, colors=self._colors)
-        self.tx_canvas = TxCanvas(system, self._precomputed_Tx,
-                                  colors=self._colors,
-                                  two_phase_color=self._two_phase_color,
-                                  two_phase_hatch=self._two_phase_hatch)
-        self.px_canvas = (PxCanvas(system, self._precomputed_Px,
-                                   colors=self._colors,
-                                   two_phase_color=self._two_phase_color,
-                                   two_phase_hatch=self._two_phase_hatch)
-                          if self._precomputed_Px is not None else None)
+
+        # ---- primary sweep canvas ----
+        prim_field = system.fields[self._primary_idx]
+        prim_canvas = SweepCanvas(
+            system, prim_field, self._precomputed[self._primary_idx],
+            colors=self._colors,
+            two_phase_color=self._two_phase_color,
+            two_phase_hatch=self._two_phase_hatch)
+        self._sweep_canvases = {self._primary_idx: prim_canvas}
 
         # ---- right-panel stacked widget ----
         self._right_stack = QStackedWidget()
-        self._right_stack.addWidget(self.tx_canvas)        # index 0
-        if self.px_canvas is not None:
-            self._right_stack.addWidget(self.px_canvas)    # index 1
+        self._right_stack.addWidget(prim_canvas)
         self._right_stack.setCurrentIndex(0)
 
-        # ---- T slider ----
-        self.T_slider = QSlider(Qt.Horizontal)
-        self.T_slider.setMinimum(int(system.T_min))
-        self.T_slider.setMaximum(int(system.T_max))
-        self.T_slider.setValue(int(system.T_initial))
-        self.T_slider.setSingleStep(1)
-        self.T_slider.setPageStep(10)
-        self.T_label = QLabel(f'T = {system.T_initial:.0f} K')
-        self.T_label.setMinimumWidth(90)
+        # ---- field sliders (one per field) ----
+        self._field_sliders = []
+        self._field_labels  = []
+        for field in system.fields:
+            slider = QSlider(Qt.Horizontal)
+            slider.setMinimum(0)
+            slider.setMaximum(self._n_steps - 1)
+            val_range = max(field.max_val - field.min_val, 1e-30)
+            frac = (field.initial_val - field.min_val) / val_range
+            slider.setValue(int(round(frac * (self._n_steps - 1))))
+            slider.setSingleStep(1)
+            slider.setPageStep(10)
+            unit_str = f' {field.unit}' if field.unit else ''
+            label = QLabel(f'{field.symbol} = {field.initial_val:.3g}{unit_str}')
+            label.setMinimumWidth(90)
+            self._field_sliders.append(slider)
+            self._field_labels.append(label)
 
-        # ---- P slider (only when has_pressure) ----
-        self.P_slider = None
-        self.P_label  = None
-        if system.has_pressure:
-            self.P_slider = QSlider(Qt.Horizontal)
-            self.P_slider.setMinimum(0)
-            self.P_slider.setMaximum(self._n_steps - 1)
-            P_range = max(system.P_max - system.P_min, 1e-30)
-            P_frac = (system.P_initial - system.P_min) / P_range
-            self.P_slider.setValue(int(round(P_frac * (self._n_steps - 1))))
-            self.P_label = QLabel(f'P = {system.P_initial:.3g} {system.P_unit}'.strip())
-            self.P_label.setMinimumWidth(90)
-
-        # ---- mode selector (only when has_pressure) ----
+        # ---- mode selector (only when multiple fields) ----
         self._mode_combo = None
-        if system.has_pressure:
+        if len(system.fields) > 1:
             self._mode_combo = QComboBox()
-            self._mode_combo.addItem('Fixed P  (T-x)')   # index 0
-            self._mode_combo.addItem('Fixed T  (P-x)')   # index 1
-            self._mode_combo.setCurrentIndex(0)
+            for f in system.fields:
+                self._mode_combo.addItem(f'{f.symbol}-x diagram')
+            self._mode_combo.setCurrentIndex(self._primary_idx)
 
         # ---- shared controls ----
         self._reveal_cb  = QCheckBox('Reveal all')
         self._colors_btn = QPushButton('Colors\u2026')
         self._res_combo  = QComboBox()
-        for _label, _n in [('Very Low (25)', 25), ('Low (50)', 50),
-                            ('Medium (100)', 100), ('High (200)', 200),
-                            ('Very High (500)', 500)]:
-            self._res_combo.addItem(_label, _n)
+        for _lbl, _n in [('Very Low (25)', 25), ('Low (50)', 50),
+                          ('Medium (100)', 100), ('High (200)', 200),
+                          ('Very High (500)', 500)]:
+            self._res_combo.addItem(_lbl, _n)
         self._res_combo.setCurrentIndex(3)   # default: High (200)
 
-        # ---- pre-compute widgets (only when pressure is active) ----
+        # ---- pre-compute / 3D widgets (only when multiple fields) ----
         self._precompute_btn    = None
         self._precompute_bar    = None
         self._precompute_status = None
-        if system.has_pressure:
+        self._viz3d_btn         = None
+        if len(system.fields) > 1:
             self._precompute_btn = QPushButton('Pre-compute full T-P-x')
             n_total = self._n_steps ** 2
             self._precompute_bar = QProgressBar()
@@ -1311,30 +1156,24 @@ class MainWindow(QMainWindow):
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(False)
             self._precompute_status = QLabel('')
+            self._viz3d_btn = QPushButton('3D View\u2026')
+            self._viz3d_btn.setEnabled(self._full_grid is not None)
+            self._viz3d_btn.setToolTip(
+                'Opens 3D T-P-x phase diagram.\n'
+                'Requires full grid \u2014 click \u201cPre-compute full T-P-x\u201d first.')
 
         # ---- Builder button ----
         self._builder_btn = QPushButton('Builder\u2026')
         self._builder_btn.clicked.connect(self._open_builder)
 
-        # ---- 3D View button (only when has_pressure) ----
-        self._viz3d_btn = None
-        if system.has_pressure:
-            self._viz3d_btn = QPushButton('3D View\u2026')
-            self._viz3d_btn.setEnabled(self._full_grid is not None)
-            self._viz3d_btn.setToolTip(
-                'Opens 3D T-P-x phase diagram.\n'
-                'Requires full grid \u2014 click \u201cPre-compute full T-P-x\u201d first.'
-            )
-
-        # ---- layout ----
-        # Top row: Builder… | 3D View… (if pressure) | mode combo (if pressure) | Reveal all | Colors… | Resolution | precompute (if pressure)
+        # ---- top row layout ----
         top_row = QHBoxLayout()
         top_row.addWidget(self._builder_btn)
         top_row.addSpacing(16)
         if self._viz3d_btn is not None:
             top_row.addWidget(self._viz3d_btn)
             top_row.addSpacing(8)
-        if system.has_pressure:
+        if self._mode_combo is not None:
             top_row.addWidget(self._mode_combo)
             top_row.addSpacing(16)
         top_row.addWidget(self._reveal_cb)
@@ -1342,7 +1181,7 @@ class MainWindow(QMainWindow):
         top_row.addSpacing(8)
         top_row.addWidget(QLabel('Resolution:'))
         top_row.addWidget(self._res_combo)
-        if system.has_pressure:
+        if self._precompute_btn is not None:
             top_row.addSpacing(16)
             top_row.addWidget(self._precompute_btn)
             top_row.addWidget(self._precompute_bar, stretch=1)
@@ -1353,37 +1192,34 @@ class MainWindow(QMainWindow):
         canvas_row.addWidget(self.gx_canvas)
         canvas_row.addWidget(self._right_stack)
 
-        T_slider_row = QHBoxLayout()
-        T_slider_row.addWidget(QLabel(f'{system.T_min:.0f} K'))
-        T_slider_row.addWidget(self.T_slider)
-        T_slider_row.addWidget(QLabel(f'{system.T_max:.0f} K'))
-        T_slider_row.addWidget(self.T_label)
-
         root = QVBoxLayout()
         root.addLayout(top_row)
         root.addLayout(canvas_row)
-        root.addLayout(T_slider_row)
 
-        if self.P_slider is not None:
-            P_slider_row = QHBoxLayout()
-            P_slider_row.addWidget(QLabel(f'{system.P_min:.3g} {system.P_unit}'.strip()))
-            P_slider_row.addWidget(self.P_slider)
-            P_slider_row.addWidget(QLabel(f'{system.P_max:.3g} {system.P_unit}'.strip()))
-            P_slider_row.addWidget(self.P_label)
-            root.addLayout(P_slider_row)
+        # One slider row per field.
+        for field, slider, label in zip(
+                system.fields, self._field_sliders, self._field_labels):
+            unit_str = f' {field.unit}' if field.unit else ''
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f'{field.min_val:.3g}{unit_str}'))
+            row.addWidget(slider)
+            row.addWidget(QLabel(f'{field.max_val:.3g}{unit_str}'))
+            row.addWidget(label)
+            root.addLayout(row)
 
         container = QWidget()
         container.setLayout(root)
         self.setCentralWidget(container)
 
         # ---- signal connections ----
-        self.T_slider.valueChanged.connect(self._on_T_changed)
-        self.T_slider.sliderReleased.connect(self._on_T_released)
-        self.T_slider.actionTriggered.connect(self._on_T_action)
-        if self.P_slider is not None:
-            self.P_slider.valueChanged.connect(self._on_P_changed)
-            self.P_slider.sliderReleased.connect(self._on_P_released)
-            self.P_slider.actionTriggered.connect(self._on_P_action)
+        for i, slider in enumerate(self._field_sliders):
+            slider.valueChanged.connect(
+                lambda tick, fi=i: self._on_slider_changed(fi, tick))
+            slider.sliderReleased.connect(
+                lambda fi=i: self._on_slider_released(fi))
+            slider.actionTriggered.connect(
+                lambda action, fi=i: self._on_slider_action(fi, action))
+        if self._mode_combo is not None:
             self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         if self._precompute_btn is not None:
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
@@ -1394,7 +1230,7 @@ class MainWindow(QMainWindow):
         self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
 
         # Render initial state.
-        self._on_T_changed(int(system.T_initial))
+        self._on_slider_changed(0, self._field_sliders[0].value())
 
     # ------------------------------------------------------------------
     # Builder integration
@@ -1411,16 +1247,26 @@ class MainWindow(QMainWindow):
             self._viz3d_window.close()
             self._viz3d_window = None
         print('Applying builder changes...', end=' ', flush=True)
-        P = system.P_initial if system.has_pressure else 0.0
-        precomputed_Tx = precompute_Tx_diagram(system, P)
+        # Use current secondary value if available, else use new system's initial.
+        fixed_vals = {}
+        if len(system.fields) > 1:
+            try:
+                fixed_vals = {f.name: self._current_val(i)
+                              for i, f in enumerate(self.system.fields)
+                              if i != 0
+                              if i < len(self._field_sliders)}
+            except (IndexError, AttributeError):
+                fixed_vals = {f.name: f.initial_val
+                              for f in system.fields[1:]}
+        precomputed_Tx = precompute_sweep_diagram(system, 0, fixed_vals)
         print('done.')
         self._init_system_state(system, precomputed_Tx, None)
         self._build_central_widget()
 
-        # Re-activate edit mode on the fresh canvas if the builder is still open.
+        # Re-activate edit mode on fresh canvas if builder is still open.
         if self._builder is not None and self._builder.isVisible():
             from pde_builder import SystemData
-            sd        = SystemData.from_system(system)
+            sd = SystemData.from_system(system)
             live_data = {pd.name: pd for pd in sd.phases}
             self.gx_canvas.set_edit_mode('handles', live_data)
             self.gx_canvas.phase_edited.connect(self._on_phase_edited)
@@ -1455,8 +1301,11 @@ class MainWindow(QMainWindow):
             self._viz3d_window.raise_()
             return
         from pde_3d import PhaseDiagram3D, Viz3DWindow
+        f0, f1 = self.system.fields[0], self.system.fields[1]
+        T_arr = np.linspace(f0.max_val, f0.min_val, self._n_steps)
+        P_arr = np.linspace(f1.max_val, f1.min_val, self._n_steps)
         diagram = PhaseDiagram3D.from_grid(
-            self._full_grid, self._T_arr, self._P_arr, self.system)
+            self._full_grid, T_arr, P_arr, self.system)
         self._viz3d_window = Viz3DWindow(diagram, colors=self._colors)
         self._viz3d_window.show()
 
@@ -1477,14 +1326,12 @@ class MainWindow(QMainWindow):
            phase, giving a correct hull at the current T and P without waiting
            for the user to click Apply.
 
-        The T-x / P-x canvases are NOT updated here — they remain valid for
+        The sweep canvases are NOT updated here — they remain valid for
         the pre-Apply system and are refreshed only when Apply is clicked.
         """
-        # Sync builder spinboxes.
         if self._builder is not None and self._builder.isVisible():
             self._builder.update_phase_data(name, new_pd)
 
-        # Build a temporary system with the edited phase.
         from pde_builder import SystemData
         sd = SystemData.from_system(self.system)
         for i, pd in enumerate(sd.phases):
@@ -1492,204 +1339,190 @@ class MainWindow(QMainWindow):
                 sd.phases[i] = new_pd
                 break
         tmp_system = sd.to_system()
-
-        T      = self._current_T()
-        P      = self._current_P()
-        result = compute_equilibrium(tmp_system, T, P)
+        fv = {f.name: self._current_val(i)
+              for i, f in enumerate(self.system.fields)}
+        result = compute_equilibrium(tmp_system,
+                                     fv.get('temperature', 0.0),
+                                     fv.get('pressure', 0.0))
         self.gx_canvas.redraw(result)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _P_from_tick(self, tick):
-        """Map slider tick 0…n_steps-1 → pressure value."""
+    def _val_from_tick(self, field_idx, tick):
+        """Map slider tick 0..n_steps-1 → field value."""
+        f = self.system.fields[field_idx]
         frac = tick / (self._n_steps - 1)
-        return self.system.P_min + frac * (self.system.P_max - self.system.P_min)
+        return f.min_val + frac * (f.max_val - f.min_val)
 
-    def _current_P(self):
-        if self.P_slider is None:
-            return 0.0
-        return self._P_from_tick(self.P_slider.value())
+    def _current_val(self, field_idx):
+        """Return current slider value for the given field index."""
+        return self._val_from_tick(field_idx, self._field_sliders[field_idx].value())
 
-    def _current_T(self):
-        return float(self.T_slider.value())
+    def _current_result(self):
+        """Return the EqResult nearest to the current slider positions."""
+        prim_arr = self._field_arr[self._primary_idx]
+        prim_val = self._current_val(self._primary_idx)
+        if prim_arr is not None and self._precomputed[self._primary_idx] is not None:
+            idx = int(np.argmin(np.abs(prim_arr - prim_val)))
+            return self._precomputed[self._primary_idx][idx]
+        fv = {f.name: self._current_val(i)
+              for i, f in enumerate(self.system.fields)}
+        return compute_equilibrium(self.system,
+                                   fv.get('temperature', 0.0),
+                                   fv.get('pressure', 0.0))
 
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
 
-    def _on_T_changed(self, T_int):
-        T = float(T_int)
-        self.T_label.setText(f'T = {T:.0f} K')
-        if self._mode == 'fixed_P':
-            # T is the primary slider — fast O(1) canvas update.
-            idx = int(np.argmin(np.abs(self._T_arr - T)))
-            self.gx_canvas.redraw(self._precomputed_Tx[idx])
-            self.tx_canvas.set_cursor(T)
+    def _on_slider_changed(self, field_idx, tick):
+        """Handle slider movement — fast O(1) update for primary, label for secondary."""
+        val = self._val_from_tick(field_idx, tick)
+        f = self.system.fields[field_idx]
+        unit_str = f' {f.unit}' if f.unit else ''
+        self._field_labels[field_idx].setText(f'{f.symbol} = {val:.3g}{unit_str}')
+
+        if field_idx == self._primary_idx:
+            # Primary slider — O(1) lookup.
+            prim_arr = self._field_arr[self._primary_idx]
+            data = self._precomputed[self._primary_idx]
+            if prim_arr is not None and data is not None:
+                idx = int(np.argmin(np.abs(prim_arr - val)))
+                self.gx_canvas.redraw(data[idx])
+                sweep = self._sweep_canvases.get(self._primary_idx)
+                if sweep is not None:
+                    sweep.set_cursor(val)
         elif self._full_grid is not None:
-            # T is the secondary slider and grid is cached — instant update.
-            T_idx = int(np.argmin(np.abs(self._T_arr - T)))
-            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(self._n_steps)]
-            self._precomputed_Px = new_Px
-            self._P_arr = np.array([r.P for r in new_Px])
-            self.gx_canvas._y_lim = _compute_ylim(new_Px)
-            P = self._current_P()
-            self.px_canvas.reset(new_Px, current_P=P)
-            idx = int(np.argmin(np.abs(self._P_arr - P)))
-            self.gx_canvas.redraw(new_Px[idx])
-            self.px_canvas.set_cursor(P)
-        # Otherwise T is the secondary slider with no cache: label updates here;
-        # canvas update (recompute) fires in _on_T_released.
+            # Secondary slider with cached full grid — instant primary sweep update.
+            self._rebuild_primary_from_grid(field_idx, val)
 
-    def _on_T_released(self):
-        """Recompute P-x diagram when T slider is released in Fixed T mode."""
-        if self._mode != 'fixed_T':
+    def _rebuild_primary_from_grid(self, sec_field_idx, sec_val):
+        """Re-slice the cached grid after a secondary-field slider move."""
+        prim_idx = self._primary_idx
+        n = self._n_steps
+        sec_arr = self._field_arr[sec_field_idx]
+        if sec_arr is None:
             return
-        T = self._current_T()
-        if self._full_grid is not None:
-            T_idx = int(np.argmin(np.abs(self._T_arr - T)))
-            new_Px = [self._full_grid[T_idx][i_P] for i_P in range(self._n_steps)]
+        sec_i = int(np.argmin(np.abs(sec_arr - sec_val)))
+
+        # Slice the grid: fix sec dimension, vary prim dimension.
+        # Currently only handles the T(primary)↔P(secondary) case (N=2 fields).
+        if prim_idx == 0 and sec_field_idx == 1:
+            new_data = [self._full_grid[i_T][sec_i] for i_T in range(n)]
+        elif prim_idx == 1 and sec_field_idx == 0:
+            new_data = [self._full_grid[sec_i][i_P] for i_P in range(n)]
         else:
-            print(f'Recomputing P-x diagram at T = {T:.1f} K...', end=' ', flush=True)
-            new_Px = precompute_Px_diagram(self.system, T, n_steps=self._n_steps)
-            print('done.')
-        self._precomputed_Px = new_Px
-        self._P_arr = np.array([r.P for r in new_Px])
-        self.gx_canvas._y_lim = _compute_ylim(new_Px)
-        P = self._current_P()
-        self.px_canvas.reset(new_Px, current_P=P)
-        idx = int(np.argmin(np.abs(self._P_arr - P)))
-        self.gx_canvas.redraw(new_Px[idx])
-        self.px_canvas.set_cursor(P)
-
-    def _on_P_changed(self, tick):
-        P = self._P_from_tick(tick)
-        self.P_label.setText(f'P = {P:.3g} {self.system.P_unit}'.strip())
-        if self._mode == 'fixed_T':
-            # P is the primary slider — fast O(1) canvas update.
-            idx = int(np.argmin(np.abs(self._P_arr - P)))
-            self.gx_canvas.redraw(self._precomputed_Px[idx])
-            self.px_canvas.set_cursor(P)
-        elif self._full_grid is not None:
-            # P is the secondary slider and grid is cached — instant update.
-            P_idx = int(np.argmin(np.abs(self._P_arr - P)))
-            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(self._n_steps)]
-            self._precomputed_Tx = new_Tx
-            self._T_arr = np.array([r.T for r in new_Tx])
-            self.gx_canvas._y_lim = _compute_ylim(new_Tx)
-            T = self._current_T()
-            self.tx_canvas.reset(new_Tx, current_T=T)
-            idx = int(np.argmin(np.abs(self._T_arr - T)))
-            self.gx_canvas.redraw(new_Tx[idx])
-            self.tx_canvas.set_cursor(T)
-        # Otherwise P is the secondary slider with no cache: label updates here;
-        # canvas update (recompute) fires in _on_P_released.
-
-    def _on_P_released(self):
-        """Recompute T-x diagram when P slider is released in Fixed P mode."""
-        if self._mode != 'fixed_P':
             return
-        P = self._P_from_tick(self.P_slider.value())
+
+        self._precomputed[prim_idx] = new_data
+        self._field_arr[prim_idx] = _extract_field_values(
+            new_data, self.system.fields[prim_idx])
+        self.gx_canvas._y_lim = _compute_ylim(new_data)
+        prim_val = self._current_val(prim_idx)
+        sweep = self._sweep_canvases.get(prim_idx)
+        if sweep is not None:
+            sweep.reset(new_data, current_val=prim_val)
+        idx = int(np.argmin(np.abs(self._field_arr[prim_idx] - prim_val)))
+        self.gx_canvas.redraw(new_data[idx])
+        if sweep is not None:
+            sweep.set_cursor(prim_val)
+
+    def _on_slider_released(self, field_idx):
+        """Handle slider release — trigger recompute for secondary sliders."""
+        if field_idx == self._primary_idx:
+            return  # primary release has no extra action
         if self._full_grid is not None:
-            P_idx = int(np.argmin(np.abs(self._P_arr - P)))
-            new_Tx = [self._full_grid[i_T][P_idx] for i_T in range(self._n_steps)]
-        else:
-            print(f'Recomputing T-x diagram at P = {P:.3g}...', end=' ', flush=True)
-            new_Tx = precompute_Tx_diagram(self.system, P, n_steps=self._n_steps)
+            # Grid cached — already handled instantly in _on_slider_changed.
+            return
+        # Recompute primary sweep at the new secondary value.
+        prim_idx = self._primary_idx
+        prim_field = self.system.fields[prim_idx]
+        sec_val = self._current_val(field_idx)
+        sec_field = self.system.fields[field_idx]
+        fixed_vals = {f.name: self._current_val(i)
+                      for i, f in enumerate(self.system.fields)
+                      if i != prim_idx}
+        print(f'Recomputing {prim_field.symbol}-x diagram at '
+              f'{sec_field.symbol} = {sec_val:.3g}'
+              + (f' {sec_field.unit}' if sec_field.unit else '') + '...',
+              end=' ', flush=True)
+        new_data = precompute_sweep_diagram(
+            self.system, prim_idx, fixed_vals, n_steps=self._n_steps)
+        print('done.')
+        self._precomputed[prim_idx] = new_data
+        self._field_arr[prim_idx] = _extract_field_values(new_data, prim_field)
+        self.gx_canvas._y_lim = _compute_ylim(new_data)
+        prim_val = self._current_val(prim_idx)
+        sweep = self._sweep_canvases.get(prim_idx)
+        if sweep is not None:
+            sweep.reset(new_data, current_val=prim_val)
+        idx = int(np.argmin(np.abs(self._field_arr[prim_idx] - prim_val)))
+        self.gx_canvas.redraw(new_data[idx])
+        if sweep is not None:
+            sweep.set_cursor(prim_val)
+
+    def _on_slider_action(self, field_idx, action):
+        """Trigger recompute on bar-click / key-press (actionTriggered fires before
+        sliderReleased for discrete steps like arrow keys and bar clicks)."""
+        if self._field_sliders[field_idx].isSliderDown():
+            return  # drag in progress — sliderReleased will handle it
+        QTimer.singleShot(0, lambda: self._on_slider_released(field_idx))
+
+    def _on_mode_changed(self, new_primary_idx):
+        """Switch which field is the primary sweep axis (Y axis of sweep canvas)."""
+        if new_primary_idx == self._primary_idx:
+            return
+        self._primary_idx = new_primary_idx
+        prim_field = self.system.fields[new_primary_idx]
+        prim_val = self._current_val(new_primary_idx)
+
+        # Lazy: compute primary sweep for new field if not yet done.
+        if self._precomputed[new_primary_idx] is None:
+            fixed_vals = {f.name: self._current_val(i)
+                          for i, f in enumerate(self.system.fields)
+                          if i != new_primary_idx}
+            print(f'Computing {prim_field.symbol}-x diagram...', end=' ', flush=True)
+            new_data = precompute_sweep_diagram(
+                self.system, new_primary_idx, fixed_vals, self._n_steps)
             print('done.')
-        self._precomputed_Tx = new_Tx
-        self._T_arr = np.array([r.T for r in new_Tx])
-        self.gx_canvas._y_lim = _compute_ylim(new_Tx)
-        T = self._current_T()
-        self.tx_canvas.reset(new_Tx, current_T=T)
-        idx = int(np.argmin(np.abs(self._T_arr - T)))
-        self.gx_canvas.redraw(new_Tx[idx])
-        self.tx_canvas.set_cursor(T)
+            self._precomputed[new_primary_idx] = new_data
+            self._field_arr[new_primary_idx] = _extract_field_values(
+                new_data, prim_field)
+            self.gx_canvas._y_lim = _compute_ylim(new_data)
 
-    def _on_T_action(self, action):
-        """Trigger recompute on bar-click / key-press of the T slider.
+        # Create SweepCanvas for new primary if not already existing.
+        if new_primary_idx not in self._sweep_canvases:
+            canvas = SweepCanvas(
+                self.system, prim_field, self._precomputed[new_primary_idx],
+                colors=self._colors,
+                two_phase_color=self._two_phase_color,
+                two_phase_hatch=self._two_phase_hatch)
+            self._sweep_canvases[new_primary_idx] = canvas
+            self._right_stack.addWidget(canvas)
 
-        Qt fires sliderReleased only at the end of a drag; for discrete
-        actions (page-step bar click, arrow keys, Home/End) it fires only
-        actionTriggered.  isSliderDown() is True only while the thumb is
-        held — False for bar clicks — so we use it to distinguish the two
-        cases without fragile enum comparisons.  We defer via singleShot so
-        that valueChanged has already updated the slider value before the
-        released handler reads _current_T().
-        """
-        if self.T_slider.isSliderDown():
-            return  # drag in progress — sliderReleased will handle it
-        QTimer.singleShot(0, self._on_T_released)
-
-    def _on_P_action(self, action):
-        """Trigger recompute on bar-click / key-press of the P slider."""
-        if self.P_slider.isSliderDown():
-            return  # drag in progress — sliderReleased will handle it
-        QTimer.singleShot(0, self._on_P_released)
-
-    def _on_mode_changed(self, button_id):
-        if button_id == 0:
-            self._mode = 'fixed_P'
-            self._right_stack.setCurrentIndex(0)
-            T = self._current_T()
-            self.tx_canvas.reset(self._precomputed_Tx, current_T=T)
-            idx = int(np.argmin(np.abs(self._T_arr - T)))
-            self.gx_canvas.redraw(self._precomputed_Tx[idx])
-            self.tx_canvas.set_cursor(T)
-        else:
-            self._mode = 'fixed_T'
-            if self.px_canvas is None:
-                # Lazy first-time computation of the P-x diagram.
-                T = self._current_T()
-                print(f'Computing P-x diagram at T={T:.1f} K...',
-                      end=' ', flush=True)
-                new_Px = precompute_Px_diagram(self.system, T)
-                print('done.')
-                self._precomputed_Px = new_Px
-                self._P_arr = np.array([r.P for r in new_Px])
-                self.gx_canvas._y_lim = _compute_ylim(new_Px)
-                self.px_canvas = PxCanvas(self.system, new_Px,
-                                          colors=self._colors,
-                                          two_phase_color=self._two_phase_color,
-                                          two_phase_hatch=self._two_phase_hatch)
-                self._right_stack.addWidget(self.px_canvas)
-                self.px_canvas.set_reveal_all(self._reveal_cb.isChecked())
-            self._right_stack.setCurrentIndex(1)
-            P = self._current_P()
-            self.px_canvas.reset(self._precomputed_Px, current_P=P)
-            idx = int(np.argmin(np.abs(self._P_arr - P)))
-            self.gx_canvas.redraw(self._precomputed_Px[idx])
-            self.px_canvas.set_cursor(P)
+        canvas = self._sweep_canvases[new_primary_idx]
+        self._right_stack.setCurrentWidget(canvas)
+        canvas.reset(self._precomputed[new_primary_idx], current_val=prim_val)
+        idx = int(np.argmin(np.abs(self._field_arr[new_primary_idx] - prim_val)))
+        self.gx_canvas.redraw(self._precomputed[new_primary_idx][idx])
+        canvas.set_cursor(prim_val)
 
     def _on_reveal_all_toggled(self, checked):
-        """Show or hide the cover on all phase-diagram canvases."""
-        self.tx_canvas.set_reveal_all(checked)
-        if self.px_canvas is not None:
-            self.px_canvas.set_reveal_all(checked)
-
-    def _current_result(self):
-        """Return the EqResult nearest to the current slider position."""
-        if self._mode == 'fixed_P':
-            idx = int(np.argmin(np.abs(self._T_arr - self._current_T())))
-            return self._precomputed_Tx[idx]
-        else:
-            idx = int(np.argmin(np.abs(self._P_arr - self._current_P())))
-            return self._precomputed_Px[idx]
+        """Show or hide the cover on all sweep canvases."""
+        for canvas in self._sweep_canvases.values():
+            canvas.set_reveal_all(checked)
 
     def _apply_colors(self, phase_colors, two_phase_color, two_phase_hatch):
         """Update shared color/hatch state and redraw all canvases live."""
         self._colors.update(phase_colors)
         self._two_phase_color = two_phase_color
         self._two_phase_hatch = two_phase_hatch
-        self.tx_canvas._two_phase_color = two_phase_color
-        self.tx_canvas._two_phase_hatch = two_phase_hatch
-        if self.px_canvas is not None:
-            self.px_canvas._two_phase_color = two_phase_color
-            self.px_canvas._two_phase_hatch = two_phase_hatch
-        self.tx_canvas.recolor()
-        if self.px_canvas is not None:
-            self.px_canvas.recolor()
+        for canvas in self._sweep_canvases.values():
+            canvas._two_phase_color = two_phase_color
+            canvas._two_phase_hatch = two_phase_hatch
+            canvas.recolor()
         self.gx_canvas.redraw(self._current_result())
 
     def _on_colors_clicked(self):
@@ -1706,28 +1539,24 @@ class MainWindow(QMainWindow):
     def _on_precompute_clicked(self):
         """Toggle pre-computation: start → pause → resume → (done)."""
         if self._worker_state == 'idle':
-            # Start a fresh computation.
             n_total = self._n_steps ** 2
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(True)
             self._precompute_status.setText('Computing... 0%')
-            T_values = np.linspace(self.system.T_max, self.system.T_min, self._n_steps)
-            P_values = np.linspace(self.system.P_max, self.system.P_min, self._n_steps)
+            f0, f1 = self.system.fields[0], self.system.fields[1]
+            T_values = np.linspace(f0.max_val, f0.min_val, self._n_steps)
+            P_values = np.linspace(f1.max_val, f1.min_val, self._n_steps)
             self._worker = FullGridWorker(self.system, T_values, P_values)
             self._worker.progress.connect(self._on_grid_progress)
             self._worker.finished.connect(self._on_grid_ready)
             self._worker.start()
             self._worker_state = 'running'
             self._precompute_btn.setText('Pause Computation')
-
         elif self._worker_state == 'running':
-            # Pause the running worker.
             self._worker.pause()
             self._worker_state = 'paused'
             self._precompute_btn.setText('Restart Computation')
-
         elif self._worker_state == 'paused':
-            # Resume from where we left off.
             self._worker.resume()
             self._worker_state = 'running'
             self._precompute_btn.setText('Pause Computation')
@@ -1754,25 +1583,24 @@ class MainWindow(QMainWindow):
         if n_steps == self._n_steps:
             return
 
-        # Abort any running background worker.
         if self._worker is not None and self._worker.isRunning():
             self._worker.abort()
             self._worker.wait()
         self._worker = None
         self._worker_state = 'idle'
         self._full_grid = None
-
         self._n_steps = n_steps
 
-        # Update P slider range to match the new step count (preserves current P value).
-        if self.P_slider is not None:
-            P_cur = self._current_P()
-            self.P_slider.setMaximum(n_steps - 1)
-            P_range = max(self.system.P_max - self.system.P_min, 1e-30)
-            P_frac = (P_cur - self.system.P_min) / P_range
-            self.P_slider.setValue(int(round(P_frac * (n_steps - 1))))
+        # Update all sliders' max range, preserving current field values.
+        for i, (field, slider) in enumerate(
+                zip(self.system.fields, self._field_sliders)):
+            cur_val = self._val_from_tick(i, slider.value())
+            slider.setMaximum(n_steps - 1)
+            val_range = max(field.max_val - field.min_val, 1e-30)
+            frac = (cur_val - field.min_val) / val_range
+            slider.setValue(int(round(frac * (n_steps - 1))))
 
-        # Reset precompute button and progress bar.
+        # Reset precompute/3D widgets.
         if self._precompute_btn is not None:
             self._precompute_btn.setText('Pre-compute full T-P-x')
             self._precompute_btn.setEnabled(True)
@@ -1783,26 +1611,42 @@ class MainWindow(QMainWindow):
         if self._viz3d_btn is not None:
             self._viz3d_btn.setEnabled(False)
 
-        # Recompute T-x at the current P.
-        P = self._current_P() if self.P_slider is not None else 0.0
-        T = self._current_T()
-        self._precomputed_Tx = precompute_Tx_diagram(self.system, P, n_steps=n_steps)
-        self._T_arr = np.array([r.T for r in self._precomputed_Tx])
-        self.gx_canvas._y_lim = _compute_ylim(self._precomputed_Tx)
+        # Recompute primary sweep.
+        prim_idx = self._primary_idx
+        fixed_vals = {f.name: self._current_val(i)
+                      for i, f in enumerate(self.system.fields)
+                      if i != prim_idx}
+        self._precomputed[prim_idx] = precompute_sweep_diagram(
+            self.system, prim_idx, fixed_vals, n_steps=n_steps)
+        self._field_arr[prim_idx] = _extract_field_values(
+            self._precomputed[prim_idx], self.system.fields[prim_idx])
+        self.gx_canvas._y_lim = _compute_ylim(self._precomputed[prim_idx])
 
-        # Recompute P-x only if it was already lazily computed.
-        if self._precomputed_Px is not None:
-            self._precomputed_Px = precompute_Px_diagram(self.system, T, n_steps=n_steps)
-            self._P_arr = np.array([r.P for r in self._precomputed_Px])
-        elif self.system.has_pressure:
-            self._P_arr = np.linspace(self.system.P_max, self.system.P_min, n_steps)
+        # Recompute already-computed secondary sweeps.
+        for i in range(len(self.system.fields)):
+            if i == prim_idx:
+                continue
+            if self._precomputed[i] is not None:
+                fixed = {f.name: self._current_val(j)
+                         for j, f in enumerate(self.system.fields) if j != i}
+                self._precomputed[i] = precompute_sweep_diagram(
+                    self.system, i, fixed, n_steps=n_steps)
+                self._field_arr[i] = _extract_field_values(
+                    self._precomputed[i], self.system.fields[i])
+            else:
+                f = self.system.fields[i]
+                self._field_arr[i] = np.linspace(f.max_val, f.min_val, n_steps)
 
-        # Redraw all canvases.
-        self.tx_canvas.reset(self._precomputed_Tx, current_T=T)
-        if self._precomputed_Px is not None and self.px_canvas is not None:
-            self.px_canvas.reset(self._precomputed_Px, current_P=P)
-        nearest = int(np.argmin(np.abs(self._T_arr - T)))
-        self.gx_canvas.redraw(self._precomputed_Tx[nearest])
+        # Redraw all sweep canvases.
+        prim_val = self._current_val(prim_idx)
+        for i, canvas in self._sweep_canvases.items():
+            if self._precomputed[i] is not None:
+                cur = self._current_val(i)
+                canvas.reset(self._precomputed[i], current_val=cur)
+
+        nearest = int(np.argmin(
+            np.abs(self._field_arr[prim_idx] - prim_val)))
+        self.gx_canvas.redraw(self._precomputed[prim_idx][nearest])
 
     def closeEvent(self, event):
         """Abort any running/paused background worker before closing."""
@@ -1820,10 +1664,34 @@ class MainWindow(QMainWindow):
 # Public entry points
 # ---------------------------------------------------------------------------
 
+def precompute_sweep_diagram(system, primary_field_idx, fixed_field_values,
+                              n_steps=N_T_STEPS):
+    """Sweep primary field from max to min at fixed other field values.
+
+    Parameters
+    ----------
+    system              : System
+    primary_field_idx   : int — index into system.fields for the swept field
+    fixed_field_values  : dict {field.name: value} for all non-primary fields
+    n_steps             : int — number of sweep steps
+
+    Returns list[EqResult] sorted by primary field descending.
+    """
+    pf = system.fields[primary_field_idx]
+    prim_values = np.linspace(pf.max_val, pf.min_val, n_steps)
+    fv = dict(fixed_field_values)
+    results = []
+    for v in prim_values:
+        fv[pf.name] = v
+        results.append(compute_equilibrium(system,
+                                           fv.get('temperature', 0.0),
+                                           fv.get('pressure', 0.0)))
+    return results
+
+
 def precompute_Tx_diagram(system, P=0.0, n_steps=N_T_STEPS):
     """Sweep T_max → T_min at fixed P; return list[EqResult] (T descending)."""
-    T_values = np.linspace(system.T_max, system.T_min, n_steps)
-    return [compute_equilibrium(system, T, P) for T in T_values]
+    return precompute_sweep_diagram(system, 0, {'pressure': P}, n_steps)
 
 
 # Backward-compatible alias.
@@ -1832,18 +1700,23 @@ precompute_diagram = precompute_Tx_diagram
 
 def precompute_Px_diagram(system, T, n_steps=N_P_STEPS):
     """Sweep P_max → P_min at fixed T; return list[EqResult] (P descending)."""
-    P_values = np.linspace(system.P_max, system.P_min, n_steps)
-    return [compute_equilibrium(system, T, P) for P in P_values]
+    p_idx = next((i for i, f in enumerate(system.fields)
+                  if f.name == 'pressure'), 1)
+    return precompute_sweep_diagram(system, p_idx, {'temperature': T}, n_steps)
 
 
 def launch_ui(system):
     """Pre-compute the phase diagram(s) and open the interactive window."""
-    if system.has_pressure:
+    if len(system.fields) > 1:
+        f0, f1 = system.fields[0], system.fields[1]
         print(
-            f'Pre-computing T-x diagram at P={system.P_initial:.3g} '
-            f'({N_T_STEPS} evaluations)...',
+            f'Pre-computing {f0.symbol}-x diagram at '
+            f'{f1.symbol} = {f1.initial_val:.3g}'
+            + (f' {f1.unit}' if f1.unit else '')
+            + f' ({N_T_STEPS} evaluations)...',
             end=' ', flush=True)
-        precomputed_Tx = precompute_Tx_diagram(system, system.P_initial)
+        precomputed_Tx = precompute_sweep_diagram(
+            system, 0, {f1.name: f1.initial_val})
         precomputed_Px = None
         print('done.')
     else:
