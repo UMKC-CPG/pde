@@ -3,11 +3,38 @@
 Phase and System data structures for PDE.
 
 Phase  — one thermodynamic phase: name, type, energy model, composition range.
-System — the full system: components, all phases, energy form, T range,
-         and optional pressure range.
+Field  — one sweepable intensive parameter (T, P, H, E, …).
+System — the full system: components, all phases, energy form, and a list of
+         Field objects.  fields[0] is temperature by convention.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass
+class Field:
+    """One sweepable intensive thermodynamic parameter (or analogue).
+
+    Role (primary sweep axis, secondary axis, fixed) is NOT stored here —
+    it belongs to the view configuration, not to the field itself.
+
+    Attributes
+    ----------
+    name        : str   — unique identifier, e.g. 'temperature', 'pressure'
+    symbol      : str   — display symbol, e.g. 'T', 'P', 'H'
+    unit        : str   — display unit string, e.g. 'K', 'atm', 'T'; '' if none
+    min_val     : float — lower bound of the sweep range
+    max_val     : float — upper bound of the sweep range
+    initial_val : float — starting value for the visualisation
+    """
+    name:        str
+    symbol:      str
+    unit:        str
+    min_val:     float
+    max_val:     float
+    initial_val: float
 
 
 class Phase:
@@ -50,40 +77,83 @@ class System:
 
     Attributes
     ----------
-    components   : list[str]   — component names in composition order
-    phases       : list[Phase] — all phases (gas, liquid, solid, end-members)
-    energy_form  : str         — 'HS' or 'polynomial'
-    T_min        : float       — lower bound of temperature range
-    T_max        : float       — upper bound of temperature range
-    T_initial    : float       — starting temperature for the visualization
-    has_pressure : bool        — True when a <pressure> block was present in XML
-    P_min        : float       — lower bound of pressure range
-    P_max        : float       — upper bound of pressure range
-    P_initial    : float       — starting pressure for the visualization
-    R_gas        : float       — gas constant in user energy units (0 → inactive)
-    P_ref        : float       — reference pressure for ideal-gas term
-    P_unit       : str         — pressure unit label (e.g. 'atm'); '' if unspecified
-    title        : str         — display title; '' if unset (viz falls back to filename)
+    components  : list[str]    — component names in composition order
+    phases      : list[Phase]  — all phases (gas, liquid, solid, end-members)
+    energy_form : str          — 'HS' or 'polynomial'
+    fields      : list[Field]  — sweepable intensive parameters; fields[0] is
+                                 temperature by convention; any number of
+                                 additional fields are allowed
+    R_gas       : float        — gas constant in user energy units (0 → inactive);
+                                 energy-coupling parameter, will move to
+                                 CouplingTerm in Phase 2
+    P_ref       : float        — reference pressure for ideal-gas term;
+                                 energy-coupling parameter, will move to
+                                 CouplingTerm in Phase 2
+    title       : str          — display title; '' if unset
     """
 
-    def __init__(self, components, phases, energy_form, T_min, T_max, T_initial,
-                 has_pressure=False,
-                 P_min=1.0, P_max=1.0, P_initial=1.0,
-                 R_gas=0.0, P_ref=1.0, P_unit='', title=''):
+    def __init__(self, components, phases, energy_form, fields,
+                 R_gas=0.0, P_ref=1.0, title=''):
         self.components = components
         self.phases = phases
         self.energy_form = energy_form
-        self.T_min = T_min
-        self.T_max = T_max
-        self.T_initial = T_initial
-        self.has_pressure = has_pressure
-        self.P_min = P_min
-        self.P_max = P_max
-        self.P_initial = P_initial
+        self.fields = list(fields)   # list[Field]; fields[0] is temperature
         self.R_gas = R_gas
         self.P_ref = P_ref
-        self.P_unit = P_unit
         self.title = title
+
+    # ------------------------------------------------------------------
+    # Convenience accessors — backward-compatible properties
+    # ------------------------------------------------------------------
+
+    @property
+    def T_field(self) -> Field:
+        return self.fields[0]
+
+    @property
+    def T_min(self) -> float:
+        return self.fields[0].min_val
+
+    @property
+    def T_max(self) -> float:
+        return self.fields[0].max_val
+
+    @property
+    def T_initial(self) -> float:
+        return self.fields[0].initial_val
+
+    @property
+    def P_field(self):
+        """The pressure Field, or None if no pressure field is defined."""
+        return next((f for f in self.fields if f.name == 'pressure'), None)
+
+    @property
+    def has_pressure(self) -> bool:
+        return self.P_field is not None
+
+    @property
+    def P_min(self) -> float:
+        f = self.P_field
+        return f.min_val if f is not None else 1.0
+
+    @property
+    def P_max(self) -> float:
+        f = self.P_field
+        return f.max_val if f is not None else 1.0
+
+    @property
+    def P_initial(self) -> float:
+        f = self.P_field
+        return f.initial_val if f is not None else 1.0
+
+    @property
+    def P_unit(self) -> str:
+        f = self.P_field
+        return f.unit if f is not None else ''
+
+    # ------------------------------------------------------------------
+    # Phase-type filters
+    # ------------------------------------------------------------------
 
     @property
     def n_components(self):

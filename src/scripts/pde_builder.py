@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from pde_energy import HSModel, PolyModel
-from pde_phase import Phase, System
+from pde_phase import Field, Phase, System
 
 
 # ---------------------------------------------------------------------------
@@ -115,20 +115,24 @@ class SystemData:
                 xmax=pd.xmax,
             ))
 
+        t_field = Field(name='temperature', symbol='T', unit='K',
+                        min_val=self.T_min, max_val=self.T_max,
+                        initial_val=self.T_initial)
+        fields = [t_field]
+        if self.has_pressure:
+            p_field = Field(name='pressure', symbol='P',
+                            unit=self.P_unit,
+                            min_val=self.P_min, max_val=self.P_max,
+                            initial_val=self.P_initial)
+            fields.append(p_field)
+
         return System(
             components=list(self.components),
             phases=phases,
             energy_form=self.energy_form,
-            T_min=self.T_min,
-            T_max=self.T_max,
-            T_initial=self.T_initial,
-            has_pressure=self.has_pressure,
-            P_min=self.P_min if self.has_pressure else 1.0,
-            P_max=self.P_max if self.has_pressure else 1.0,
-            P_initial=self.P_initial if self.has_pressure else 1.0,
+            fields=fields,
             R_gas=R_gas,
             P_ref=P_ref,
-            P_unit=self.P_unit if self.has_pressure else '',
             title=self.title,
         )
 
@@ -147,21 +151,25 @@ class SystemData:
         etree.SubElement(sys_el, 'components').text = ' '.join(self.components)
         etree.SubElement(sys_el, 'energy_form').text = self.energy_form
 
-        temp_el = etree.SubElement(root, 'temperature')
-        etree.SubElement(temp_el, 'min').text = _fmt(self.T_min)
-        etree.SubElement(temp_el, 'max').text = _fmt(self.T_max)
-        etree.SubElement(temp_el, 'initial').text = _fmt(self.T_initial)
-
+        fields_el = etree.SubElement(root, 'fields')
+        t_el = etree.SubElement(fields_el, 'field')
+        t_el.set('name', 'temperature')
+        t_el.set('symbol', 'T')
+        t_el.set('unit', 'K')
+        t_el.set('min', _fmt(self.T_min))
+        t_el.set('max', _fmt(self.T_max))
+        t_el.set('initial', _fmt(self.T_initial))
         if self.has_pressure:
-            pres_el = etree.SubElement(root, 'pressure')
-            etree.SubElement(pres_el, 'min').text = _fmt(self.P_min)
-            etree.SubElement(pres_el, 'max').text = _fmt(self.P_max)
-            etree.SubElement(pres_el, 'initial').text = _fmt(self.P_initial)
+            p_el = etree.SubElement(fields_el, 'field')
+            p_el.set('name', 'pressure')
+            p_el.set('symbol', 'P')
+            p_el.set('unit', self.P_unit)
+            p_el.set('min', _fmt(self.P_min))
+            p_el.set('max', _fmt(self.P_max))
+            p_el.set('initial', _fmt(self.P_initial))
             if self.R_gas:
-                etree.SubElement(pres_el, 'R_gas').text = _fmt(self.R_gas)
-            etree.SubElement(pres_el, 'P_ref').text = _fmt(self.P_ref)
-            if self.P_unit:
-                etree.SubElement(pres_el, 'unit').text = self.P_unit
+                p_el.set('R_gas', _fmt(self.R_gas))
+            p_el.set('P_ref', _fmt(self.P_ref))
 
         for pd in self.phases:
             phase_el = etree.SubElement(root, 'phase')

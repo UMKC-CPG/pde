@@ -66,7 +66,7 @@ import pathlib
 from lxml import etree
 
 from pde_energy import HSModel, PolyModel
-from pde_phase import Phase, System
+from pde_phase import Field, Phase, System
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +212,22 @@ def _parse_phase(phase_el, energy_form, R_gas, P_ref):
 # ---------------------------------------------------------------------------
 
 def parse_system(infile):
-    """Parse *infile* (path to an XML input file) and return a System object."""
+    """Parse *infile* (path to an XML input file) and return a System object.
+
+    Accepts two XML schemas:
+
+    New schema — a single <fields> block:
+        <fields>
+          <field name="temperature" symbol="T" unit="K"
+                 min="250" max="500" initial="400"/>
+          <field name="pressure" symbol="P" unit="atm"
+                 min="0.5" max="5.0" initial="1.0"
+                 R_gas="8.314e-3" P_ref="1.0"/>
+        </fields>
+
+    Legacy schema (all existing demo files) — separate <temperature> and
+    optional <pressure> blocks.  Both schemas produce identical System objects.
+    """
     tree = etree.parse(infile)
     root = tree.getroot()
 
@@ -220,32 +235,6 @@ def parse_system(infile):
     sys_el = root.find('system')
     components = sys_el.find('components').text.strip().split()
     energy_form = sys_el.find('energy_form').text.strip()
-
-    # Temperature block
-    temp_el = root.find('temperature')
-    T_min = float(temp_el.find('min').text)
-    T_max = float(temp_el.find('max').text)
-    T_initial = float(temp_el.find('initial').text)
-
-    # Pressure block (optional)
-    pres_el = root.find('pressure')
-    if pres_el is not None:
-        has_pressure = True
-        P_min = float(pres_el.find('min').text)
-        P_max = float(pres_el.find('max').text)
-        P_initial = float(pres_el.find('initial').text)
-        R_gas_el = pres_el.find('R_gas')
-        R_gas = float(R_gas_el.text) if R_gas_el is not None else 0.0
-        P_ref_el = pres_el.find('P_ref')
-        P_ref = float(P_ref_el.text) if P_ref_el is not None else 1.0
-        unit_el = pres_el.find('unit')
-        P_unit = unit_el.text.strip() if unit_el is not None else ''
-    else:
-        has_pressure = False
-        P_min = P_max = P_initial = 1.0
-        R_gas = 0.0
-        P_ref = 1.0
-        P_unit = ''
 
     # Title (optional <title> element; fall back to stripped filename)
     title_el = root.find('title')
@@ -258,6 +247,15 @@ def parse_system(infile):
                 name = name[:-len(ext)]
         title = name
 
+    # ------------------------------------------------------------------
+    # Field parsing — new <fields> schema or legacy <temperature>/<pressure>
+    # ------------------------------------------------------------------
+    fields_el = root.find('fields')
+    if fields_el is not None:
+        fields, R_gas, P_ref = _parse_fields_block(fields_el)
+    else:
+        fields, R_gas, P_ref = _parse_legacy_fields(root)
+
     # Phases (preserve document order)
     phases = [_parse_phase(ph_el, energy_form, R_gas, P_ref)
               for ph_el in root.findall('phase')]
@@ -266,15 +264,64 @@ def parse_system(infile):
         components=components,
         phases=phases,
         energy_form=energy_form,
-        T_min=T_min,
-        T_max=T_max,
-        T_initial=T_initial,
-        has_pressure=has_pressure,
-        P_min=P_min,
-        P_max=P_max,
-        P_initial=P_initial,
+        fields=fields,
         R_gas=R_gas,
         P_ref=P_ref,
-        P_unit=P_unit,
         title=title,
     )
+
+
+def _parse_fields_block(fields_el):
+    """Parse a <fields> element and return (list[Field], R_gas, P_ref)."""
+    fields = []
+    R_gas = 0.0
+    P_ref = 1.0
+    for f_el in fields_el.findall('field'):
+        name = f_el.get('name')
+        symbol = f_el.get('symbol', name)
+        unit = f_el.get('unit', '')
+        min_val = float(f_el.get('min'))
+        max_val = float(f_el.get('max'))
+        initial_val = float(f_el.get('initial'))
+        fields.append(Field(name=name, symbol=symbol, unit=unit,
+                            min_val=min_val, max_val=max_val,
+                            initial_val=initial_val))
+        # R_gas and P_ref are stored on the pressure field element
+        # (Phase 1 transitional convention; will move to CouplingTerm in Phase 2)
+        if name == 'pressure':
+            if f_el.get('R_gas') is not None:
+                R_gas = float(f_el.get('R_gas'))
+            if f_el.get('P_ref') is not None:
+                P_ref = float(f_el.get('P_ref'))
+    return fields, R_gas, P_ref
+
+
+def _parse_legacy_fields(root):
+    """Parse legacy <temperature> and optional <pressure> blocks.
+
+    Returns (list[Field], R_gas, P_ref) — same shape as _parse_fields_block.
+    """
+    temp_el = root.find('temperature')
+    T_min = float(temp_el.find('min').text)
+    T_max = float(temp_el.find('max').text)
+    T_initial = float(temp_el.find('initial').text)
+    t_field = Field(name='temperature', symbol='T', unit='K',
+                    min_val=T_min, max_val=T_max, initial_val=T_initial)
+
+    pres_el = root.find('pressure')
+    if pres_el is None:
+        return [t_field], 0.0, 1.0
+
+    P_min = float(pres_el.find('min').text)
+    P_max = float(pres_el.find('max').text)
+    P_initial = float(pres_el.find('initial').text)
+    R_gas_el = pres_el.find('R_gas')
+    R_gas = float(R_gas_el.text) if R_gas_el is not None else 0.0
+    P_ref_el = pres_el.find('P_ref')
+    P_ref = float(P_ref_el.text) if P_ref_el is not None else 1.0
+    unit_el = pres_el.find('unit')
+    P_unit = unit_el.text.strip() if unit_el is not None else ''
+
+    p_field = Field(name='pressure', symbol='P', unit=P_unit,
+                    min_val=P_min, max_val=P_max, initial_val=P_initial)
+    return [t_field, p_field], R_gas, P_ref

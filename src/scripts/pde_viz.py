@@ -1862,11 +1862,13 @@ def launch_ui(system):
 def _make_default_system():
     """Return a minimal single-phase System for use when no input file is given."""
     from pde_energy import HSModel
-    from pde_phase import Phase, System
+    from pde_phase import Field, Phase, System
     liq = Phase('liquid', 'liquid',
                 HSModel([8.0, -2.0, 2.0], [0.01]),
                 0.0, 1.0)
-    return System(['A', 'B'], [liq], 'HS', 500, 1500, 1500, title='New System')
+    t_field = Field(name='temperature', symbol='T', unit='K',
+                    min_val=500, max_val=1500, initial_val=1500)
+    return System(['A', 'B'], [liq], 'HS', fields=[t_field], title='New System')
 
 
 def launch_ui_empty():
