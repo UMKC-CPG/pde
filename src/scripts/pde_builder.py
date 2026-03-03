@@ -131,8 +131,6 @@ class SystemData:
             phases=phases,
             energy_form=self.energy_form,
             fields=fields,
-            R_gas=R_gas,
-            P_ref=P_ref,
             title=self.title,
         )
 

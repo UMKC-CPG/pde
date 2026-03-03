@@ -15,6 +15,21 @@ End-member (point) phases are represented naturally:
   HSModel  with single-element H and S lists  → G(T) = H[0] - T·S[0]
   PolyModel with only an x⁰ T-coefficient list → G(T) = Σⱼ a₀ⱼ·Tʲ
 
+Generalised interface
+---------------------
+EnergyModel.gibbs() accepts both calling conventions:
+
+  Old (positional):  model.gibbs(x, T)  or  model.gibbs(x, T, P)
+  New (field dict):  model.gibbs(x, {'temperature': T, 'pressure': P})
+
+Both map to the internal _gibbs_impl(x, field_values) which subclasses
+implement.  The shim handles type-dispatch; call sites need not change.
+
+Each model also exposes a `couplings` property returning a list of
+CouplingTerm objects that describes how each field enters G(x).  This
+is used by Phase 3 (visualisation generalisation) to discover field
+dependencies without parsing the energy model internals.
+
 Variable pressure
 -----------------
 All models accept an optional pressure argument P (default 0.0, which
@@ -25,7 +40,8 @@ contributes zero to G so existing call sites are unaffected):
              + R_gas · T · ln(P / P_ref)         if ideal_gas=True and P > 0
 
 V(x) = V_coeffs[0] + V_coeffs[1]·x + V_coeffs[2]·x² + ...
-R_gas and P_ref are set from the system-level <pressure> block by the parser.
+R_gas and P_ref are set per-model from the system-level pressure block
+by the parser (pde_input.py).
 
 Physical guidance on which terms to use:
   Ideal gas phase:  set ideal_gas=True and omit V_coeffs.
@@ -41,24 +57,113 @@ Physical guidance on which terms to use:
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.polynomial.polynomial import polyval
 
 
+# ---------------------------------------------------------------------------
+# CouplingTerm — describes how one field (or field combination) enters G(x)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CouplingTerm:
+    """One field-coupling contribution to the Gibbs energy.
+
+    G(x, {λ}) += R(x) · f({λ})
+
+    where R(x) is a composition polynomial (response function) and
+    f({λ}) is a function of one or more field values.
+
+    Attributes
+    ----------
+    response_coeffs : list[float]
+        Coefficients of R(x) in ascending order; R(x) = Σᵢ cᵢ·xⁱ.
+    coupling_type   : str
+        How f({λ}) is computed:
+          'linear'    — f = λ  (single field).  Covers −S·T, V·P, −M·H.
+          'ideal_gas' — f = T · ln(P / params['P_ref']).
+          'power'     — f = λʲ for a single field (T-power in PolyModel).
+    field_names     : list[str]
+        Names of the Field objects this term uses (e.g. ['temperature']).
+    params          : dict
+        Extra parameters (e.g. {'P_ref': 1.0} for ideal_gas coupling).
+    """
+    response_coeffs: list
+    coupling_type:   str
+    field_names:     list
+    params:          dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Abstract base
+# ---------------------------------------------------------------------------
+
 class EnergyModel(ABC):
     """Abstract base for all Gibbs energy models.
 
-    All subclasses must implement gibbs(x, T, P=0.0) where x is a numpy
-    array of compositions in [0, 1], T is a scalar temperature in kelvin
-    (or whatever units the user has chosen), and P is an optional scalar
-    pressure. The return value is a numpy array of the same shape as x.
+    Subclasses implement _gibbs_impl(x, field_values) where field_values
+    is a dict mapping field names to scalar values (e.g.
+    {'temperature': 800.0, 'pressure': 1.5}).
+
+    The public gibbs() method is a backward-compatible shim that accepts
+    both the old positional signature gibbs(x, T, P=0.0) and the new
+    dict-based signature gibbs(x, {'temperature': T, 'pressure': P}).
     """
 
     @abstractmethod
-    def gibbs(self, x, T, P=0.0):
-        """Return G(x, T, P) as a numpy array with the same shape as x."""
+    def _gibbs_impl(self, x, field_values: dict) -> np.ndarray:
+        """Return G(x, {fields}) as a numpy array with the same shape as x."""
 
+    def gibbs(self, x, T=None, P=0.0, field_values=None, **kwargs):
+        """Return G evaluated at composition x and the given field values.
+
+        Accepts two calling conventions (both remain supported):
+
+          Old:  model.gibbs(x, T)
+                model.gibbs(x, T, P)
+          New:  model.gibbs(x, {'temperature': T, 'pressure': P, ...})
+                model.gibbs(x, field_values={'temperature': T, ...})
+
+        Parameters
+        ----------
+        x             : array-like   — composition values
+        T             : float or dict — temperature (old style) or
+                        field_values dict (new style, positional shortcut)
+        P             : float        — pressure (old style only)
+        field_values  : dict or None — explicit field dict (new style)
+        **kwargs      : extra field values merged into field_values (new style)
+        """
+        if field_values is not None:
+            fv = dict(field_values)
+            fv.update(kwargs)
+        elif isinstance(T, dict):
+            # New style passed positionally: gibbs(x, {'temperature': T, ...})
+            fv = dict(T)
+            fv.update(kwargs)
+        else:
+            # Old style: gibbs(x, T) or gibbs(x, T, P)
+            fv = {
+                'temperature': float(T) if T is not None else 0.0,
+                'pressure':    float(P),
+            }
+            fv.update(kwargs)
+        return self._gibbs_impl(np.asarray(x, dtype=float), fv)
+
+    @property
+    def couplings(self) -> list:
+        """Return the list of CouplingTerm objects describing this model.
+
+        Subclasses override this to provide inspectable coupling structure.
+        Default: empty list (no explicit coupling description available).
+        """
+        return []
+
+
+# ---------------------------------------------------------------------------
+# HSModel
+# ---------------------------------------------------------------------------
 
 class HSModel(EnergyModel):
     """G(x, T, P) = H(x) - T·S(x) [+ P·V(x)] [+ R·T·ln(P/P°)]
@@ -90,10 +195,9 @@ class HSModel(EnergyModel):
         self.R_gas = float(R_gas)
         self.P_ref = float(P_ref)
 
-    def gibbs(self, x, T, P=0.0):
-        x = np.asarray(x, dtype=float)
-        T = float(T)
-        P = float(P)
+    def _gibbs_impl(self, x, field_values: dict) -> np.ndarray:
+        T = float(field_values.get('temperature', 0.0))
+        P = float(field_values.get('pressure', 0.0))
         G = polyval(x, self.H_coeffs) - T * polyval(x, self.S_coeffs)
         if self.V_coeffs is not None:
             G = G + P * polyval(x, self.V_coeffs)
@@ -101,6 +205,35 @@ class HSModel(EnergyModel):
             G = G + self.R_gas * T * np.log(P / self.P_ref)
         return G
 
+    @property
+    def couplings(self) -> list:
+        """CouplingTerm list describing this model's field dependencies."""
+        terms = [
+            CouplingTerm(
+                response_coeffs=(-self.S_coeffs).tolist(),
+                coupling_type='linear',
+                field_names=['temperature'],
+            ),
+        ]
+        if self.V_coeffs is not None:
+            terms.append(CouplingTerm(
+                response_coeffs=self.V_coeffs.tolist(),
+                coupling_type='linear',
+                field_names=['pressure'],
+            ))
+        if self.ideal_gas:
+            terms.append(CouplingTerm(
+                response_coeffs=[self.R_gas],
+                coupling_type='ideal_gas',
+                field_names=['temperature', 'pressure'],
+                params={'P_ref': self.P_ref},
+            ))
+        return terms
+
+
+# ---------------------------------------------------------------------------
+# PolyModel
+# ---------------------------------------------------------------------------
 
 class PolyModel(EnergyModel):
     """G(x, T, P) = Σᵢ cᵢ(T)·xⁱ [+ P·V(x)] [+ R·T·ln(P/P°)]
@@ -130,10 +263,9 @@ class PolyModel(EnergyModel):
         self.R_gas = float(R_gas)
         self.P_ref = float(P_ref)
 
-    def gibbs(self, x, T, P=0.0):
-        x = np.asarray(x, dtype=float)
-        T = float(T)
-        P = float(P)
+    def _gibbs_impl(self, x, field_values: dict) -> np.ndarray:
+        T = float(field_values.get('temperature', 0.0))
+        P = float(field_values.get('pressure', 0.0))
         result = np.zeros_like(x)
         for i, t_coeffs in enumerate(self.coeffs):
             c_i = polyval(T, t_coeffs)   # scalar: T-polynomial evaluated at T
@@ -143,3 +275,31 @@ class PolyModel(EnergyModel):
         if self.ideal_gas and P > 0.0 and self.R_gas > 0.0:
             result = result + self.R_gas * T * np.log(P / self.P_ref)
         return result
+
+    @property
+    def couplings(self) -> list:
+        """CouplingTerm list describing this model's field dependencies."""
+        # Represent the full T-polynomial structure as a single 'poly_T' term.
+        # The coefficient grid is stored in params for Phase 3 inspection.
+        terms = [
+            CouplingTerm(
+                response_coeffs=[1.0],   # placeholder; full structure in params
+                coupling_type='poly_T',
+                field_names=['temperature'],
+                params={'t_poly_coeffs': [c.tolist() for c in self.coeffs]},
+            ),
+        ]
+        if self.V_coeffs is not None:
+            terms.append(CouplingTerm(
+                response_coeffs=self.V_coeffs.tolist(),
+                coupling_type='linear',
+                field_names=['pressure'],
+            ))
+        if self.ideal_gas:
+            terms.append(CouplingTerm(
+                response_coeffs=[self.R_gas],
+                coupling_type='ideal_gas',
+                field_names=['temperature', 'pressure'],
+                params={'P_ref': self.P_ref},
+            ))
+        return terms

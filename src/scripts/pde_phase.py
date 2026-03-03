@@ -83,23 +83,19 @@ class System:
     fields      : list[Field]  — sweepable intensive parameters; fields[0] is
                                  temperature by convention; any number of
                                  additional fields are allowed
-    R_gas       : float        — gas constant in user energy units (0 → inactive);
-                                 energy-coupling parameter, will move to
-                                 CouplingTerm in Phase 2
-    P_ref       : float        — reference pressure for ideal-gas term;
-                                 energy-coupling parameter, will move to
-                                 CouplingTerm in Phase 2
     title       : str          — display title; '' if unset
+
+    R_gas, P_ref are no longer stored on System; they live on each phase's
+    EnergyModel.  The backward-compat properties below scan self.phases to
+    retrieve them for code that has not yet migrated to reading from the
+    energy model directly.  Both properties will be removed in Phase 3.
     """
 
-    def __init__(self, components, phases, energy_form, fields,
-                 R_gas=0.0, P_ref=1.0, title=''):
+    def __init__(self, components, phases, energy_form, fields, title=''):
         self.components = components
         self.phases = phases
         self.energy_form = energy_form
         self.fields = list(fields)   # list[Field]; fields[0] is temperature
-        self.R_gas = R_gas
-        self.P_ref = P_ref
         self.title = title
 
     # ------------------------------------------------------------------
@@ -150,6 +146,32 @@ class System:
     def P_unit(self) -> str:
         f = self.P_field
         return f.unit if f is not None else ''
+
+    @property
+    def R_gas(self) -> float:
+        """Gas constant from the first ideal-gas phase's energy model.
+
+        Returns 0.0 when no ideal-gas phases are present.
+        Backward-compatible shim; will be removed in Phase 3.
+        """
+        for p in self.phases:
+            m = p.energy_model
+            if getattr(m, 'ideal_gas', False) and getattr(m, 'R_gas', 0.0) > 0.0:
+                return m.R_gas
+        return 0.0
+
+    @property
+    def P_ref(self) -> float:
+        """Reference pressure from the first ideal-gas phase's energy model.
+
+        Returns 1.0 when no ideal-gas phases are present.
+        Backward-compatible shim; will be removed in Phase 3.
+        """
+        for p in self.phases:
+            m = p.energy_model
+            if getattr(m, 'ideal_gas', False) and getattr(m, 'R_gas', 0.0) > 0.0:
+                return m.P_ref
+        return 1.0
 
     # ------------------------------------------------------------------
     # Phase-type filters

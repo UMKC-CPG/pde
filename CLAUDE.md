@@ -106,23 +106,27 @@ Other optional XML elements:
 
 ### `pde_energy.py`
 
-Abstract base `EnergyModel` with two concrete subclasses. All models accept an optional `P` argument (default `0.0`; backward-compatible with files that have no pressure block):
+**`CouplingTerm`** — dataclass: `response_coeffs` (R(x) polynomial), `coupling_type` (`'linear'`/`'ideal_gas'`/`'poly_T'`), `field_names` (list of Field names this term uses), `params` (dict, e.g. `{'P_ref': 1.0}`).
 
-- **`HSModel`**: `G(x,T,P) = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P°)]`
-- **`PolyModel`**: `G(x,T,P) = Σᵢ cᵢ(T)·xⁱ [+ P·V(x)] [+ R·T·ln(P/P°)]`
+**`EnergyModel`** (ABC) — abstract `_gibbs_impl(x, field_values: dict)`; public `gibbs()` shim accepts both calling conventions:
+- Old: `model.gibbs(x, T)` / `model.gibbs(x, T, P)` — still works unchanged
+- New: `model.gibbs(x, {'temperature': T, 'pressure': P})` or `model.gibbs(x, field_values={...})`
+
+`couplings` property on base returns `[]`; subclasses override to return their `CouplingTerm` list.
+
+**`HSModel`**: `G(x,T,P) = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P°)]`; implements `_gibbs_impl`; `couplings` returns linear entropic term + optional linear PV term + optional ideal_gas term.
+
+**`PolyModel`**: `G(x,T,P) = Σᵢ cᵢ(T)·xⁱ [+ P·V(x)] [+ R·T·ln(P/P°)]`; `couplings` returns a single `'poly_T'` term (full coefficient grid in `params`) + optional PV/ideal_gas terms.
 
 Both use ascending-order coefficient conventions: `[c0, c1, c2, ...]` means `c0 + c1·x + c2·x² + ...`
 
-Pressure terms (mutually exclusive for a pure gas — combining both double-counts):
-- `V_coeffs` present → adds `P·V(x)` (Poynting correction for condensed phases).
-- `ideal_gas=True` → adds `R_gas·T·ln(P/P_ref)` (ideal-gas chemical potential).
-- `R_gas`, `P_ref` are passed down from the system-level `<pressure>` block by the parser.
+`R_gas` and `P_ref` are stored per-model (not on `System`); passed from the XML pressure block by the parser to each `HSModel`/`PolyModel` constructor.
 
 ### `pde_phase.py`
 
 - **`Field`** — dataclass: `name` (unique id, e.g. `'temperature'`), `symbol` (e.g. `'T'`), `unit` (e.g. `'K'`; `''` if none), `min_val`, `max_val`, `initial_val`. Role (primary/secondary sweep axis) is NOT stored on the field — it belongs to the view configuration.
 - **`Phase`** — name, phase_type (`'gas'`, `'liquid'`, `'solid'`, `'end_member'`), energy model, xmin/xmax. Key methods: `gibbs(x, T, P=0.0)`, `composition_grid(n_points=500)`, `is_point` (property, True when xmin==xmax).
-- **`System`** — `components`, `phases`, `energy_form`, `fields: list[Field]` (fields[0] is temperature by convention; any number of additional fields allowed), `R_gas`, `P_ref`, `title`. Backward-compatible properties: `T_field`, `T_min`, `T_max`, `T_initial`, `P_field`, `has_pressure`, `P_min`, `P_max`, `P_initial`, `P_unit`, `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`. Constructor: `System(components, phases, energy_form, fields, R_gas=0.0, P_ref=1.0, title='')`.
+- **`System`** — `components`, `phases`, `energy_form`, `fields: list[Field]` (fields[0] is temperature by convention), `title`. Constructor: `System(components, phases, energy_form, fields, title='')`. Backward-compatible properties: `T_field`, `T_min`, `T_max`, `T_initial`, `P_field`, `has_pressure`, `P_min`, `P_max`, `P_initial`, `P_unit`, `R_gas` (scans phases; removed in Phase 3), `P_ref` (scans phases; removed in Phase 3), `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`.
 
 ### `pde_compute.py`
 
