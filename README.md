@@ -1,1 +1,1 @@
-Stochastic Democracy Simulation
+Phase Diagram Explorer
