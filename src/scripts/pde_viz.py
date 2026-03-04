@@ -197,6 +197,7 @@ class _DragState:
     x_press_px:   float = 0.0   # pixel-x at press (direction detection)
     y_press_px:   float = 0.0   # pixel-y at press (direction detection)
     drag_axis:    object = None  # None=undetermined | 'vertical' | 'horizontal'
+    fit_target:   str   = 'H'   # 'H' or 'S'; 'S' when Shift held at press
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +243,9 @@ class GxCanvas(FigureCanvasQTAgg):
         #                   G curves are recomputed from this dict in redraw()
         #                   so edits persist across T-slider moves (hull will lag
         #                   behind until the user clicks Apply in the builder)
-        # _phase_line_artists / _phase_orig_y: matplotlib Line2D + its original
-        #                   y-data, rebuilt each redraw() for use by _on_motion
+        # _phase_line_artists / _phase_orig_y / _phase_orig_x: matplotlib Line2D
+        #                   + its original y- and x-data, rebuilt each redraw()
+        #                   for use by _on_motion (rigid shift needs both axes)
         # _handle_info   : {phase_name: [{'x':, 'G':, 'artist':}, ...]}
         #                   rebuilt each redraw() from _live_phase_data
         # _drag_state    : _DragState while a drag is in progress, else None
@@ -252,6 +254,7 @@ class GxCanvas(FigureCanvasQTAgg):
         self._live_phase_data    = None
         self._phase_line_artists = {}
         self._phase_orig_y       = {}
+        self._phase_orig_x       = {}
         self._handle_info        = {}
         self._drag_state         = None
         self._press_cid          = None
@@ -266,6 +269,7 @@ class GxCanvas(FigureCanvasQTAgg):
         # Reset per-draw artist storage (all artists destroyed by cla()).
         self._phase_line_artists.clear()
         self._phase_orig_y.clear()
+        self._phase_orig_x.clear()
         self._handle_info.clear()
 
         # Draw each phase's G(x) curve.
@@ -282,7 +286,9 @@ class GxCanvas(FigureCanvasQTAgg):
                     and not phase.is_point
                     and self.system.energy_form == 'HS'):
                 pd = self._live_phase_data.get(phase.name)
-                if pd is not None:
+                # VLE gas phases: hs_H/hs_S are [0.0] placeholders in live_data;
+                # use the precomputed G from result.phase_curves instead.
+                if pd is not None and not pd.is_vle_gas:
                     G_plot = _G_from_phase_data(
                         pd, x, result.T, result.P,
                         self.system.R_gas, self.system.P_ref)
@@ -296,6 +302,7 @@ class GxCanvas(FigureCanvasQTAgg):
                 if self._edit_mode != 'off':
                     self._phase_line_artists[phase.name] = line
                     self._phase_orig_y[phase.name] = np.asarray(G_plot).copy()
+                    self._phase_orig_x[phase.name] = np.asarray(line.get_xdata()).copy()
 
         # Lower convex envelope (dashed black).
         ax.plot(result.hull_x, result.hull_G, 'k--',
@@ -436,6 +443,10 @@ class GxCanvas(FigureCanvasQTAgg):
         for phase in self.system.phases:
             if phase.is_point or self.system.energy_form != 'HS':
                 continue
+            # Skip VLE gas phases — their curve is derived from the liquid;
+            # dragging it independently is physically meaningless.
+            if getattr(phase.energy_model, 'vle_params', None) is not None:
+                continue
             pd = self._live_phase_data.get(phase.name)
             if pd is None:
                 continue
@@ -458,10 +469,62 @@ class GxCanvas(FigureCanvasQTAgg):
     # --- drag event handlers -----------------------------------------------
 
     def _on_press(self, event):
-        """Begin a handle drag when the user clicks near a diamond."""
+        """Begin a handle drag or rigid shift when the user clicks.
+
+        Ctrl+click anywhere on a G(x) curve starts a rigid shift of the whole
+        curve (handle_idx = −1); both vertical (G offset) and horizontal
+        (x-range translation) motion are supported.  A plain click near a
+        diamond handle starts the normal vertical/horizontal drag.
+        """
         if event.inaxes is not self.ax or event.button != 1:
             return
-        if event.ydata is None or not self._handle_info:
+        if event.ydata is None:
+            return
+
+        import copy
+        mods = QApplication.keyboardModifiers()
+        rigid_mode = bool(mods & Qt.ControlModifier)
+
+        if rigid_mode:
+            # Hit-test phase curves, not handles.
+            HIT_RADIUS_PX = 8
+            best_dist  = HIT_RADIUS_PX
+            best_phase = None
+            for phase_name, line in self._phase_line_artists.items():
+                xdata = line.get_xdata()
+                ydata = line.get_ydata()
+                pts   = self.ax.transData.transform(
+                    np.column_stack([xdata, ydata]))
+                dist = np.hypot(pts[:, 0] - event.x,
+                                pts[:, 1] - event.y).min()
+                if dist < best_dist:
+                    best_dist  = dist
+                    best_phase = phase_name
+            if best_phase is None:
+                return
+            pd = (self._live_phase_data.get(best_phase)
+                  if self._live_phase_data else None)
+            # Freeze axes autoscaling for the duration of the drag so that
+            # set_xdata() in _on_motion doesn't trigger a y-axis rescale
+            # that makes curves disappear.  redraw() (called on release via
+            # phase_edited) resets the axes via cla(), restoring the default.
+            self.ax.autoscale(enable=False)
+            self._drag_state = _DragState(
+                phase_name   = best_phase,
+                handle_idx   = -1,
+                y_press_data = event.ydata,
+                snapshot     = copy.deepcopy(pd),
+                T_ref        = self._last_result.T if self._last_result else 0.0,
+                P_ref        = self._last_result.P if self._last_result else 0.0,
+                x_press_data = event.xdata if event.xdata is not None else 0.0,
+                x_press_px   = event.x,
+                y_press_px   = event.y,
+                drag_axis    = 'rigid',
+                fit_target   = 'H',
+            )
+            return
+
+        if not self._handle_info:
             return
 
         HIT_RADIUS_PX = 12
@@ -481,9 +544,9 @@ class GxCanvas(FigureCanvasQTAgg):
         if best_phase is None:
             return
 
-        import copy
         pd = (self._live_phase_data.get(best_phase)
               if self._live_phase_data else None)
+        shift_held = bool(mods & Qt.ShiftModifier)
         self._drag_state = _DragState(
             phase_name   = best_phase,
             handle_idx   = best_idx,
@@ -495,7 +558,13 @@ class GxCanvas(FigureCanvasQTAgg):
             x_press_px   = event.x,
             y_press_px   = event.y,
             drag_axis    = None,
+            fit_target   = 'S' if shift_held else 'H',
         )
+        # Visual hint: yellow edge for S-mode handles.
+        if shift_held:
+            self._handle_info[best_phase][best_idx]['artist'].set_markeredgecolor(
+                'yellow')
+            self.draw_idle()
 
     def _on_motion(self, event):
         """Live visual feedback during a G(x) handle drag.
@@ -540,7 +609,21 @@ class GxCanvas(FigureCanvasQTAgg):
         R_gas = self.system.R_gas
         P_ref = self.system.P_ref
 
-        if ds.drag_axis == 'vertical':
+        if ds.drag_axis == 'rigid':
+            # ---- Rigid shift: translate whole curve + all handles in x and y ----
+            delta_G  = event.ydata - ds.y_press_data
+            delta_x  = event.xdata - ds.x_press_data
+            orig_G   = self._phase_orig_y.get(phase_name)
+            orig_x   = self._phase_orig_x.get(phase_name)
+            if orig_G is None or orig_x is None:
+                return
+            line.set_xdata(orig_x + delta_x)
+            line.set_ydata(orig_G + delta_G)
+            for info in self._handle_info.get(phase_name, []):
+                info['artist'].set_xdata([info['x'] + delta_x])
+                info['artist'].set_ydata([info['G'] + delta_G])
+
+        elif ds.drag_axis == 'vertical':
             # ---- Phase 4: live 3-point quadratic H fit ----
             delta_G   = event.ydata - ds.y_press_data
             info_list = self._handle_info.get(phase_name, [])
@@ -551,7 +634,8 @@ class GxCanvas(FigureCanvasQTAgg):
             try:
                 new_pd = apply_handle_drag(
                     pd, ds.handle_idx, handles_x, handles_G,
-                    T, self.system.energy_form, P, R_gas, P_ref)
+                    T, self.system.energy_form, P, R_gas, P_ref,
+                    fit_target=ds.fit_target)
             except Exception:
                 return
             xs = line.get_xdata()
@@ -615,7 +699,25 @@ class GxCanvas(FigureCanvasQTAgg):
         if pd is None:
             return
 
-        if ds.drag_axis == 'horizontal':
+        if ds.drag_axis == 'rigid':
+            # Rigid shift: apply delta_G to hs_H[0] and delta_x to xmin/xmax.
+            delta_G = (event.ydata - ds.y_press_data
+                       if event.ydata is not None else 0.0)
+            delta_x = (event.xdata - ds.x_press_data
+                       if event.xdata is not None else 0.0)
+            if abs(delta_G) < 1e-12 and abs(delta_x) < 1e-12:
+                if self._last_result is not None:
+                    self.redraw(self._last_result)
+                return
+            from pde_builder import apply_rigid_shift
+            try:
+                new_pd = apply_rigid_shift(pd, delta_G, delta_x)
+            except Exception:
+                if self._last_result is not None:
+                    self.redraw(self._last_result)
+                return
+
+        elif ds.drag_axis == 'horizontal':
             # Phase 3: apply xmin / xmax change.
             if event.xdata is None:
                 if self._last_result is not None:
@@ -649,7 +751,8 @@ class GxCanvas(FigureCanvasQTAgg):
                 new_pd = apply_handle_drag(
                     pd, ds.handle_idx, handles_x, handles_G,
                     ds.T_ref, self.system.energy_form,
-                    ds.P_ref, self.system.R_gas, self.system.P_ref)
+                    ds.P_ref, self.system.R_gas, self.system.P_ref,
+                    fit_target=ds.fit_target)
             except Exception:
                 if self._last_result is not None:
                     self.redraw(self._last_result)
@@ -1263,8 +1366,9 @@ class MainWindow(QMainWindow):
         self._init_system_state(system, precomputed_Tx, None)
         self._build_central_widget()
 
-        # Re-activate edit mode on fresh canvas if builder is still open.
-        if self._builder is not None and self._builder.isVisible():
+        # Re-activate edit mode on fresh canvas if builder is still open (and not closing).
+        if (self._builder is not None and self._builder.isVisible()
+                and not getattr(self._builder, '_closing', False)):
             from pde_builder import SystemData
             sd = SystemData.from_system(system)
             live_data = {pd.name: pd for pd in sd.phases}
@@ -1345,6 +1449,17 @@ class MainWindow(QMainWindow):
                                      fv.get('temperature', 0.0),
                                      fv.get('pressure', 0.0))
         self.gx_canvas.redraw(result)
+
+        # Live consistency checks: refresh warning panel in the builder if open.
+        if self._builder is not None and self._builder.isVisible():
+            try:
+                from pde_check import run_all_checks
+                warnings = run_all_checks(tmp_system,
+                                          T=fv.get('temperature'),
+                                          P=fv.get('pressure'))
+                self._builder._show_warnings(warnings)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Helpers

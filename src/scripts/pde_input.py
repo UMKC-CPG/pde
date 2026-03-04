@@ -65,7 +65,7 @@ import pathlib
 
 from lxml import etree
 
-from pde_energy import HSModel, PolyModel
+from pde_energy import HSModel, PolyModel, compute_vle_gas_hs
 from pde_phase import Field, Phase, System
 
 
@@ -188,7 +188,12 @@ def _parse_energy(energy_el, energy_form, ideal_gas, R_gas, P_ref):
 # ---------------------------------------------------------------------------
 
 def _parse_phase(phase_el, energy_form, R_gas, P_ref):
-    """Create a Phase from a <phase> element."""
+    """Create a Phase from a <phase> element.
+
+    Returns a Phase object for normal phases, or a dict (VLE sentinel) when
+    the phase element contains a <vle> element instead of <energy>.  The
+    caller (parse_system) handles VLE phases in a second pass.
+    """
     name = phase_el.get('name')
     phase_type = phase_el.get('type')
     ideal_gas = phase_el.get('ideal_gas', 'false').lower() == 'true'
@@ -199,6 +204,22 @@ def _parse_phase(phase_el, energy_form, R_gas, P_ref):
         xmax = float(cr_el.get('xmax'))
     else:
         xmin, xmax = 0.0, 1.0
+
+    # Check for VLE reparameterisation (<vle> element instead of <energy>).
+    vle_el = phase_el.find('vle')
+    if vle_el is not None:
+        return {
+            '_vle_sentinel': True,
+            'name':       name,
+            'phase_type': phase_type,
+            'ideal_gas':  ideal_gas,
+            'xmin':       xmin,
+            'xmax':       xmax,
+            'T_bp_A': float(vle_el.get('T_bp_A')),
+            'T_bp_B': float(vle_el.get('T_bp_B')),
+            'L_A':    float(vle_el.get('L_A')),
+            'L_B':    float(vle_el.get('L_B')),
+        }
 
     energy_el = phase_el.find('energy')
     model = _parse_energy(energy_el, energy_form, ideal_gas, R_gas, P_ref)
@@ -256,9 +277,50 @@ def parse_system(infile):
     else:
         fields, R_gas, P_ref = _parse_legacy_fields(root)
 
-    # Phases (preserve document order)
-    phases = [_parse_phase(ph_el, energy_form, R_gas, P_ref)
-              for ph_el in root.findall('phase')]
+    # Phases — two-pass to resolve VLE gas phases against the liquid baseline.
+    raw = [_parse_phase(ph_el, energy_form, R_gas, P_ref)
+           for ph_el in root.findall('phase')]
+
+    # First pass: collect normal phases; find liquid baseline H/S.
+    phases = []
+    liq_H = [0.0]
+    liq_S = [0.0]
+    liq_found = False
+    pending_vle = []
+
+    for item in raw:
+        if isinstance(item, dict) and item.get('_vle_sentinel'):
+            pending_vle.append(item)
+        else:
+            phases.append(item)
+            if (not liq_found
+                    and item.phase_type == 'liquid'
+                    and isinstance(item.energy_model, HSModel)):
+                liq_H = item.energy_model.H_coeffs.tolist()
+                liq_S = item.energy_model.S_coeffs.tolist()
+                liq_found = True
+
+    # Second pass: build VLE gas phases.
+    for vp in pending_vle:
+        H_gas, S_gas = compute_vle_gas_hs(
+            liq_H, liq_S,
+            vp['T_bp_A'], vp['T_bp_B'],
+            vp['L_A'],    vp['L_B'],
+        )
+        model = HSModel(H_gas, S_gas,
+                        ideal_gas=vp['ideal_gas'],
+                        R_gas=R_gas, P_ref=P_ref)
+        model.vle_params = {
+            'T_bp_A': vp['T_bp_A'], 'T_bp_B': vp['T_bp_B'],
+            'L_A':    vp['L_A'],    'L_B':    vp['L_B'],
+        }
+        phases.append(Phase(
+            name=vp['name'],
+            phase_type=vp['phase_type'],
+            energy_model=model,
+            xmin=vp['xmin'],
+            xmax=vp['xmax'],
+        ))
 
     return System(
         components=components,

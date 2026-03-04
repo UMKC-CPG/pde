@@ -194,6 +194,7 @@ class HSModel(EnergyModel):
         self.ideal_gas = bool(ideal_gas)
         self.R_gas = float(R_gas)
         self.P_ref = float(P_ref)
+        self.vle_params = None   # set by callers using compute_vle_gas_hs()
 
     def _gibbs_impl(self, x, field_values: dict) -> np.ndarray:
         T = float(field_values.get('temperature', 0.0))
@@ -229,6 +230,51 @@ class HSModel(EnergyModel):
                 params={'P_ref': self.P_ref},
             ))
         return terms
+
+
+# ---------------------------------------------------------------------------
+# VLE reparameterisation helper
+# ---------------------------------------------------------------------------
+
+def compute_vle_gas_hs(liq_H, liq_S, T_bp_A, T_bp_B, L_A, L_B):
+    """Derive (H_gas_coeffs, S_gas_coeffs) satisfying all VLE conditions.
+
+    Given a liquid phase's H and S polynomials and the latent heats L_A, L_B
+    at the pure-component boiling points T_bp_A (x=0) and T_bp_B (x=1),
+    returns gas H and S coefficients such that all 6 VLE consistency conditions
+    are satisfied by construction:
+      - G_gas = G_liq and dG_gas/dx = dG_liq/dx  at  x=0  (T = T_bp_A)
+      - G_gas = G_liq and dG_gas/dx = dG_liq/dx  at  x=1  (T = T_bp_B)
+      - S_gas > S_liq  so that vapour is stable above the boiling point
+
+    The ΔH and ΔS corrections follow from a 4-constraint derivation with
+    a quadratic Ansatz ΔH(x) = L_A·(1−x)² + L_B·x²:
+
+        ΔH = [L_A,  −2·L_A,   L_A+L_B]
+        ΔS = [L_A/T_A, −2·L_A/T_A, L_A/T_A+L_B/T_B]
+
+    Parameters
+    ----------
+    liq_H   : sequence  — liquid enthalpy coefficients (ascending x)
+    liq_S   : sequence  — liquid entropy coefficients (ascending x)
+    T_bp_A  : float     — boiling point of pure A (x=0), K
+    T_bp_B  : float     — boiling point of pure B (x=1), K
+    L_A     : float     — latent heat of A (same units as H)
+    L_B     : float     — latent heat of B (same units as H)
+
+    Returns
+    -------
+    (H_gas_coeffs, S_gas_coeffs) : (list[float], list[float])
+        Length-3 lists ready to pass to HSModel.
+    """
+    # Pad liquid coefficients to at least 3 terms.
+    H = list(liq_H) + [0.0] * max(0, 3 - len(liq_H))
+    S = list(liq_S) + [0.0] * max(0, 3 - len(liq_S))
+    dH = [L_A, -2.0 * L_A, L_A + L_B]
+    dS = [L_A / T_bp_A, -2.0 * L_A / T_bp_A, L_A / T_bp_A + L_B / T_bp_B]
+    H_gas = [H[i] + dH[i] for i in range(3)]
+    S_gas = [S[i] + dS[i] for i in range(3)]
+    return H_gas, S_gas
 
 
 # ---------------------------------------------------------------------------

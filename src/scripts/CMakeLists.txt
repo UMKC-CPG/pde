@@ -15,6 +15,7 @@ pde_compute.py
 pde_viz.py
 pde_builder.py
 pde_3d.py
+pde_check.py
 )
 
 install (PROGRAMS ${SCRIPTS} DESTINATION bin)

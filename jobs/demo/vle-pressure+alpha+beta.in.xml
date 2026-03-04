@@ -1,0 +1,37 @@
+<pde>
+  <title>Vapor-Liquid Equilibrium (A-B, variable P)</title>
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+  </system>
+  <fields>
+    <field name="temperature" symbol="T" unit="K" min="100" max="500" initial="500"/>
+    <field name="pressure" symbol="P" unit="atm" min="0.499" max="5" initial="1" R_gas="0.008314" P_ref="1"/>
+  </fields>
+  <phase name="vapor" type="gas" ideal_gas="true">
+    <energy model="quadratic">
+      <H x0="14.4" x1="0.689285" x2="8.410715"/>
+      <S x0="0.12" x1="0.01"/>
+    </energy>
+  </phase>
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="0" x1="-21.173473" x2="23.173473"/>
+      <S x0="0.08"/>
+    </energy>
+  </phase>
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.7264" xmax="1"/>
+    <energy model="quadratic">
+      <H x0="113.745216" x1="-272.73312" x2="140.922113"/>
+      <S x0="0"/>
+    </energy>
+  </phase>
+  <phase name="beta" type="solid">
+    <composition_range xmin="0" xmax="0.2347"/>
+    <energy model="quadratic">
+      <H x0="-19.753266" x1="-32.539568" x2="522.953361"/>
+      <S x0="0"/>
+    </energy>
+  </phase>
+</pde>

@@ -31,10 +31,10 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QScrollArea, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
-from pde_energy import HSModel, PolyModel
+from pde_energy import HSModel, PolyModel, compute_vle_gas_hs
 from pde_phase import Field, Phase, System
 
 
@@ -65,6 +65,14 @@ class PhaseData:
     hs_V: list = field(default_factory=lambda: None)   # None → no PV term
     # Polynomial form: poly[i][j] = coefficient for x^i * T^j
     poly: list = field(default_factory=lambda: [[0.0]])
+    # VLE reparameterisation (gas phases only)
+    # When not None: {'T_bp_A': float, 'T_bp_B': float, 'L_A': float, 'L_B': float}
+    vle: dict = field(default=None)
+
+    @property
+    def is_vle_gas(self) -> bool:
+        """True when this is a gas phase using the VLE reparameterisation."""
+        return self.phase_type == 'gas' and self.vle is not None
 
 
 @dataclass
@@ -94,8 +102,18 @@ class SystemData:
         R_gas = self.R_gas if self.has_pressure else 0.0
         P_ref = self.P_ref if self.has_pressure else 1.0
 
+        # First pass: build all non-VLE phases; collect first liquid's H/S.
         phases = []
+        liq_H = [0.0]
+        liq_S = [0.0]
+        liq_found = False
+        pending_vle = []   # list of PhaseData for VLE gas phases
+
         for pd in self.phases:
+            if pd.is_vle_gas:
+                pending_vle.append(pd)
+                continue
+
             V_coeffs = pd.hs_V if pd.hs_V else None
             if self.energy_form == 'HS':
                 model = HSModel(pd.hs_H, pd.hs_S,
@@ -107,6 +125,32 @@ class SystemData:
                                   V_coeffs=V_coeffs,
                                   ideal_gas=pd.ideal_gas,
                                   R_gas=R_gas, P_ref=P_ref)
+            phases.append(Phase(
+                name=pd.name,
+                phase_type=pd.phase_type,
+                energy_model=model,
+                xmin=pd.xmin,
+                xmax=pd.xmax,
+            ))
+            if pd.phase_type == 'liquid' and not liq_found and self.energy_form == 'HS':
+                liq_H = list(pd.hs_H) if pd.hs_H else [0.0]
+                liq_S = list(pd.hs_S) if pd.hs_S else [0.0]
+                liq_found = True
+
+        # Second pass: build VLE gas phases using compute_vle_gas_hs().
+        for pd in pending_vle:
+            vp = pd.vle
+            H_gas, S_gas = compute_vle_gas_hs(
+                liq_H, liq_S,
+                vp['T_bp_A'], vp['T_bp_B'],
+                vp['L_A'],    vp['L_B'],
+            )
+            V_coeffs = pd.hs_V if pd.hs_V else None
+            model = HSModel(H_gas, S_gas,
+                            V_coeffs=V_coeffs,
+                            ideal_gas=pd.ideal_gas,
+                            R_gas=R_gas, P_ref=P_ref)
+            model.vle_params = dict(vp)
             phases.append(Phase(
                 name=pd.name,
                 phase_type=pd.phase_type,
@@ -182,6 +226,16 @@ class SystemData:
                 cr_el.set('xmin', _fmt(pd.xmin))
                 cr_el.set('xmax', _fmt(pd.xmax))
 
+            # VLE gas phases: emit <vle> element instead of <energy>.
+            if pd.is_vle_gas:
+                vp = pd.vle
+                vle_el = etree.SubElement(phase_el, 'vle')
+                vle_el.set('T_bp_A', _fmt(vp['T_bp_A']))
+                vle_el.set('T_bp_B', _fmt(vp['T_bp_B']))
+                vle_el.set('L_A',    _fmt(vp['L_A']))
+                vle_el.set('L_B',    _fmt(vp['L_B']))
+                continue
+
             energy_el = etree.SubElement(phase_el, 'energy')
             energy_el.set('model', 'point' if is_point else 'quadratic')
 
@@ -246,10 +300,17 @@ class SystemData:
             model = phase.energy_model
             if isinstance(model, HSModel):
                 pd.ideal_gas = model.ideal_gas
-                pd.hs_H = model.H_coeffs.tolist()
-                pd.hs_S = model.S_coeffs.tolist()
                 pd.hs_V = (model.V_coeffs.tolist()
                            if model.V_coeffs is not None else None)
+                # Recover VLE parameterisation if present.
+                vp = getattr(model, 'vle_params', None)
+                if vp is not None:
+                    pd.vle = dict(vp)
+                    pd.hs_H = [0.0]
+                    pd.hs_S = [0.0]
+                else:
+                    pd.hs_H = model.H_coeffs.tolist()
+                    pd.hs_S = model.S_coeffs.tolist()
                 pd.poly = [[0.0]]
             elif isinstance(model, PolyModel):
                 pd.ideal_gas = model.ideal_gas
@@ -274,24 +335,32 @@ class SystemData:
 # Fitting layer — pure Python, no Qt
 # ---------------------------------------------------------------------------
 
+def _extend_and_add(coeffs, delta):
+    """Pad *coeffs* to len(*delta*) with zeros, add *delta* element-wise.
+
+    Returns a new list; *coeffs* is not modified.
+    """
+    import numpy as np
+    c = list(coeffs or [0.0])
+    d = list(delta)
+    if len(c) < len(d):
+        c = c + [0.0] * (len(d) - len(c))
+    for i, dv in enumerate(d):
+        c[i] += dv
+    return c
+
+
 def apply_handle_drag(phase_data, drag_handle_idx,
                       handles_x, handles_G, T, energy_form,
-                      P=0.0, R_gas=0.0, P_ref=1.0):
-    """Return updated PhaseData after a vertical G(x) handle drag (Strategy 1: H-only).
+                      P=0.0, R_gas=0.0, P_ref=1.0,
+                      fit_target='H'):
+    """Return updated PhaseData after a vertical G(x) handle drag.
 
-    The function is a standalone, Qt-free fitting layer designed to be
-    swappable as the interactive editing feature matures:
+    *fit_target* selects which polynomial is fitted:
+      'H'  (default) — adjust H₀, H₁, H₂; keep S unchanged.
+      'S'            — adjust S₀, S₁, S₂; keep H unchanged.
 
-    Current implementation — Phase 4 (quadratic fit):
-        Solve the 3×3 Vandermonde system  H(xᵢ) = Gᵢ + T·S(xᵢ) − P·V(xᵢ) − R·T·ln(P/P₀)
-        for i = 0,1,2, fitting H₀, H₁, H₂ so the full G(x) curve passes through
-        all three handle positions simultaneously.  Higher-order H terms are
-        discarded (documented limitation).  Falls back to a uniform H₀ shift when
-        the system is degenerate (e.g. coincident handles).
-
-    Planned extensions (same signature, different body):
-        Phase 8 — two-temperature H+S decomposition (Strategy 3):
-            Collect drag snapshots at two T values, solve uniquely for ΔH, ΔS.
+    In both cases higher-order coefficients (index ≥ 3) are preserved.
 
     Parameters
     ----------
@@ -306,6 +375,7 @@ def apply_handle_drag(phase_data, drag_handle_idx,
     P               : float       — pressure at drag time (default 0; backward-compatible)
     R_gas           : float       — ideal-gas constant for the system (default 0)
     P_ref           : float       — reference pressure for ideal-gas term (default 1)
+    fit_target      : str         — 'H' or 'S' (default 'H')
 
     Returns
     -------
@@ -319,41 +389,88 @@ def apply_handle_drag(phase_data, drag_handle_idx,
         # Polynomial form editing deferred to a later phase.
         return new_data
 
-    # ---- Phase 4: 3-point Vandermonde solve for H₀, H₁, H₂ ----
-    # Full G = H - T·S + P·V + R·T·ln(P/P₀)
-    # Invert to get H target:  H = G + T·S - P·V - R·T·ln(P/P₀)
-    S_coeffs = np.asarray(phase_data.hs_S or [0.0])
-    xs       = np.asarray(handles_x, dtype=float)
-    S_vals   = np.polynomial.polynomial.polyval(xs, S_coeffs)
-    H_target = np.asarray(handles_G, dtype=float) + T * S_vals
+    xs = np.asarray(handles_x, dtype=float)
+
+    # --- helper: remove PV and ideal-gas contributions from target G values ---
+    net_G = np.asarray(handles_G, dtype=float).copy()
     if phase_data.hs_V and P != 0.0:
-        V_vals   = np.polynomial.polynomial.polyval(xs, np.asarray(phase_data.hs_V))
-        H_target = H_target - P * V_vals
+        V_vals = np.polynomial.polynomial.polyval(xs, np.asarray(phase_data.hs_V))
+        net_G  = net_G - P * V_vals
     if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
-        H_target = H_target - R_gas * T * np.log(P / P_ref)
+        net_G = net_G - R_gas * T * np.log(P / P_ref)
 
     # Vandermonde matrix [1, x, x²] for each handle position.
     A = np.column_stack([np.ones(3), xs, xs ** 2])
 
-    try:
-        H_coeffs = np.linalg.solve(A, H_target)
-        new_data.hs_H = list(H_coeffs)
-    except np.linalg.LinAlgError:
-        # Degenerate geometry — fall back to uniform H₀ shift.
-        H_old  = np.asarray(phase_data.hs_H or [0.0])
-        S_old  = np.asarray(phase_data.hs_S or [0.0])
-        x_drag = handles_x[drag_handle_idx]
-        G_old  = (np.polynomial.polynomial.polyval(x_drag, H_old)
-                  - T * np.polynomial.polynomial.polyval(x_drag, S_old))
-        if phase_data.hs_V and P != 0.0:
-            G_old += P * np.polynomial.polynomial.polyval(
-                x_drag, np.asarray(phase_data.hs_V))
-        if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
-            G_old += R_gas * T * np.log(P / P_ref)
-        delta_G   = handles_G[drag_handle_idx] - G_old
-        new_H     = list(phase_data.hs_H or [0.0])
-        new_H[0] += delta_G
-        new_data.hs_H = new_H
+    if fit_target == 'S':
+        # ---- S-mode: keep H fixed, adjust S₀, S₁, S₂ ----
+        # G = H(x) - T·S(x)  →  S(x) = (H(x) - G(x)) / T
+        if abs(T) < 1e-10:
+            return new_data   # cannot solve for S at T ≈ 0
+        H_all  = np.asarray(phase_data.hs_H or [0.0])
+        H_vals = np.polynomial.polynomial.polyval(xs, H_all)
+        S_target = (H_vals - net_G) / T
+
+        S_all  = np.asarray(phase_data.hs_S or [0.0])
+        S_high = S_all[3:] if len(S_all) > 3 else np.array([])
+
+        # Subtract high-order S contribution at handle positions.
+        S_high_at_xs = np.zeros(3)
+        for k, s_k in enumerate(S_high):
+            S_high_at_xs += s_k * xs ** (k + 3)
+        S_low_target = S_target - S_high_at_xs
+
+        try:
+            S_low_new    = np.linalg.solve(A, S_low_target)
+            new_data.hs_S = list(S_low_new) + list(S_high)
+        except np.linalg.LinAlgError:
+            # Degenerate geometry — fall back to uniform S₀ shift.
+            x_drag       = handles_x[drag_handle_idx]
+            H_at_drag    = float(np.polynomial.polynomial.polyval(x_drag, H_all))
+            net_G_drag   = float(net_G[drag_handle_idx])
+            S_target_drag = (H_at_drag - net_G_drag) / T
+            S_current_drag = float(np.polynomial.polynomial.polyval(x_drag, S_all))
+            new_S        = list(phase_data.hs_S or [0.0])
+            if not new_S:
+                new_S = [0.0]
+            new_S[0]    += S_target_drag - S_current_drag
+            new_data.hs_S = new_S
+
+    else:
+        # ---- H-mode (default): keep S fixed, adjust H₀, H₁, H₂ ----
+        # Invert G = H - T·S  →  H = net_G + T·S
+        S_coeffs = np.asarray(phase_data.hs_S or [0.0])
+        S_vals   = np.polynomial.polynomial.polyval(xs, S_coeffs)
+        H_target = net_G + T * S_vals
+
+        H_all  = np.asarray(phase_data.hs_H or [0.0])
+        H_high = H_all[3:] if len(H_all) > 3 else np.array([])
+
+        # Subtract high-order H contribution at handle positions.
+        H_high_at_xs = np.zeros(3)
+        for k, h_k in enumerate(H_high):
+            H_high_at_xs += h_k * xs ** (k + 3)
+        H_low_target = H_target - H_high_at_xs
+
+        try:
+            H_low_new    = np.linalg.solve(A, H_low_target)
+            new_data.hs_H = list(H_low_new) + list(H_high)
+        except np.linalg.LinAlgError:
+            # Degenerate geometry — fall back to uniform H₀ shift.
+            H_old  = np.asarray(phase_data.hs_H or [0.0])
+            S_old  = np.asarray(phase_data.hs_S or [0.0])
+            x_drag = handles_x[drag_handle_idx]
+            G_old  = (np.polynomial.polynomial.polyval(x_drag, H_old)
+                      - T * np.polynomial.polynomial.polyval(x_drag, S_old))
+            if phase_data.hs_V and P != 0.0:
+                G_old += P * np.polynomial.polynomial.polyval(
+                    x_drag, np.asarray(phase_data.hs_V))
+            if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
+                G_old += R_gas * T * np.log(P / P_ref)
+            delta_G    = handles_G[drag_handle_idx] - G_old
+            new_H      = list(phase_data.hs_H or [0.0])
+            new_H[0]  += delta_G
+            new_data.hs_H = new_H
 
     return new_data
 
@@ -382,6 +499,64 @@ def apply_xrange_drag(phase_data, handle_idx, new_x):
         new_data.xmin = float(np.clip(new_x, 0.0, phase_data.xmax - 0.02))
     elif handle_idx == 2:
         new_data.xmax = float(np.clip(new_x, phase_data.xmin + 0.02, 1.0))
+    return new_data
+
+
+def _shift_poly_coeffs(coeffs, dx):
+    """Return ascending-order coefficients of p(x − dx).
+
+    Given coefficients [c0, c1, …, cn] representing p(x) = Σ cᵢ xⁱ, returns
+    the coefficients of p(x − dx) via numpy polynomial composition.  The curve
+    shape is preserved; only the x-domain is translated.
+    """
+    import numpy as np
+    if not coeffs or dx == 0.0:
+        return list(coeffs) if coeffs else []
+    # np.poly1d uses descending-degree order (highest power first).
+    p = np.poly1d(list(reversed(coeffs)))
+    q = np.poly1d([1.0, -dx])          # represents (x − dx)
+    result = p(q)                       # polynomial composition p(x − dx)
+    return list(reversed(result.c.tolist()))
+
+
+def apply_rigid_shift(phase_data, delta_G, delta_x=0.0):
+    """Return updated PhaseData after a rigid G(x) shift (vertical and/or horizontal).
+
+    *delta_G* is added to the constant H coefficient (hs_H[0]), shifting
+    G(x, T) = H(x) − T·S(x) by exactly *delta_G* at every composition and
+    temperature.
+
+    *delta_x* translates the phase's x-range: both xmin and xmax are shifted
+    by the same amount (clamped to keep them within [0, 1]).  The H and S
+    polynomial coefficients are reparameterised via p(x) → p(x − δ) so that
+    the curve shape is preserved at the new positions.
+
+    Parameters
+    ----------
+    phase_data : PhaseData — original data (not modified in place)
+    delta_G    : float     — vertical shift in G units (positive = up)
+    delta_x    : float     — horizontal translation in composition units
+
+    Returns
+    -------
+    PhaseData — deep copy with updated coefficients and/or xmin/xmax.
+    """
+    import numpy as np
+    new_data = copy.deepcopy(phase_data)
+    # Vertical shift: add delta_G to constant H term.
+    H = list(new_data.hs_H or [0.0])
+    H[0] = H[0] + float(delta_G)
+    new_data.hs_H = H
+    if delta_x != 0.0:
+        width = phase_data.xmax - phase_data.xmin
+        clamped_dx = float(np.clip(delta_x, -phase_data.xmin, 1.0 - phase_data.xmax))
+        if clamped_dx != 0.0:
+            new_data.xmin = phase_data.xmin + clamped_dx
+            new_data.xmax = new_data.xmin + width
+            # Reparameterise H and S: p(x) → p(x − clamped_dx).
+            new_data.hs_H = _shift_poly_coeffs(new_data.hs_H, clamped_dx)
+            if new_data.hs_S:
+                new_data.hs_S = _shift_poly_coeffs(new_data.hs_S, clamped_dx)
     return new_data
 
 
@@ -633,6 +808,7 @@ class PhaseEditorWidget(QFrame):
         super().__init__(parent)
         self.setFrameStyle(QFrame.StyledPanel)
         self._energy_form = energy_form
+        self._vle_mode = False   # True when gas VLE page is active
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 4, 6, 4)
@@ -651,6 +827,7 @@ class PhaseEditorWidget(QFrame):
         self._type_combo = QComboBox()
         for t in ('solid', 'liquid', 'gas', 'end_member'):
             self._type_combo.addItem(t)
+        self._type_combo.currentTextChanged.connect(self._on_type_changed)
         header.addWidget(self._type_combo)
 
         header.addWidget(QLabel('x:'))
@@ -684,10 +861,10 @@ class PhaseEditorWidget(QFrame):
 
         root.addLayout(header)
 
-        # ---- stacked content: index 0 = HS, index 1 = poly ----
+        # ---- stacked content: index 0 = HS, index 1 = poly, index 2 = VLE ----
         self._stack = QStackedWidget()
 
-        # HS page
+        # HS page (index 0)
         hs_widget = QWidget()
         hs_layout = QVBoxLayout(hs_widget)
         hs_layout.setContentsMargins(0, 0, 0, 0)
@@ -711,7 +888,7 @@ class PhaseEditorWidget(QFrame):
         self._stack.addWidget(hs_widget)   # index 0
         self._update_eq_label()            # set initial text
 
-        # Poly page
+        # Poly page (index 1)
         poly_page = QWidget()
         poly_layout = QVBoxLayout(poly_page)
         poly_layout.setContentsMargins(0, 0, 0, 0)
@@ -726,14 +903,97 @@ class PhaseEditorWidget(QFrame):
         poly_layout.addWidget(self._poly_widget)
         self._stack.addWidget(poly_page)  # index 1
 
+        # VLE page (index 2)
+        vle_page = QWidget()
+        vle_layout = QVBoxLayout(vle_page)
+        vle_layout.setContentsMargins(0, 0, 0, 0)
+        vle_layout.setSpacing(4)
+        vle_hint = QLabel(
+            'G\u1d33\u1d43\u02e2(x,T) = G\u2097\u1d35\u1d63(x,T) + \u0394H(x) \u2212 T\u00b7\u0394S(x)\n'
+            '\u0394H(x) = L\u2090\u00b7(1\u2212x)\u00b2 + L\u1d2e\u00b7x\u00b2   '
+            '   \u0394S(x) = (L\u2090/T\u2090)\u00b7(1\u2212x)\u00b2 + (L\u1d2e/T\u1d2e)\u00b7x\u00b2')
+        vle_hint.setStyleSheet('color: #777; font-style: italic;')
+        vle_layout.addWidget(vle_hint)
+
+        vle_grid = QWidget()
+        vle_grid_layout = QGridLayout(vle_grid)
+        vle_grid_layout.setSpacing(6)
+        vle_grid_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._T_bp_A_sb = _FloatSpinBox()
+        self._T_bp_A_sb.setRange(0.0, 5000.0)
+        self._T_bp_A_sb.setDecimals(2)
+        self._T_bp_A_sb.setSingleStep(1.0)
+        self._T_bp_A_sb.setValue(350.0)
+
+        self._T_bp_B_sb = _FloatSpinBox()
+        self._T_bp_B_sb.setRange(0.0, 5000.0)
+        self._T_bp_B_sb.setDecimals(2)
+        self._T_bp_B_sb.setSingleStep(1.0)
+        self._T_bp_B_sb.setValue(400.0)
+
+        self._L_A_sb = _FloatSpinBox()
+        self._L_A_sb.setRange(0.0, 1e9)
+        self._L_A_sb.setDecimals(4)
+        self._L_A_sb.setSingleStep(0.1)
+        self._L_A_sb.setValue(1.0)
+
+        self._L_B_sb = _FloatSpinBox()
+        self._L_B_sb.setRange(0.0, 1e9)
+        self._L_B_sb.setDecimals(4)
+        self._L_B_sb.setSingleStep(0.1)
+        self._L_B_sb.setValue(1.0)
+
+        vle_grid_layout.addWidget(QLabel('T_bp_A (K):'), 0, 0)
+        vle_grid_layout.addWidget(self._T_bp_A_sb,       0, 1)
+        vle_grid_layout.addWidget(QLabel('T_bp_B (K):'), 0, 2)
+        vle_grid_layout.addWidget(self._T_bp_B_sb,       0, 3)
+        vle_grid_layout.addWidget(QLabel('L_A:'),         1, 0)
+        vle_grid_layout.addWidget(self._L_A_sb,           1, 1)
+        vle_grid_layout.addWidget(QLabel('L_B:'),         1, 2)
+        vle_grid_layout.addWidget(self._L_B_sb,           1, 3)
+        vle_layout.addWidget(vle_grid)
+
+        custom_hs_btn = QPushButton('Use custom H/S instead\u2026')
+        custom_hs_btn.setToolTip(
+            'Switch to the raw H/S coefficient page for full manual control')
+        custom_hs_btn.clicked.connect(self._switch_to_hs_page)
+        vle_layout.addWidget(custom_hs_btn)
+        vle_layout.addStretch()
+        self._stack.addWidget(vle_page)   # index 2
+
         root.addWidget(self._stack)
         self.set_energy_form(energy_form)
+
+    # -- private helpers ----------------------------------------------------
+
+    def _on_type_changed(self, phase_type):
+        """Switch to VLE page when type becomes 'gas'; back to HS otherwise."""
+        if phase_type == 'gas' and self._energy_form == 'HS':
+            self._vle_mode = True
+        else:
+            self._vle_mode = False
+        self._update_stack_page()
+
+    def _switch_to_hs_page(self):
+        """Explicitly switch away from the VLE page to raw H/S."""
+        self._vle_mode = False
+        self._update_stack_page()
+
+    def _update_stack_page(self):
+        """Select the correct stack page from (_energy_form, _vle_mode)."""
+        if self._energy_form == 'polynomial':
+            self._stack.setCurrentIndex(1)
+        elif self._vle_mode:
+            self._stack.setCurrentIndex(2)
+        else:
+            self._stack.setCurrentIndex(0)
 
     # -- public API ---------------------------------------------------------
 
     def set_energy_form(self, form):
         self._energy_form = form
-        self._stack.setCurrentIndex(0 if form == 'HS' else 1)
+        self._update_stack_page()
 
     def _update_eq_label(self, _=None):
         text = 'G(x,T) = H(x) \u2212 T\u00b7S(x)'
@@ -756,20 +1016,35 @@ class PhaseEditorWidget(QFrame):
         pd.xmin = self._xmin_sb.value()
         pd.xmax = self._xmax_sb.value()
         pd.ideal_gas = self._ideal_gas_cb.isChecked()
-        pd.hs_H = self._H_row.get_coeffs()
-        pd.hs_S = self._S_row.get_coeffs()
-        pd.hs_V = self._V_row.get_coeffs() if self._V_enable_cb.isChecked() else None
+        if self._vle_mode and pd.phase_type == 'gas' and self._energy_form == 'HS':
+            pd.vle = {
+                'T_bp_A': self._T_bp_A_sb.value(),
+                'T_bp_B': self._T_bp_B_sb.value(),
+                'L_A':    self._L_A_sb.value(),
+                'L_B':    self._L_B_sb.value(),
+            }
+        else:
+            pd.hs_H = self._H_row.get_coeffs()
+            pd.hs_S = self._S_row.get_coeffs()
+            pd.hs_V = self._V_row.get_coeffs() if self._V_enable_cb.isChecked() else None
         pd.poly = self._poly_widget.get_coeffs()
         return pd
 
     def set_phase_data(self, data: PhaseData):
         self._name_edit.setText(data.name)
+        # Block type-combo signal — we handle mode switching explicitly below.
+        self._type_combo.blockSignals(True)
         idx = self._type_combo.findText(data.phase_type)
         if idx >= 0:
             self._type_combo.setCurrentIndex(idx)
+        self._type_combo.blockSignals(False)
+
         self._xmin_sb.setValue(data.xmin)
         self._xmax_sb.setValue(data.xmax)
         self._ideal_gas_cb.setChecked(data.ideal_gas)
+
+        # Always populate the H/S spinboxes so they hold correct values if the
+        # user switches to "Use custom H/S instead".
         self._H_row.set_coeffs(data.hs_H or [0.0])
         self._S_row.set_coeffs(data.hs_S or [0.0])
         if data.hs_V:
@@ -778,6 +1053,31 @@ class PhaseEditorWidget(QFrame):
         else:
             self._V_enable_cb.setChecked(False)
         self._poly_widget.set_coeffs(data.poly or [[0.0]])
+
+        if data.vle is not None:
+            # Explicit VLE parameterisation — populate spinboxes and show VLE page.
+            self._vle_mode = True
+            self._T_bp_A_sb.setValue(data.vle.get('T_bp_A', 350.0))
+            self._T_bp_B_sb.setValue(data.vle.get('T_bp_B', 400.0))
+            self._L_A_sb.setValue(data.vle.get('L_A', 1.0))
+            self._L_B_sb.setValue(data.vle.get('L_B', 1.0))
+        else:
+            # Raw H/S data (including old-style gas phases) — show HS page.
+            self._vle_mode = False
+
+        self._update_stack_page()
+
+    def set_highlight(self, severity=None):
+        """Apply a colored border or clear it based on warning severity."""
+        from pde_check import Severity
+        if severity is None:
+            self.setStyleSheet('')
+        else:
+            colors = {Severity.ERROR:   '#cc0000',
+                      Severity.WARNING: '#b85000',
+                      Severity.INFO:    '#1a5ca0'}
+            c = colors[severity]
+            self.setStyleSheet(f'PhaseEditorWidget {{ border: 2px solid {c}; }}')
 
 
 # ---------------------------------------------------------------------------
@@ -799,9 +1099,10 @@ class BuilderWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle('PDE Builder')
         self.setWindowFlags(Qt.Window)   # independent (non-modal) window
-        self.resize(700, 600)
+        self.resize(700, 760)
 
         self._phase_editors = []   # list[PhaseEditorWidget]
+        self._last_names    = {}   # PhaseEditorWidget → last accepted name
         self._comp_edits = []      # list[QLineEdit]
 
         root = QVBoxLayout(self)
@@ -912,6 +1213,23 @@ class BuilderWindow(QDialog):
         add_phase_btn.clicked.connect(lambda: self._add_phase())
         root.addWidget(add_phase_btn)
 
+        # ---- Consistency check panel ----
+        warn_group = QGroupBox('Consistency Checks')
+        warn_layout = QVBoxLayout(warn_group)
+        warn_layout.setContentsMargins(4, 4, 4, 4)
+        self._warn_scroll = QScrollArea()
+        self._warn_scroll.setWidgetResizable(True)
+        self._warn_scroll.setMaximumHeight(130)
+        self._warn_scroll.setMinimumHeight(48)
+        self._warn_contents = QWidget()
+        self._warn_box = QVBoxLayout(self._warn_contents)
+        self._warn_box.setContentsMargins(2, 2, 2, 2)
+        self._warn_box.setSpacing(4)
+        self._warn_box.addStretch()
+        self._warn_scroll.setWidget(self._warn_contents)
+        warn_layout.addWidget(self._warn_scroll)
+        root.addWidget(warn_group)
+
         # ---- Button row ----
         btn_row = QHBoxLayout()
         load_btn = QPushButton('Load XML\u2026')
@@ -921,7 +1239,7 @@ class BuilderWindow(QDialog):
         load_btn.clicked.connect(self._on_load)
         save_btn.clicked.connect(self._on_save)
         apply_btn.clicked.connect(self._on_apply)
-        close_btn.clicked.connect(self.close)
+        close_btn.clicked.connect(self._on_close)
         btn_row.addWidget(load_btn)
         btn_row.addWidget(save_btn)
         btn_row.addStretch()
@@ -936,6 +1254,9 @@ class BuilderWindow(QDialog):
         else:
             self._add_component_edit('A')
             self._add_component_edit('B')
+
+        # Run checks immediately so the panel is populated on first open
+        self._run_and_show_checks()
 
     # ------------------------------------------------------------------
     # Component management
@@ -963,18 +1284,50 @@ class BuilderWindow(QDialog):
         for editor in self._phase_editors:
             editor.set_energy_form(form)
 
+    def _unique_phase_name(self, base='phase'):
+        """Return *base* if unused, otherwise *base_2*, *base_3*, …"""
+        existing = {e._name_edit.text() for e in self._phase_editors}
+        if base not in existing:
+            return base
+        i = 2
+        while f'{base}_{i}' in existing:
+            i += 1
+        return f'{base}_{i}'
+
+    def _on_phase_name_changed(self, editor):
+        """Reject a name edit that duplicates another phase; revert to previous."""
+        new_name = editor._name_edit.text().strip()
+        if not new_name:
+            editor._name_edit.setText(self._last_names.get(editor, 'phase'))
+            return
+        others = {e._name_edit.text() for e in self._phase_editors if e is not editor}
+        if new_name in others:
+            QMessageBox.warning(self, 'Duplicate Phase Name',
+                                f'A phase named "{new_name}" already exists.\n'
+                                'The name has been reverted.')
+            editor._name_edit.setText(self._last_names.get(editor, 'phase'))
+        else:
+            self._last_names[editor] = new_name
+
     def _add_phase(self, data=None):
         form = self._form_combo.currentText()
         editor = PhaseEditorWidget(energy_form=form)
         if data is not None:
+            data.name = self._unique_phase_name(data.name)
             editor.set_phase_data(data)
+        else:
+            editor._name_edit.setText(self._unique_phase_name('phase'))
+        self._last_names[editor] = editor._name_edit.text()
         editor.remove_requested.connect(lambda e=editor: self._remove_phase(e))
+        editor._name_edit.editingFinished.connect(
+            lambda e=editor: self._on_phase_name_changed(e))
         # Insert before the bottom stretch.
         count = self._phases_layout.count()
         self._phases_layout.insertWidget(count - 1, editor)
         self._phase_editors.append(editor)
 
     def _remove_phase(self, editor):
+        self._last_names.pop(editor, None)
         if editor in self._phase_editors:
             self._phase_editors.remove(editor)
         self._phases_layout.removeWidget(editor)
@@ -1060,17 +1413,193 @@ class BuilderWindow(QDialog):
             except Exception as exc:
                 QMessageBox.warning(self, 'Save Error', str(exc))
 
-    def _on_apply(self):
+    def _show_warnings(self, warnings):
+        """Render consistency-check warnings into the warning panel."""
+        from pde_check import Severity
+
+        # ---- C: clear all phase highlights ----
+        for editor in self._phase_editors:
+            editor.set_highlight(None)
+
+        # ---- C: apply highlights (first match per phase name wins) ----
+        highlighted = set()
+        for w in warnings:
+            for name in w.phase_names:
+                if name not in highlighted:
+                    for editor in self._phase_editors:
+                        if editor._name_edit.text() == name:
+                            editor.set_highlight(w.severity)
+                            highlighted.add(name)
+                            break
+
+        # ---- clear warning box ----
+        while self._warn_box.count():
+            item = self._warn_box.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        energy_form = self._form_combo.currentText()
+        colour_map = {Severity.ERROR:   '#cc0000',
+                      Severity.WARNING: '#b85000',
+                      Severity.INFO:    '#1a5ca0'}
+        icon_map   = {Severity.ERROR:   '⚠',
+                      Severity.WARNING: '●',
+                      Severity.INFO:    'ⅈ'}
+
+        if not warnings:
+            lbl = QLabel('✓ No issues found.')
+            lbl.setStyleSheet('color: #2a7a2a; font-weight: bold;')
+            self._warn_box.addWidget(lbl)
+            self._warn_box.addStretch()
+            return
+
+        for w in warnings:
+            row_widget = QWidget()
+            row_layout = QVBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(1)
+
+            c  = colour_map[w.severity]
+            ic = icon_map[w.severity]
+            ph = f' [{", ".join(w.phase_names)}]' if w.phase_names else ''
+
+            # top line: icon + message + optional Fix button
+            top = QHBoxLayout()
+            top.setSpacing(4)
+            msg_lbl = QLabel(f'{ic} {w.message}{ph}')
+            msg_lbl.setStyleSheet(f'color: {c}; font-weight: bold;')
+            msg_lbl.setWordWrap(True)
+            top.addWidget(msg_lbl, 1)
+
+            # B: Fix buttons — only for HS form
+            # if energy_form == 'HS':
+            #     if w.fix_hs is not None:
+            #         fix_btn = QPushButton('Fix All →')
+            #         fix_btn.setFixedWidth(64)
+            #         fix_btn.setToolTip(
+            #             'Correct H and S to satisfy all 4 consistency conditions '
+            #             f'(G and dG/dx at both endpoints) for {w.phase_names[0]}'
+            #         )
+            #         fix_btn.clicked.connect(lambda checked=False, _w=w: self._apply_fix(_w))
+            #         top.addWidget(fix_btn)
+            #     elif w.fix_delta is not None:
+            #         fix_btn = QPushButton('Fix G →')
+            #         fix_btn.setFixedWidth(52)
+            #         fix_btn.setToolTip(
+            #             f'Apply H₀ correction ({w.fix_delta:+.4g}) to {w.phase_names[0]}'
+            #         )
+            #         fix_btn.clicked.connect(lambda checked=False, _w=w: self._apply_fix(_w))
+            #         top.addWidget(fix_btn)
+
+            top_widget = QWidget()
+            top_widget.setLayout(top)
+            row_layout.addWidget(top_widget)
+
+            # detail line
+            det_lbl = QLabel(w.detail)
+            det_lbl.setStyleSheet('color: #555; font-size: 10px;')
+            det_lbl.setWordWrap(True)
+            row_layout.addWidget(det_lbl)
+
+            self._warn_box.addWidget(row_widget)
+
+        self._warn_box.addStretch()
+
+    def _apply_fix(self, w):
+        """Apply the one-click correction stored in a ConsistencyWarning.
+
+        Handles two cases:
+          fix_hs    — minimum-norm H+S correction satisfying all 4 conditions
+          fix_delta — simple H₀ shift to equalise G at one endpoint
+        """
+        if not w.phase_names:
+            return
+
+        if w.fix_hs is not None:
+            target_name = w.fix_hs['target_name']
+            dH = w.fix_hs['dH']
+            dS = w.fix_hs['dS']
+            for editor in self._phase_editors:
+                if editor._name_edit.text() == target_name:
+                    pd = editor.get_phase_data()
+                    pd.hs_H = _extend_and_add(pd.hs_H, dH)
+                    pd.hs_S = _extend_and_add(pd.hs_S, dS)
+                    editor.set_phase_data(pd)
+                    break
+        elif w.fix_delta is not None:
+            target_name = w.phase_names[0]
+            for editor in self._phase_editors:
+                if editor._name_edit.text() == target_name:
+                    pd = editor.get_phase_data()
+                    if not pd.hs_H:
+                        pd.hs_H = [0.0]
+                    pd.hs_H[0] += w.fix_delta
+                    editor.set_phase_data(pd)
+                    break
+        else:
+            return
+
+        self._run_and_show_checks()
+
+    def _run_and_show_checks(self):
+        """Collect current UI state, run all consistency checks, refresh warning panel."""
+        try:
+            sd = self._collect_system_data()
+            system = sd.to_system()
+            from pde_check import run_all_checks
+            warnings = run_all_checks(system)
+        except Exception:
+            warnings = []
+        self._show_warnings(warnings)
+
+    def _on_apply(self) -> bool:
+        """Apply current state. Returns True on success, False on error."""
         try:
             sd = self._collect_system_data()
             if not sd.phases:
                 QMessageBox.warning(self, 'Apply Error',
                                     'Add at least one phase before applying.')
-                return
+                return False
             system = sd.to_system()
-            self.system_applied.emit(system)
         except Exception as exc:
             QMessageBox.warning(self, 'Apply Error', str(exc))
+            return False
+        try:
+            from pde_check import run_all_checks
+            warnings = run_all_checks(system)
+        except ImportError:
+            warnings = []
+        except Exception as check_exc:
+            warnings = []
+            print(f'[pde_check] Checker error: {check_exc}')
+        self._show_warnings(warnings)
+        self.system_applied.emit(system)
+        return True
+
+    def _on_close(self):
+        self._closing = True
+        if not self._on_apply():
+            self._closing = False
+            return
+        self.close()
+
+    def closeEvent(self, event):
+        if not getattr(self, '_closing', False):
+            # Window X button: silently apply if possible, ignore errors
+            try:
+                sd = self._collect_system_data()
+                if sd.phases:
+                    system = sd.to_system()
+                    try:
+                        from pde_check import run_all_checks
+                        warnings = run_all_checks(system)
+                    except Exception:
+                        warnings = []
+                    self._show_warnings(warnings)
+                    self.system_applied.emit(system)
+            except Exception:
+                pass
+        event.accept()
 
     # ------------------------------------------------------------------
     # Canvas-edit integration (called by GxCanvas via MainWindow)

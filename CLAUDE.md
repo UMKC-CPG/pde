@@ -6,19 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **PDE** (Phase Diagram Explorer) is a Python tool for defining phase energy curves and visualizing the resulting phase diagrams. The intended output format is HDF5 + XDMF.
 
+For full architecture detail see `docs/architecture.md`.
+
 ## Environment Setup
 
-Source `.pde/pderc` (bash) before building or running to set required environment variables:
-
 ```bash
-source .pde/pderc
+source .pde/pderc      # sets PDE_DIR, PDE_RC, PDE_BIN; adds PDE_BIN to PATH
 ```
-
-This sets:
-- `PDE_DIR` — repo root / install prefix (e.g. `$HOME/CPG/cpg-repo/pde`)
-- `PDE_RC` — directory containing `pderc.py` (e.g. `$PDE_DIR/.pde`)
-- `PDE_BIN` — install destination for scripts (`$PDE_DIR/bin`)
-- Adds `PDE_BIN` to `PATH`
 
 ## Build and Install
 
@@ -26,10 +20,10 @@ CMake installs the Python scripts only — no compilation.
 
 ```bash
 cd build/release && cmake ../..
-make install   # installs pde.py and companion modules to $PDE_DIR/bin/
+make install            # installs pde.py and companion modules to $PDE_DIR/bin/
 ```
 
-## Running the Script
+## Running
 
 ```bash
 pde.py                        # reads pde.in.xml, opens interactive UI
@@ -40,235 +34,89 @@ Each run appends the command and timestamp to a local `command` file.
 
 ## Configuration
 
-`pderc.py` (a Python module) provides default parameters via `parameters_and_defaults() -> dict`:
-- `infile`: `pde.in.xml`
-- `outfile`: `pde.out`
-
-Load order: `$PDE_RC/pderc.py` is loaded first; a `pderc.py` in the current working directory takes precedence. `.pde/pderc.py` in this repo is the reference template.
+`pderc.py` provides defaults via `parameters_and_defaults() → dict` (`infile: pde.in.xml`, `outfile: pde.out`). The repo template is `.pde/pderc.py`; a `pderc.py` in the working directory overrides it.
 
 ## Architecture
 
 ```
 src/scripts/pde.py          Main script (installed to $PDE_DIR/bin/)
 src/scripts/pde_input.py    XML input parser → System object
-src/scripts/pde_energy.py   Energy model classes (HSModel, PolyModel)
-src/scripts/pde_phase.py    Phase and System data structures
+src/scripts/pde_energy.py   Energy model classes (HSModel, PolyModel, CouplingTerm)
+src/scripts/pde_phase.py    Field, Phase, System data structures
 src/scripts/pde_compute.py  Equilibrium computation (convex hull) → EqResult
 src/scripts/pde_viz.py      PySide6 + matplotlib interactive UI
-src/scripts/pde_builder.py  Graphical input builder (QDialog) + data model
+src/scripts/pde_builder.py  Graphical input builder (QDialog) + PhaseData/SystemData
+src/scripts/pde_check.py    Consistency checker (warnings panel in BuilderWindow)
 src/scripts/pde_3d.py       3D T-P-x visualization (PhaseDiagram3D + Viz3DWindow)
 src/scripts/pde.1.py        Standalone vedo + PySide6 prototype (not installed)
 .pde/pderc                  Bash environment setup script
 .pde/pderc.py               Python resource control file template
-jobs/demo/                  Demo input files (see Demo Jobs below)
+jobs/demo/                  Demo input files
 ```
 
 ### Pipeline
 
 ```
-XML input
-  └─ pde_input.parse_system()  →  System
-       └─ pde_compute.compute_equilibrium(system, T, P=0.0)  →  EqResult
-            └─ pde_viz.launch_ui(system)  →  PySide6 window
+XML input → pde_input.parse_system() → System
+                 ↓
+    pde_compute.compute_equilibrium(system, T, P) → EqResult
+                 ↓
+    pde_viz.launch_ui(system) → PySide6 window
 ```
 
-### `pde.py` internals
+## Key Data Structures
 
-- `ScriptSettings.__init__()` — loads `pderc.py`, parses CLI args (`-i`/`-o`), reconciles them, logs invocation to `command`.
-- `ScriptSettings.read_input_file()` — delegates to `pde_input.parse_system()`; stores the result as `self.system`.
-- `main()` — if input file exists, calls `settings.read_input_file()` then `start_program(settings)`; if the default `pde.in.xml` is absent, calls `pde_viz.launch_ui_empty()` which opens the main window with a default system and auto-opens the builder; if an explicit `-i` file is missing, prints an error and exits.
-- `start_program()` — calls `pde_viz.launch_ui(settings.system)`.
+**`Field`** (`pde_phase.py`) — `name`, `symbol`, `unit`, `min_val`, `max_val`, `initial_val`. Role (primary/secondary sweep axis) is NOT stored on Field — it belongs to view config.
 
-### `pde_input.py`
+**`System`** — `components`, `phases`, `energy_form`, `fields: list[Field]` (fields[0] = temperature by convention), `title`. Backward-compat properties: `T_field`, `T_min/max/initial`, `P_field`, `has_pressure`, `P_min/max/initial/unit`, `gas/liquid/solid_phases`, `end_members`.
 
-Parses the XML input file using `lxml.etree`. The system-level `<energy_form>` tag (`'HS'` or `'polynomial'`) selects which energy model parser is used for all phases; mixing forms within one file is not supported. Returns a `System` object.
+**`EnergyModel`** (ABC) — `gibbs()` shim accepts both `gibbs(x, T, P=0.0)` (old) and `gibbs(x, field_values: dict)` (new). Subclasses implement `_gibbs_impl(x, field_values: dict)`. Coefficient convention: ascending order `[c0, c1, c2, …]`.
+- **`HSModel`**: `G = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P°)]`
+- **`PolyModel`**: `G = Σᵢ cᵢ(T)·xⁱ [+ P·V(x)] [+ R·T·ln(P/P°)]`
 
-**Accepts two XML schemas (both produce identical `System` objects):**
+**`PhaseData` / `SystemData`** (`pde_builder.py`) — pure-Python mirrors of Phase/System for the builder. `SystemData.to_system()`, `to_xml_str()`, `from_system()`, `from_xml()`.
 
-*New schema* — a single `<fields>` block (generated by the builder):
-```xml
-<fields>
-  <field name="temperature" symbol="T" unit="K"
-         min="250" max="500" initial="400"/>
-  <field name="pressure" symbol="P" unit="atm"
-         min="0.5" max="5.0" initial="1.0"
-         R_gas="8.314e-3" P_ref="1.0"/>
-</fields>
-```
+## XML Input
 
-*Legacy schema* (all existing demo files) — separate `<temperature>` and optional `<pressure>` blocks. All demo files continue to work unchanged.
+Two accepted schemas (both produce identical `System` objects):
 
-Other optional XML elements:
-- `<title>` — optional top-level element; sets the window title bar text. If absent, the title is derived from the input filename with path and extensions (`.xml`, `.in`) stripped.
-- `<V x0=... x1=.../>` inside `<energy>` — optional molar volume polynomial for the PV term.
-- `ideal_gas="true"` attribute on `<phase>` — enables the ideal-gas chemical potential term (see `pde_energy.py`).
-- `R_gas` and `P_ref` on the pressure `<field>` element (new schema) or as children of `<pressure>` (legacy schema) — passed to energy models as coupling parameters.
+- **New** (builder output): `<fields>` block with `<field name=… symbol=… unit=… min=… max=… initial=… />` elements.
+- **Legacy** (demo files): separate `<temperature>` and optional `<pressure>` blocks.
 
-### `pde_energy.py`
+Optional: `<title>`, `<V x0=… x1=…/>` inside `<energy>` (molar volume), `ideal_gas="true"` on `<phase>`, `R_gas`/`P_ref` on pressure element.
 
-**`CouplingTerm`** — dataclass: `response_coeffs` (R(x) polynomial), `coupling_type` (`'linear'`/`'ideal_gas'`/`'poly_T'`), `field_names` (list of Field names this term uses), `params` (dict, e.g. `{'P_ref': 1.0}`).
+VLE gas phases: `<vle T_bp_A=… T_bp_B=… L_A=… L_B=…/>` element inside `<phase>`; parser does a two-pass build so the liquid H/S are available when constructing the gas phase.
 
-**`EnergyModel`** (ABC) — abstract `_gibbs_impl(x, field_values: dict)`; public `gibbs()` shim accepts both calling conventions:
-- Old: `model.gibbs(x, T)` / `model.gibbs(x, T, P)` — still works unchanged
-- New: `model.gibbs(x, {'temperature': T, 'pressure': P})` or `model.gibbs(x, field_values={...})`
+## Visualization (`pde_viz.py`)
 
-`couplings` property on base returns `[]`; subclasses override to return their `CouplingTerm` list.
+- **`GxCanvas`** (left): G(x) curves + lower convex envelope. Supports `'handles'` edit mode for HS phases (3 draggable diamonds; vertical drag fits H coefficients, horizontal drag adjusts x range). **Ctrl+click** anywhere on a curve → rigid shift: drag moves the whole curve as a rigid body in both x (translates composition range) and y (shifts G offset); axes autoscaling is frozen during the drag.
+- **`SweepCanvas`** (right): unified T-x / P-x / field-x diagram. One per field; created lazily on first mode switch. Y axis derived from `primary_field`.
+- **Sliders**: one per `system.fields[i]`, range 0…N_STEPS−1 mapped to `field.min_val…field.max_val`. Primary slider → O(1) lookup; secondary slider release → recompute sweep.
+- **`FullGridWorker`**: background QThread for full N_T×N_P grid; pause/resume via `threading.Event`.
+- **`MainWindow` state**: `_precomputed[i]`, `_field_arr[i]`, `_primary_idx`, `_sweep_canvases: dict[int, SweepCanvas]`.
 
-**`HSModel`**: `G(x,T,P) = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P°)]`; implements `_gibbs_impl`; `couplings` returns linear entropic term + optional linear PV term + optional ideal_gas term.
+## Builder (`pde_builder.py`)
 
-**`PolyModel`**: `G(x,T,P) = Σᵢ cᵢ(T)·xⁱ [+ P·V(x)] [+ R·T·ln(P/P°)]`; `couplings` returns a single `'poly_T'` term (full coefficient grid in `params`) + optional PV/ideal_gas terms.
+- **`BuilderWindow(QDialog)`** — non-modal; emits `system_applied(System)` on Apply.
+- **`apply_handle_drag()`** — 3×3 Vandermonde solve for H₀, H₁, H₂ from 3 handle (x, G) pairs.
+- **`apply_xrange_drag()`** — updates xmin/xmax; clamped with 0.02 margin.
+- **`apply_rigid_shift(phase_data, delta_G, delta_x=0.0)`** — vertical shift adds `delta_G` to `hs_H[0]`; horizontal shift reparameterises H and S polynomials via `_shift_poly_coeffs` (composition p(x) → p(x−δ)) so the curve shape is preserved at the new x domain, then clamps and updates xmin/xmax.
+- **`_shift_poly_coeffs(coeffs, dx)`** — returns ascending-order coefficients of p(x−dx) via numpy `poly1d` composition; handles arbitrary degree.
+- **`BuilderWindow.update_phase_data(name, data)`** — syncs spinboxes after a canvas drag.
 
-Both use ascending-order coefficient conventions: `[c0, c1, c2, ...]` means `c0 + c1·x + c2·x² + ...`
-
-`R_gas` and `P_ref` are stored per-model (not on `System`); passed from the XML pressure block by the parser to each `HSModel`/`PolyModel` constructor.
-
-### `pde_phase.py`
-
-- **`Field`** — dataclass: `name` (unique id, e.g. `'temperature'`), `symbol` (e.g. `'T'`), `unit` (e.g. `'K'`; `''` if none), `min_val`, `max_val`, `initial_val`. Role (primary/secondary sweep axis) is NOT stored on the field — it belongs to the view configuration.
-- **`Phase`** — name, phase_type (`'gas'`, `'liquid'`, `'solid'`, `'end_member'`), energy model, xmin/xmax. Key methods: `gibbs(x, T, P=0.0)`, `composition_grid(n_points=500)`, `is_point` (property, True when xmin==xmax).
-- **`System`** — `components`, `phases`, `energy_form`, `fields: list[Field]` (fields[0] is temperature by convention), `title`. Constructor: `System(components, phases, energy_form, fields, title='')`. Backward-compatible properties: `T_field`, `T_min`, `T_max`, `T_initial`, `P_field`, `has_pressure`, `P_min`, `P_max`, `P_initial`, `P_unit`, `R_gas` (scans phases; removed in Phase 3), `P_ref` (scans phases; removed in Phase 3), `gas_phases`, `liquid_phases`, `solid_phases`, `end_members`.
-
-### `pde_compute.py`
-
-`compute_equilibrium(system, T, P=0.0, n_points=500)` evaluates G(x,T,P) for every phase, then computes the lower convex hull of the combined (x, G) point cloud via `scipy.spatial.ConvexHull`. Consecutive hull vertices from the same phase form a single-phase region; from different phases, a two-phase region. Returns an `EqResult`.
-
-`EqResult` fields: `T`, `P`, `phase_curves`, `hull_x`, `hull_G`, `hull_phase_idx`, `regions`, plus properties `two_phase_regions` and `single_phase_regions`.
-
-### `pde_viz.py`
-
-Interactive PySide6 + matplotlib window with full pressure support:
-
-**Pre-computation** — at startup, `launch_ui(system)` calls:
-- `precompute_Tx_diagram(system, P_initial)` — 200 T steps (T_max → T_min) at fixed P.
-- The P-x diagram is **not** pre-computed at startup; it is computed lazily the first time the user switches to "Fixed T (P-x)" mode (at the current T slider value).
-- `precompute_diagram` is kept as a backward-compatible alias for `precompute_Tx_diagram`.
-
-**Canvases:**
-- **`GxCanvas`** (left): G(x) curves per phase + lower convex envelope + common tangent lines. Redrawn on every primary slider move.
-- **`TxCanvas`** (right, Fixed P mode): T-x phase diagram revealed incrementally top-down; white cover rectangle shrinks as T slider moves down (O(1) updates).
-- **`PxCanvas`** (right, Fixed T mode): P-x phase diagram, symmetric to `TxCanvas` but revealed bottom-up as P slider moves down. Created lazily on first mode switch.
-
-**Layout (Phase 3 — generalised):**
-All controls sit in a single **top row** above the canvas area:
-`Builder…` — `3D View…` (if >1 field) — `[{sym}-x diagram combo]` (if >1 field) — `Reveal all` — `Colors…` — `Resolution` — `[Pre-compute | Progress | Status]` (if >1 field).
-Below the canvas: one slider row per field in `system.fields`.
-
-**Controls:**
-- **Mode combo** (only when `len(system.fields) > 1`): one entry per field (`"{sym}-x diagram"`); selecting a field makes it the primary Y axis of `SweepCanvas` and swaps the sweep data lazily.
-- **Field sliders**: `_field_sliders[i]` / `_field_labels[i]` — one per field; all use 0…N_STEPS-1 ticks mapped linearly to `field.min_val…field.max_val`.
-- **"Reveal all" checkbox**: hides the cover rectangle on all `SweepCanvas` instances.
-- **"Pre-compute full T-P-x" button** (only when `len(system.fields) > 1`): same pause/resume cycle as before.
-- **"Colors…" button**: opens `ColorDialog`; applies live to all canvases.
-- **"3D View…" button** (only when `len(system.fields) > 1`): disabled until full grid cached.
-
-**Canvases:**
-- **`GxCanvas`** (left): unchanged except title is now field-driven (loops `system.fields`).
-- **`SweepCanvas`** (right, Phase 3): unified replacement for the old `TxCanvas`/`PxCanvas`. Accepts `primary_field: Field` and `precomputed: list[EqResult]` sorted descending. Y axis label/title/limits are all derived from `primary_field`. Methods: `set_cursor(val)`, `set_reveal_all(flag)`, `reset(precomputed, current_val)`, `recolor()`.
-
-**Key state (Phase 3 — generalised):**
-- `_precomputed[i]` / `_field_arr[i]`: list-indexed per field (replaces `_precomputed_Tx/Px`, `_T_arr/_P_arr`).
-- `_primary_idx: int`: which field is the Y axis of `SweepCanvas` (replaces `_mode = 'fixed_P'/'fixed_T'`).
-- `_sweep_canvases: dict[int, SweepCanvas]`: lazy dict; created on first mode switch to field `i`.
-
-**Key functions (Phase 3):**
-- `precompute_sweep_diagram(system, primary_field_idx, fixed_field_values, n_steps)` — sweeps primary field max→min at fixed others; returns `list[EqResult]`.
-- `precompute_Tx_diagram(system, P, n_steps)` / `precompute_Px_diagram(system, T, n_steps)` — backward-compat wrappers around `precompute_sweep_diagram`.
-- `_extract_field_values(precomputed, field) → np.array` — extracts T or P from `EqResult` list.
-
-**`FullGridWorker` internals:**
-- `threading.Event` (`_run_event`, initially set) + `_abort` flag.
-- `run()` calls `_run_event.wait()` then checks `_abort` before each `compute_equilibrium` call.
-- `pause()` clears the event; `resume()` sets it; `abort()` sets `_abort=True` then sets the event.
-- `MainWindow._worker_state`: `'idle'` → `'running'` → `'paused'` ↔ `'running'` → `'done'`.
-- `MainWindow.closeEvent` calls `abort()` + `wait()` before window teardown; also closes `_builder` and `_viz3d_window` if open.
-
-**Slider interaction logic:**
-- Primary slider (`_on_slider_changed`) → fast O(1) lookup in `_precomputed[_primary_idx]`.
-- Secondary slider (`_on_slider_released`) → `precompute_sweep_diagram` recompute (or instant grid slice if cached). `_on_slider_action` fires `_on_slider_released` via `QTimer.singleShot(0, ...)` for bar-clicks/key-presses.
-- `_rebuild_primary_from_grid(sec_field_idx, sec_val)` — slices cached grid when secondary slider drags with full grid available (instant O(1) update).
-- Mode switch → cover initialized at current primary slider position.
-
-**`MainWindow` refactor:**
-- `__init__` delegates to `_init_system_state()` + `_build_central_widget()`.
-- `reload_system(system)` — called by builder on Apply; uses `precompute_sweep_diagram`.
-- `_open_builder()`, `_on_builder_closed()`, `_on_phase_edited()` — builder integration unchanged in behaviour; `_on_phase_edited` now uses `_current_val(i)` dict instead of hardcoded `_current_T()`/`_current_P()`.
-- `launch_ui_empty()` / `_make_default_system()` — unchanged.
-
-**Interactive G(x) handle-drag editing:**
-- `_G_from_phase_data(pd, x, T, P=0.0, R_gas=0.0, P_ref=1.0)` — module-level helper; evaluates full `G = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P₀)]` from a live `PhaseData` object; mirrors `HSModel.gibbs()`; pressure params default to zero for backward compatibility.
-- `_DragState` — `@dataclass`: `phase_name`, `handle_idx` (0/1/2 = left/mid/right), `y_press_data`, `snapshot` (Phase-5 undo), `T_ref`/`P_ref` (Phase-8); plus `x_press_data`, `x_press_px`, `y_press_px`, `drag_axis` (None/'vertical'/'horizontal') for Phase-3 direction detection.
-- `GxCanvas` extended:
-  - `phase_edited = Signal(str, object)` class attribute.
-  - `set_edit_mode(mode, live_phase_data=None)` — `'off'` deactivates and disconnects mpl event handlers; `'handles'` activates; initialises `_live_phase_data` from `SystemData.from_system()` if not supplied; guards double-connection with `if self._press_cid is None`.
-  - `redraw()` overrides G curves from `_live_phase_data` (with full pressure terms) when `_edit_mode != 'off'`; calls `_draw_edit_overlay()` after drawing.
-  - `_draw_edit_overlay(result)` — draws 3 diamond handle artists per HS phase at xmin, xmid, xmax (zorder=10); handle G positions computed with full pressure terms; fills `_handle_info` dict.
-  - `_on_press()` — hit-tests handles within 12 px; creates `_DragState` including pixel coordinates for direction detection.
-  - `_on_motion()` — determines drag direction on first motion (≥3 px threshold; endpoint handles only go horizontal); **vertical**: calls `apply_handle_drag()` live (3-point quadratic H fit, curvature updates immediately); **horizontal**: extends/contracts the phase line and moves endpoint + midpoint handles.
-  - `_on_release()` — routes to `apply_xrange_drag()` (horizontal) or `apply_handle_drag()` (vertical); updates `_live_phase_data`; emits `phase_edited`.
-- Edit mode is only active for HS-form systems (PolyModel phases render handles but fitting functions return unchanged `PhaseData`).
-
-### `pde_3d.py`
-
-3-D T-P-x phase diagram visualization. New dependencies: `pyvista`, `pyvistaqt` (lazy-imported in `Viz3DWindow.__init__` so the rest of the app works when they are absent).
-
-**`PhaseDiagram3D`** dataclass — `T_arr`/`P_arr` (ascending), `system`, `two_phase_surfaces` (list of dicts with `'label'`, `'phases'`, `'x_left'`, `'x_right'`):
-- `from_grid(grid, T_arr, P_arr, system)` — walks `grid[i_T][i_P]` (descending, from `FullGridWorker`); remaps to ascending via `j_T = N_T-1-i_T`; fills per-region NaN arrays keyed by phase-index tuple.
-- `to_pyvista_surfaces()` — returns `list[pyvista.StructuredGrid]`, two per two-phase region (x_left, x_right); axis: x=composition, y=T (K), z=P; `dimensions=[N_P, N_T, 1]`.
-- `to_pyvista_volume()` / `to_xdmf()` — stubs; raise `NotImplementedError`.
-
-**`Viz3DWindow(QMainWindow)`** — non-modal:
-- Top row: per-region visibility checkboxes, opacity slider (0–100, default 60), disabled Export… stub, Close.
-- `_actors` dict: key `f"{label}|{side}"` → VTK actor; `SetVisibility()` / `GetProperty().SetOpacity()`.
-- `set_scale(xscale=T_span, yscale=1.0, zscale=T_span/P_span)` normalizes the three axes to equal visual length (composition ∈ [0,1], T in K, P in user units differ wildly otherwise).
-- `show_bounds()` uses `xtitle`/`ytitle`/`ztitle` keyword arguments (pyvista API).
-- `closeEvent` calls `self._plotter.close()` to release VTK resources.
-
-### `pde_builder.py`
-
-Graphical input builder. Non-modal `QDialog`; emits `system_applied(System)` on Apply.
-
-**Data model (pure Python, no Qt):**
-- `PhaseData` — one phase: name, phase_type, xmin/xmax, ideal_gas, hs_H/S/V lists, poly list.
-- `SystemData` — full system fields (mirrors `System` + phase list). Methods:
-  - `to_system() → System` — build live objects using `pde_energy`/`pde_phase`.
-  - `to_xml_str() → str` — serialize to lxml XML parseable by `pde_input`.
-  - `from_system(cls, system)` — round-trip from live System.
-  - `from_xml(cls, path)` — delegate to `pde_input.parse_system()` then `from_system()`.
-
-**UI widgets:**
-- `_FloatSpinBox` — QDoubleSpinBox ±1e9, 6 decimals, step 0.001.
-- `CoeffRowWidget` — labelled row of float spinboxes with dynamic +/− buttons; `get_coeffs()`/`set_coeffs()`. Optional `coeff_name` parameter (e.g. `'H'`) adds Unicode subscript headers (H₀, H₁, H₂, …) above each spinbox using a two-row `QGridLayout` (row 0 = subscript labels, row 1 = spinboxes). Label and +/− buttons are bottom-aligned (`Qt.AlignBottom`) to sit flush with the spinboxes.
-- `PolyPhaseCoeffWidget` — 2D grid for polynomial coefficients (x-power rows × T-power columns); rows and columns dynamically resizable.
-- `PhaseEditorWidget(QFrame)` — one phase editor: header row (name, type, x range, Ideal gas checkbox, remove button) + QStackedWidget:
-  - HS page: H/S/V rows with subscript headers + dynamic hint label (`_hint_lbl`) updated by `_update_eq_label()` — shows `G(x,T) = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P₀)]` and updates live when the V-enable or Ideal-gas checkbox toggles.
-  - Poly page: static hint label (`G(x,T) = c₀(T) + c₁(T)·x + …`) + `PolyPhaseCoeffWidget`.
-  - `get_phase_data()`/`set_phase_data()`/`set_energy_form()`.
-- `BuilderWindow(QDialog)` — top-level builder: system group (title, components, form), temperature group, pressure group, scroll area of `PhaseEditorWidget`s, Load XML / Save XML / Apply / Close buttons.
-
-**Canvas ↔ builder sync:**
-- `apply_handle_drag(phase_data, drag_handle_idx, handles_x, handles_G, T, energy_form, P=0.0, R_gas=0.0, P_ref=1.0) → PhaseData` — Phase-4: 3×3 Vandermonde solve for H₀, H₁, H₂ so that `G(xᵢ) = handles_G[i]` at all three handle positions; correctly inverts full G including pressure terms (`H = G + T·S − P·V − R·T·ln(P/P₀)`); falls back to uniform H₀ shift on `LinAlgError`. Phase-8 TODO: two-temperature H+S decomposition. Returns unchanged `PhaseData` for non-HS forms.
-- `apply_xrange_drag(phase_data, handle_idx, new_x) → PhaseData` — Phase-3: deep copy with updated `xmin` (handle 0) or `xmax` (handle 2); clamped to [0, xmax−0.02] or [xmin+0.02, 1].
-- `BuilderWindow.update_phase_data(name, data)` — walks `_phase_editors` to find the editor whose name matches, then calls `set_phase_data(data)` on it; called by `MainWindow._on_phase_edited()` to keep spinbox values in sync after a canvas drag.
-
-### `pde.1.py`
-
-A minimal standalone prototype that opens a `vedo` window with a PySide6 color-picker button. Not wired into the main pipeline.
-
-## Demo Jobs
-
-All in `jobs/demo/`:
+## Demo Jobs (`jobs/demo/`)
 
 | File | Description |
 |------|-------------|
 | `pde.in.xml` | Symmetric eutectic binary (HS form) |
-| `pde-lg.in.xml` | Liquid-gas (HS form) |
 | `azeotrope.in.xml` | Minimum boiling azeotrope (HS form) |
 | `vle-pressure.in.xml` | Vapor-liquid equilibrium with variable pressure (P=0.5–5 atm) |
-| `isomorphous.xml` | Isomorphous (complete solid solution) system |
+| `isomorphous.xml` | Isomorphous (complete solid solution) |
 | `asymmetric-eutectic.xml` | Asymmetric eutectic binary |
 | `eutectic-with-compound.xml` | Eutectic with intermetallic compound |
 | `eutectoid.xml` | Eutectoid transformation |
 | `polynomial-asymmetric.xml` | Asymmetric system using polynomial energy form |
+| `vle-pressure+alpha+beta.in.xml` | VLE + two partial-range solid phases (alpha/beta); tests rigid horizontal shift |
 
 ## Dependencies
 
