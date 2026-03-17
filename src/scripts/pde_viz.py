@@ -289,9 +289,15 @@ class GxCanvas(FigureCanvasQTAgg):
                 # VLE gas phases: hs_H/hs_S are [0.0] placeholders in live_data;
                 # use the precomputed G from result.phase_curves instead.
                 if pd is not None and not pd.is_vle_gas:
-                    G_plot = _G_from_phase_data(
-                        pd, x, result.T, result.P,
-                        self.system.R_gas, self.system.P_ref)
+                    # For patched phases the precomputed G (from PiecewisePatchModel)
+                    # already reflects the piecewise shape; _G_from_phase_data only
+                    # knows the plain hs_H polynomial and would draw the wrong curve.
+                    has_patch = ((pd.patch_left  is not None and pd.patch_left_phase)
+                                 or (pd.patch_right is not None and pd.patch_right_phase))
+                    if not has_patch:
+                        G_plot = _G_from_phase_data(
+                            pd, x, result.T, result.P,
+                            self.system.R_gas, self.system.P_ref)
 
             if phase.is_point:
                 ax.plot(x, G_plot, 'o', color=c, markersize=9,
@@ -446,6 +452,11 @@ class GxCanvas(FigureCanvasQTAgg):
             # Skip VLE gas phases — their curve is derived from the liquid;
             # dragging it independently is physically meaningless.
             if getattr(phase.energy_model, 'vle_params', None) is not None:
+                continue
+            # Skip piecewise-patched phases — handle drag would conflict with
+            # the patch polynomial.
+            from pde_energy import PiecewisePatchModel as _PPM
+            if isinstance(phase.energy_model, _PPM):
                 continue
             pd = self._live_phase_data.get(phase.name)
             if pd is None:
@@ -1385,6 +1396,7 @@ class MainWindow(QMainWindow):
             from pde_builder import BuilderWindow, SystemData
             self._builder = BuilderWindow(system=self.system)
             self._builder.system_applied.connect(self.reload_system)
+            self._builder.patch_changed.connect(self._on_patch_changed)
             self._builder.finished.connect(self._on_builder_closed)
 
             # Activate edit mode on the canvas with fresh live data.
@@ -1442,7 +1454,8 @@ class MainWindow(QMainWindow):
             if pd.name == name:
                 sd.phases[i] = new_pd
                 break
-        tmp_system = sd.to_system()
+        t = self._current_val(0)
+        tmp_system = sd.to_system(current_T=t)
         fv = {f.name: self._current_val(i)
               for i, f in enumerate(self.system.fields)}
         result = compute_equilibrium(tmp_system,
@@ -1450,16 +1463,23 @@ class MainWindow(QMainWindow):
                                      fv.get('pressure', 0.0))
         self.gx_canvas.redraw(result)
 
-        # Live consistency checks: refresh warning panel in the builder if open.
-        if self._builder is not None and self._builder.isVisible():
-            try:
-                from pde_check import run_all_checks
-                warnings = run_all_checks(tmp_system,
-                                          T=fv.get('temperature'),
-                                          P=fv.get('pressure'))
-                self._builder._show_warnings(warnings)
-            except Exception:
-                pass
+
+    def _on_patch_changed(self, patched_system):
+        """Lightweight GxCanvas redraw when a builder patch slider moves.
+
+        The preview system already contains the PiecewisePatchModel for the
+        patched phase.  We recompute equilibrium at the current T/P and redraw
+        the G-x canvas without touching the sweep canvases or self.system.
+        """
+        fv = {f.name: self._current_val(i)
+              for i, f in enumerate(self.system.fields)}
+        try:
+            result = compute_equilibrium(patched_system,
+                                         fv.get('temperature', 0.0),
+                                         fv.get('pressure', 0.0))
+            self.gx_canvas.redraw(result)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1498,6 +1518,9 @@ class MainWindow(QMainWindow):
         f = self.system.fields[field_idx]
         unit_str = f' {f.unit}' if f.unit else ''
         self._field_labels[field_idx].setText(f'{f.symbol} = {val:.3g}{unit_str}')
+        # Keep builder in sync with current T for patch polynomial computation.
+        if field_idx == 0 and self._builder is not None and self._builder.isVisible():
+            self._builder.set_current_T(val)
 
         if field_idx == self._primary_idx:
             # Primary slider — O(1) lookup.

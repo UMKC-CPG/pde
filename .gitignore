@@ -3,4 +3,4 @@ __pycache__/
 bin/
 build/
 .claude/
-jobs/demo/command
+jobs/

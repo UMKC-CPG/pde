@@ -65,7 +65,7 @@ import pathlib
 
 from lxml import etree
 
-from pde_energy import HSModel, PolyModel, compute_vle_gas_hs
+from pde_energy import HSModel, PiecewisePatchModel, PolyModel, compute_vle_gas_hs
 from pde_phase import Field, Phase, System
 
 
@@ -168,6 +168,57 @@ def _parse_poly_energy(energy_el, V_coeffs, ideal_gas, R_gas, P_ref):
 
 
 # ---------------------------------------------------------------------------
+# Patch H computation (mirrors pde_builder.compute_{left,right}_patch_H but
+# operates on plain coefficient lists to avoid a circular import).
+# ---------------------------------------------------------------------------
+
+def _compute_left_patch_H(H, S, H_t, S_t, xmin, x_cut, T):
+    """Return [q0, q1, q2] for the left patch quadratic at reference T."""
+    import numpy as np
+    pv   = np.polynomial.polynomial.polyval
+    pd_d = np.polynomial.polynomial.polyder
+    H    = np.asarray(H);  S  = np.asarray(S)
+    H_t  = np.asarray(H_t); S_t = np.asarray(S_t)
+    H_val        = float(pv(x_cut, H))
+    dH_at_cut    = float(pv(x_cut, pd_d(H)))   if len(H)   > 1 else 0.0
+    dH_t_at_xmin = float(pv(xmin,  pd_d(H_t))) if len(H_t) > 1 else 0.0
+    dS_at_xmin   = float(pv(xmin,  pd_d(S)))   if len(S)   > 1 else 0.0
+    dS_t_at_xmin = float(pv(xmin,  pd_d(S_t))) if len(S_t) > 1 else 0.0
+    slope_target = dH_t_at_xmin + float(T) * (dS_at_xmin - dS_t_at_xmin)
+    dx = x_cut - xmin
+    if abs(dx) < 1e-10:
+        h = list(H)
+        return (h + [0.0] * max(0, 3 - len(h)))[:3]
+    q2 = (dH_at_cut - slope_target) / (2.0 * dx)
+    q1 = slope_target - 2.0 * q2 * xmin
+    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
+    return [q0, q1, q2]
+
+
+def _compute_right_patch_H(H, S, H_t, S_t, xmax, x_cut, T):
+    """Return [q0, q1, q2] for the right patch quadratic at reference T."""
+    import numpy as np
+    pv   = np.polynomial.polynomial.polyval
+    pd_d = np.polynomial.polynomial.polyder
+    H    = np.asarray(H);  S  = np.asarray(S)
+    H_t  = np.asarray(H_t); S_t = np.asarray(S_t)
+    H_val        = float(pv(x_cut, H))
+    dH_at_cut    = float(pv(x_cut, pd_d(H)))   if len(H)   > 1 else 0.0
+    dH_t_at_xmax = float(pv(xmax,  pd_d(H_t))) if len(H_t) > 1 else 0.0
+    dS_at_xmax   = float(pv(xmax,  pd_d(S)))   if len(S)   > 1 else 0.0
+    dS_t_at_xmax = float(pv(xmax,  pd_d(S_t))) if len(S_t) > 1 else 0.0
+    slope_target = dH_t_at_xmax + float(T) * (dS_at_xmax - dS_t_at_xmax)
+    dx = xmax - x_cut
+    if abs(dx) < 1e-10:
+        h = list(H)
+        return (h + [0.0] * max(0, 3 - len(h)))[:3]
+    q2 = (slope_target - dH_at_cut) / (2.0 * dx)
+    q1 = dH_at_cut - 2.0 * q2 * x_cut
+    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
+    return [q0, q1, q2]
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -223,6 +274,22 @@ def _parse_phase(phase_el, energy_form, R_gas, P_ref):
 
     energy_el = phase_el.find('energy')
     model = _parse_energy(energy_el, energy_form, ideal_gas, R_gas, P_ref)
+
+    patch_left_el  = phase_el.find('patch_left')
+    patch_right_el = phase_el.find('patch_right')
+    if patch_left_el is not None or patch_right_el is not None:
+        return {
+            '_patch_sentinel': True,
+            'name':       name,
+            'phase_type': phase_type,
+            'xmin':       xmin,
+            'xmax':       xmax,
+            'energy_model': model,
+            'patch_left_x_cut':  float(patch_left_el.get('x_cut'))  if patch_left_el  is not None else None,
+            'patch_left_phase':  patch_left_el.get('phase',  '')     if patch_left_el  is not None else '',
+            'patch_right_x_cut': float(patch_right_el.get('x_cut')) if patch_right_el is not None else None,
+            'patch_right_phase': patch_right_el.get('phase', '')     if patch_right_el is not None else '',
+        }
 
     return Phase(name=name, phase_type=phase_type, energy_model=model,
                  xmin=xmin, xmax=xmax)
@@ -287,10 +354,24 @@ def parse_system(infile):
     liq_S = [0.0]
     liq_found = False
     pending_vle = []
+    pending_patches = []
 
     for item in raw:
         if isinstance(item, dict) and item.get('_vle_sentinel'):
             pending_vle.append(item)
+        elif isinstance(item, dict) and item.get('_patch_sentinel'):
+            # Add as a plain phase first (base HSModel); upgrade in third pass.
+            base_phase = Phase(name=item['name'], phase_type=item['phase_type'],
+                               energy_model=item['energy_model'],
+                               xmin=item['xmin'], xmax=item['xmax'])
+            phases.append(base_phase)
+            pending_patches.append(item)
+            if (not liq_found
+                    and item['phase_type'] == 'liquid'
+                    and isinstance(item['energy_model'], HSModel)):
+                liq_H = item['energy_model'].H_coeffs.tolist()
+                liq_S = item['energy_model'].S_coeffs.tolist()
+                liq_found = True
         else:
             phases.append(item)
             if (not liq_found
@@ -321,6 +402,50 @@ def parse_system(infile):
             xmin=vp['xmin'],
             xmax=vp['xmax'],
         ))
+
+    # Third pass: upgrade patched phases to PiecewisePatchModel.
+    if pending_patches:
+        T_ref = fields[0].initial_val if fields else 0.0
+        phase_by_name = {p.name: p for p in phases}
+        for pp in pending_patches:
+            base_model = pp['energy_model']
+            H_orig    = base_model.H_coeffs.tolist()
+            S_coeffs  = base_model.S_coeffs.tolist()
+            H_left    = None
+            x_cut_left        = pp['patch_left_x_cut']
+            patch_left_phase  = pp['patch_left_phase']
+            H_right   = None
+            x_cut_right       = pp['patch_right_x_cut']
+            patch_right_phase = pp['patch_right_phase']
+            if x_cut_left is not None and patch_left_phase:
+                tgt = phase_by_name.get(patch_left_phase)
+                if tgt is not None and isinstance(tgt.energy_model, HSModel):
+                    tm = tgt.energy_model
+                    H_left = _compute_left_patch_H(
+                        H_orig, S_coeffs,
+                        tm.H_coeffs.tolist(), tm.S_coeffs.tolist(),
+                        pp['xmin'], x_cut_left, T_ref)
+            if x_cut_right is not None and patch_right_phase:
+                tgt = phase_by_name.get(patch_right_phase)
+                if tgt is not None and isinstance(tgt.energy_model, HSModel):
+                    tm = tgt.energy_model
+                    H_right = _compute_right_patch_H(
+                        H_orig, S_coeffs,
+                        tm.H_coeffs.tolist(), tm.S_coeffs.tolist(),
+                        pp['xmax'], x_cut_right, T_ref)
+            patch_model = PiecewisePatchModel(
+                H_orig, S_coeffs,
+                H_left=H_left, x_cut_left=x_cut_left,
+                H_right=H_right, x_cut_right=x_cut_right,
+                V_coeffs=(base_model.V_coeffs.tolist()
+                          if base_model.V_coeffs is not None else None),
+                ideal_gas=base_model.ideal_gas,
+                R_gas=base_model.R_gas,
+                P_ref=base_model.P_ref,
+            )
+            patch_model.patch_left_phase_name  = patch_left_phase  or ''
+            patch_model.patch_right_phase_name = patch_right_phase or ''
+            phase_by_name[pp['name']].energy_model = patch_model
 
     return System(
         components=components,

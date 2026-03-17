@@ -4,8 +4,8 @@ Energy model classes for PDE.
 
 Hierarchy:
   EnergyModel  (ABC)
-  ├── HSModel     G(x,T,P) = H(x) - T·S(x) + P·V(x) [+ R·T·ln(P/P°)]
-  └── PolyModel   G(x,T,P) = Σᵢ cᵢ(T)·xⁱ + P·V(x) [+ R·T·ln(P/P°)]
+  ├── HSModel          G(x,T,P) = H(x) - T·S(x) + P·V(x) [+ R·T·ln(P/P°)]
+  └── PolyModel        G(x,T,P) = Σᵢ cᵢ(T)·xⁱ + P·V(x) [+ R·T·ln(P/P°)]
 
 Both classes use ascending-order coefficient conventions throughout:
   [c0, c1, c2, ...] means c0 + c1·x + c2·x² + ...
@@ -60,7 +60,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 import numpy as np
-from numpy.polynomial.polynomial import polyval
+from numpy.polynomial.polynomial import polyval, polyder
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,78 @@ class HSModel(EnergyModel):
                 params={'P_ref': self.P_ref},
             ))
         return terms
+
+
+# ---------------------------------------------------------------------------
+# PiecewisePatchModel — left-patch support
+# ---------------------------------------------------------------------------
+
+class PiecewisePatchModel(EnergyModel):
+    """G(x, T) = H_eff(x) − T·S(x) where H_eff is piecewise:
+
+        H_eff(x) = H_left(x)  for x ≤ x_cut_left   (left patch, when active)
+                   H_orig(x)  in the interior        (always)
+                   H_right(x) for x > x_cut_right    (right patch, when active)
+
+    Either or both patches may be active.  S(x) is unchanged across the full
+    composition range.
+
+    Parameters
+    ----------
+    H_orig        : array-like        — original enthalpy polynomial (full range)
+    S_coeffs      : array-like        — entropy polynomial (full range, unchanged)
+    H_left        : array-like or None — left patch quadratic [q0, q1, q2]
+    x_cut_left    : float or None      — cut-off for left patch  (patch covers x ≤ x_cut_left)
+    H_right       : array-like or None — right patch quadratic [q0, q1, q2]
+    x_cut_right   : float or None      — cut-off for right patch (patch covers x > x_cut_right)
+    V_coeffs      : array-like or None
+    ideal_gas     : bool
+    R_gas, P_ref  : float
+    """
+
+    def __init__(self, H_orig, S_coeffs,
+                 H_left=None, x_cut_left=None,
+                 H_right=None, x_cut_right=None,
+                 V_coeffs=None, ideal_gas=False, R_gas=0.0, P_ref=1.0):
+        self.H_orig       = np.asarray(H_orig,   dtype=float)
+        self.S_coeffs     = np.asarray(S_coeffs, dtype=float)
+        self.H_left       = np.asarray(H_left,   dtype=float) if H_left  is not None else None
+        self.H_right      = np.asarray(H_right,  dtype=float) if H_right is not None else None
+        self.x_cut_left   = float(x_cut_left)  if x_cut_left  is not None else None
+        self.x_cut_right  = float(x_cut_right) if x_cut_right is not None else None
+        self.V_coeffs     = np.asarray(V_coeffs, dtype=float) if V_coeffs is not None else None
+        self.ideal_gas    = bool(ideal_gas)
+        self.R_gas        = float(R_gas)
+        self.P_ref        = float(P_ref)
+        # Metadata for round-trip through from_system().
+        self.patch_left_phase_name  = ''
+        self.patch_right_phase_name = ''
+
+    def _gibbs_impl(self, x, field_values: dict) -> np.ndarray:
+        T = float(field_values.get('temperature', 0.0))
+        P = float(field_values.get('pressure', 0.0))
+        # Start with the original H everywhere, then overwrite patched regions.
+        H_vals = polyval(x, self.H_orig)
+        if self.H_left is not None and self.x_cut_left is not None:
+            H_vals = np.where(x <= self.x_cut_left,
+                              polyval(x, self.H_left), H_vals)
+        if self.H_right is not None and self.x_cut_right is not None:
+            H_vals = np.where(x > self.x_cut_right,
+                              polyval(x, self.H_right), H_vals)
+        G = H_vals - T * polyval(x, self.S_coeffs)
+        if self.V_coeffs is not None:
+            G = G + P * polyval(x, self.V_coeffs)
+        if self.ideal_gas and P > 0.0 and self.R_gas > 0.0:
+            G = G + self.R_gas * T * np.log(P / self.P_ref)
+        return G
+
+    @property
+    def couplings(self) -> list:
+        return [CouplingTerm(
+            response_coeffs=(-self.S_coeffs).tolist(),
+            coupling_type='linear',
+            field_names=['temperature'],
+        )]
 
 
 # ---------------------------------------------------------------------------

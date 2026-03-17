@@ -8,7 +8,7 @@ System — the full system: components, all phases, energy form, and a list of
          Field objects.  fields[0] is temperature by convention.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 

@@ -10,10 +10,22 @@ Viz3DWindow
     Non-modal QMainWindow wrapping a PyVista QtInteractor.  Displays the
     two-phase boundary surfaces as semi-transparent StructuredGrids.
 
-Axis convention
-    x-axis : composition (0 → 1)
-    y-axis : temperature T (K), ascending
-    z-axis : pressure P, ascending
+Axis convention (current two-field case: fields = [T, P])
+    x-axis : composition (0 → 1)        — points right on screen
+    y-axis : pressure P (fields[1])     — points into the screen (depth)
+    z-axis : temperature T (fields[0])  — points up on screen
+
+For future generalisation with N fields the mapping would be:
+    x-axis : composition
+    z-axis : fields[0]   (primary sweep axis, ascending = up)
+    y-axis : fields[1]   (secondary sweep axis, ascending = depth)
+    higher fields : would require additional slicing/animation
+
+Visual scaling
+    T and P are kept in physical units in the VTK geometry so that
+    show_bounds() naturally displays physical tick labels.  set_scale() is
+    used in Viz3DWindow to equalise the visual extent of all three axes.
+    Composition is already in [0, 1] so it is left unchanged.
 
 Imports of pyvista and pyvistaqt are deferred to Viz3DWindow.__init__ so that
 the rest of the application works normally when those packages are absent.
@@ -118,7 +130,10 @@ class PhaseDiagram3D:
     def to_pyvista_surfaces(self):
         """Return a list of pyvista.StructuredGrid, two per two-phase region.
 
-        Axis convention: x=composition, y=T (K), z=P.
+        Axis convention: x=composition [0,1], y=P (physical), z=T (physical).
+        Physical coordinates are used directly so that show_bounds() displays
+        the correct tick labels.  Viz3DWindow calls set_scale() to equalise
+        the visual extent of all three axes.
 
         NaN points are left in place; VTK renders only cells whose all four
         corner points are finite (StructuredGrid blanking).
@@ -128,7 +143,7 @@ class PhaseDiagram3D:
         N_T = len(self.T_arr)
         N_P = len(self.P_arr)
 
-        # meshgrid with indexing='ij': T_grid[j_T, j_P], P_grid[j_T, j_P]
+        # meshgrid with indexing='ij': shape (N_T, N_P)
         T_grid, P_grid = np.meshgrid(self.T_arr, self.P_arr, indexing='ij')
 
         surfaces = []
@@ -136,16 +151,17 @@ class PhaseDiagram3D:
             for side in ('x_left', 'x_right'):
                 x_2d = surf_data[side]   # shape (N_T, N_P)
 
+                # Column order: x = composition (right), y = P (depth), z = T (up).
                 pts = np.column_stack([
                     x_2d.ravel(),
-                    T_grid.ravel(),
                     P_grid.ravel(),
+                    T_grid.ravel(),
                 ]).astype(float)
 
                 sg = pv.StructuredGrid()
                 sg.points = pts
                 # PyVista dim order: [fast, mid, slow]
-                # The ravel() above iterates P fastest (dim-1), T next (dim-0).
+                # ravel() iterates P fastest (dim-1), T next (dim-0).
                 sg.dimensions = [N_P, N_T, 1]
                 sg.field_data['label'] = np.array([surf_data['label']])
                 sg.field_data['side']  = np.array([side])
@@ -231,27 +247,46 @@ class Viz3DWindow(QMainWindow):
                 )
                 self._actors[f'{label}|{side}'] = actor
 
-        # Scale all three axes to equal visual length so the view looks cubic
-        # rather than a thin sliver (composition 0-1, T 250-500 K, P 0.5-5 atm
-        # would otherwise differ by two orders of magnitude).
-        T_span = max(diagram.T_arr[-1] - diagram.T_arr[0], 1e-9)
-        P_span = max(diagram.P_arr[-1] - diagram.P_arr[0], 1e-9)
-        # x (composition) is always [0, 1]; scale the other two axes relative to it.
-        self._plotter.set_scale(xscale=T_span, yscale=1.0, zscale=T_span / P_span)
+        # Axis labels: composition = x, pressure = y (depth), temperature = z (up).
+        # Geometry uses physical T and P coordinates; set_scale() equalises the
+        # visual extent of all three axes so the diagram looks balanced.
+        T_min = diagram.T_arr[0];  T_max = diagram.T_arr[-1]
+        P_min = diagram.P_arr[0];  P_max = diagram.P_arr[-1]
+        T_span = max(T_max - T_min, 1e-9)
+        P_span = max(P_max - P_min, 1e-9)
 
-        # Axis labels and bounds.
-        self._plotter.add_axes()
+        # Scale y (P) and z (T) so each axis spans 1 visual unit, matching
+        # composition x which is already in [0, 1].
+        self._plotter.set_scale(xscale=1.0,
+                                yscale=1.0 / P_span,
+                                zscale=1.0 / T_span)
+
         P_unit  = getattr(system, 'P_unit', '')
         P_label = f'P ({P_unit})' if P_unit else 'P'
+        comp_label = 'x'
+        if system.components and len(system.components) >= 1:
+            comp_label = f'x({system.components[-1]})'
+
+        # show_bounds uses physical coordinates → tick labels are correct.
         self._plotter.show_bounds(
-            xtitle='x',
-            ytitle='T (K)',
-            ztitle=P_label,
+            xtitle=comp_label,
+            ytitle=P_label,
+            ztitle='T (K)',
             show_xaxis=True,
             show_yaxis=True,
             show_zaxis=True,
         )
+
+        self._plotter.add_axes(
+            xlabel=comp_label,
+            ylabel=P_label,
+            zlabel='T (K)',
+        )
         self._plotter.add_legend()
+
+        # Camera in physical coordinates; after set_scale the visual centre is
+        # at (0.5, P_mid/P_span, T_mid/T_span) ≈ (0.5, 0.5, 0.5).
+        self._plotter.reset_camera()
 
         # ---- top control row ----
         top_row = QHBoxLayout()

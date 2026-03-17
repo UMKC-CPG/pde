@@ -30,11 +30,11 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QScrollArea, QStackedWidget,
-    QTextEdit, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QScrollArea, QSlider, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
-from pde_energy import HSModel, PolyModel, compute_vle_gas_hs
+from pde_energy import HSModel, PiecewisePatchModel, PolyModel, compute_vle_gas_hs
 from pde_phase import Field, Phase, System
 
 
@@ -68,6 +68,12 @@ class PhaseData:
     # VLE reparameterisation (gas phases only)
     # When not None: {'T_bp_A': float, 'T_bp_B': float, 'L_A': float, 'L_B': float}
     vle: dict = field(default=None)
+    # Patch cutoffs: composition value within [xmin, xmax], or None = no patch
+    patch_left: object = field(default=None)   # float | None
+    patch_right: object = field(default=None)  # float | None
+    # Target phase name for each patch (empty string = none selected)
+    patch_left_phase: str = field(default='')
+    patch_right_phase: str = field(default='')
 
     @property
     def is_vle_gas(self) -> bool:
@@ -97,10 +103,21 @@ class SystemData:
     # Build live objects
     # ------------------------------------------------------------------
 
-    def to_system(self) -> System:
-        """Construct and return a live System object."""
+    def to_system(self, current_T=None) -> System:
+        """Construct and return a live System object.
+
+        Parameters
+        ----------
+        current_T : float or None
+            Temperature to use when computing left-patch polynomials (G slope
+            matching).  Defaults to self.T_initial when None.
+        """
+        T_patch = float(current_T) if current_T is not None else self.T_initial
         R_gas = self.R_gas if self.has_pressure else 0.0
         P_ref = self.P_ref if self.has_pressure else 1.0
+
+        # Index PhaseData by name for patch target look-ups.
+        phase_data_by_name = {pd.name: pd for pd in self.phases}
 
         # First pass: build all non-VLE phases; collect first liquid's H/S.
         phases = []
@@ -115,22 +132,82 @@ class SystemData:
                 continue
 
             V_coeffs = pd.hs_V if pd.hs_V else None
-            if self.energy_form == 'HS':
+
+            # Build energy model — use PiecewisePatchModel when patches are set.
+            has_left  = (self.energy_form == 'HS'
+                         and pd.patch_left is not None
+                         and pd.patch_left_phase
+                         and pd.patch_left > pd.xmin + 1e-10)
+            has_right = (self.energy_form == 'HS'
+                         and pd.patch_right is not None
+                         and pd.patch_right_phase
+                         and pd.patch_right < pd.xmax - 1e-10)
+
+            if has_left or has_right:
+                H_left, x_cut_left   = None, None
+                H_right, x_cut_right = None, None
+                xmin_eff = pd.xmin
+                xmax_eff = pd.xmax
+                if has_left:
+                    tpd = phase_data_by_name.get(pd.patch_left_phase)
+                    if tpd is not None:
+                        H_left = compute_left_patch_H(
+                            pd, tpd, pd.patch_left, T=T_patch,
+                            phase_data_by_name=phase_data_by_name)
+                        x_cut_left = pd.patch_left
+                        # Extend xmin to chain root's xmin.
+                        _, xmin_eff = _resolve_left_patch_chain(tpd, phase_data_by_name)
+                        xmin_eff = min(pd.xmin, xmin_eff)
+                if has_right:
+                    tpd = phase_data_by_name.get(pd.patch_right_phase)
+                    if tpd is not None:
+                        H_right = compute_right_patch_H(
+                            pd, tpd, pd.patch_right, T=T_patch,
+                            phase_data_by_name=phase_data_by_name)
+                        x_cut_right = pd.patch_right
+                        # Extend xmax to chain root's xmax.
+                        _, xmax_eff = _resolve_right_patch_chain(tpd, phase_data_by_name)
+                        xmax_eff = max(pd.xmax, xmax_eff)
+                if H_left is not None or H_right is not None:
+                    model = PiecewisePatchModel(
+                        pd.hs_H, pd.hs_S,
+                        H_left=H_left, x_cut_left=x_cut_left,
+                        H_right=H_right, x_cut_right=x_cut_right,
+                        V_coeffs=V_coeffs,
+                        ideal_gas=pd.ideal_gas,
+                        R_gas=R_gas, P_ref=P_ref,
+                    )
+                    if H_left  is not None:
+                        model.patch_left_phase_name  = pd.patch_left_phase
+                    if H_right is not None:
+                        model.patch_right_phase_name = pd.patch_right_phase
+                else:
+                    model = HSModel(pd.hs_H, pd.hs_S,
+                                    V_coeffs=V_coeffs,
+                                    ideal_gas=pd.ideal_gas,
+                                    R_gas=R_gas, P_ref=P_ref)
+                    xmin_eff = pd.xmin
+                    xmax_eff = pd.xmax
+            elif self.energy_form == 'HS':
                 model = HSModel(pd.hs_H, pd.hs_S,
                                 V_coeffs=V_coeffs,
                                 ideal_gas=pd.ideal_gas,
                                 R_gas=R_gas, P_ref=P_ref)
+                xmin_eff = pd.xmin
+                xmax_eff = pd.xmax
             else:
                 model = PolyModel(pd.poly,
                                   V_coeffs=V_coeffs,
                                   ideal_gas=pd.ideal_gas,
                                   R_gas=R_gas, P_ref=P_ref)
+                xmin_eff = pd.xmin
+                xmax_eff = pd.xmax
             phases.append(Phase(
                 name=pd.name,
                 phase_type=pd.phase_type,
                 energy_model=model,
-                xmin=pd.xmin,
-                xmax=pd.xmax,
+                xmin=xmin_eff,
+                xmax=xmax_eff,
             ))
             if pd.phase_type == 'liquid' and not liq_found and self.energy_form == 'HS':
                 liq_H = list(pd.hs_H) if pd.hs_H else [0.0]
@@ -266,6 +343,16 @@ class SystemData:
                     for i, c in enumerate(pd.hs_V):
                         V_el.set(f'x{i}', _fmt(c))
 
+            # Patch metadata (HS form only; patches not supported for polynomial form).
+            if pd.patch_left is not None and pd.patch_left_phase:
+                pl_el = etree.SubElement(phase_el, 'patch_left')
+                pl_el.set('x_cut', _fmt(pd.patch_left))
+                pl_el.set('phase', pd.patch_left_phase)
+            if pd.patch_right is not None and pd.patch_right_phase:
+                pr_el = etree.SubElement(phase_el, 'patch_right')
+                pr_el.set('x_cut', _fmt(pd.patch_right))
+                pr_el.set('phase', pd.patch_right_phase)
+
         return etree.tostring(root, pretty_print=True, encoding='unicode')
 
     # ------------------------------------------------------------------
@@ -298,7 +385,20 @@ class SystemData:
             pd.xmin = phase.xmin
             pd.xmax = phase.xmax
             model = phase.energy_model
-            if isinstance(model, HSModel):
+            if isinstance(model, PiecewisePatchModel):
+                pd.ideal_gas = model.ideal_gas
+                pd.hs_V = (model.V_coeffs.tolist()
+                           if model.V_coeffs is not None else None)
+                pd.hs_H = model.H_orig.tolist()
+                pd.hs_S = model.S_coeffs.tolist()
+                pd.poly = [[0.0]]
+                if model.x_cut_left is not None:
+                    pd.patch_left       = model.x_cut_left
+                    pd.patch_left_phase = model.patch_left_phase_name
+                if model.x_cut_right is not None:
+                    pd.patch_right       = model.x_cut_right
+                    pd.patch_right_phase = model.patch_right_phase_name
+            elif isinstance(model, HSModel):
                 pd.ideal_gas = model.ideal_gas
                 pd.hs_V = (model.V_coeffs.tolist()
                            if model.V_coeffs is not None else None)
@@ -334,20 +434,6 @@ class SystemData:
 # ---------------------------------------------------------------------------
 # Fitting layer — pure Python, no Qt
 # ---------------------------------------------------------------------------
-
-def _extend_and_add(coeffs, delta):
-    """Pad *coeffs* to len(*delta*) with zeros, add *delta* element-wise.
-
-    Returns a new list; *coeffs* is not modified.
-    """
-    import numpy as np
-    c = list(coeffs or [0.0])
-    d = list(delta)
-    if len(c) < len(d):
-        c = c + [0.0] * (len(d) - len(c))
-    for i, dv in enumerate(d):
-        c[i] += dv
-    return c
 
 
 def apply_handle_drag(phase_data, drag_handle_idx,
@@ -560,9 +646,182 @@ def apply_rigid_shift(phase_data, delta_G, delta_x=0.0):
     return new_data
 
 
+def _resolve_right_patch_chain(target_pd, phase_data_by_name, _seen=None):
+    """Follow the right patch chain from *target_pd* to find the root PhaseData.
+
+    Returns ``(root_pd, xmax_eff)`` where *root_pd* is the first phase in the
+    chain that has no further right patch (or whose right-patch target cannot
+    be resolved), and *xmax_eff* = ``root_pd.xmax``.
+
+    Example:  C→B→A  returns (A, A.xmax).
+    """
+    if _seen is None:
+        _seen = set()
+    if (target_pd.patch_right_phase
+            and target_pd.patch_right is not None
+            and target_pd.name not in _seen):
+        _seen.add(target_pd.name)
+        next_pd = phase_data_by_name.get(target_pd.patch_right_phase)
+        if next_pd is not None:
+            return _resolve_right_patch_chain(next_pd, phase_data_by_name, _seen)
+    return target_pd, target_pd.xmax
+
+
+def _resolve_left_patch_chain(target_pd, phase_data_by_name, _seen=None):
+    """Follow the left patch chain from *target_pd* to find the root PhaseData.
+
+    Returns ``(root_pd, xmin_eff)`` where *root_pd* is the first phase in the
+    chain that has no further left patch, and *xmin_eff* = ``root_pd.xmin``.
+    """
+    if _seen is None:
+        _seen = set()
+    if (target_pd.patch_left_phase
+            and target_pd.patch_left is not None
+            and target_pd.name not in _seen):
+        _seen.add(target_pd.name)
+        next_pd = phase_data_by_name.get(target_pd.patch_left_phase)
+        if next_pd is not None:
+            return _resolve_left_patch_chain(next_pd, phase_data_by_name, _seen)
+    return target_pd, target_pd.xmin
+
+
+def compute_left_patch_H(phase_data, target_phase_data, x_cut, T=0.0,
+                         phase_data_by_name=None):
+    """Compute quadratic H coefficients Q(x) for the left patch region.
+
+    Returns [q0, q1, q2] such that Q(x) = q0 + q1·x + q2·x² satisfies:
+
+    1.  Q(x_cut)  = H_phase(x_cut)          — value continuity at the cut
+    2.  Q'(x_cut) = H_phase'(x_cut)         — slope continuity at the cut
+    3.  G_patch'(xmin_eff, T) = G_root'(xmin_eff, T)  — G slope match with
+        the chain root at the effective left edge.
+
+    Condition 3 expands (S is shared on the left of G_patch) to:
+        Q'(xmin_eff) = H_root'(xmin_eff) + T·(S_phase'(xmin_eff) − S_root'(xmin_eff))
+
+    When *phase_data_by_name* is supplied the left patch chain is followed
+    (target → its target → …) so that chained patches share a common endpoint.
+    When T = 0 the formula reduces to pure H-slope matching at xmin_eff.
+
+    Parameters
+    ----------
+    phase_data        : PhaseData  — phase being patched
+    target_phase_data : PhaseData  — target phase whose slope is matched at xmin
+    x_cut             : float      — cut-off composition (left patch covers [xmin, x_cut])
+    T                 : float      — temperature for G slope matching (default 0 → H only)
+    phase_data_by_name : dict | None — full {name: PhaseData} mapping for chain resolution
+
+    Returns
+    -------
+    list[float] — [q0, q1, q2] (three coefficients of the quadratic patch)
+    """
+    import numpy as np
+    pv = np.polynomial.polynomial.polyval
+    pd_d = np.polynomial.polynomial.polyder
+
+    # Resolve patch chain: follow target's left-patch chain to the root.
+    if phase_data_by_name is not None:
+        root_pd, xmin_eff = _resolve_left_patch_chain(target_phase_data, phase_data_by_name)
+    else:
+        root_pd, xmin_eff = target_phase_data, phase_data.xmin
+
+    xmin = xmin_eff
+    H   = np.asarray(phase_data.hs_H   or [0.0])
+    S   = np.asarray(phase_data.hs_S   or [0.0])
+    H_t = np.asarray(root_pd.hs_H or [0.0])
+    S_t = np.asarray(root_pd.hs_S or [0.0])
+
+    H_val          = float(pv(x_cut, H))
+    dH_at_cut      = float(pv(x_cut, pd_d(H))) if len(H) > 1 else 0.0
+    dH_t_at_xmin   = float(pv(xmin,  pd_d(H_t))) if len(H_t) > 1 else 0.0
+    dS_at_xmin     = float(pv(xmin,  pd_d(S)))  if len(S)   > 1 else 0.0
+    dS_t_at_xmin   = float(pv(xmin,  pd_d(S_t))) if len(S_t) > 1 else 0.0
+
+    # Target G-slope at xmin projected back to H-space:
+    slope_target = dH_t_at_xmin + float(T) * (dS_at_xmin - dS_t_at_xmin)
+
+    dx = x_cut - xmin
+    if abs(dx) < 1e-10:
+        # Degenerate — no patch region; return original H padded to 3 terms.
+        h = list(H)
+        return (h + [0.0] * max(0, 3 - len(h)))[:3]
+
+    q2 = (dH_at_cut - slope_target) / (2.0 * dx)
+    q1 = slope_target - 2.0 * q2 * xmin
+    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
+    return [q0, q1, q2]
+
+
+def compute_right_patch_H(phase_data, target_phase_data, x_cut, T=0.0,
+                          phase_data_by_name=None):
+    """Compute quadratic H coefficients Q(x) for the right patch region.
+
+    Returns [q0, q1, q2] such that Q(x) = q0 + q1·x + q2·x² satisfies:
+
+    1.  Q(x_cut)   = H_phase(x_cut)           — value continuity at the cut
+    2.  Q'(x_cut)  = H_phase'(x_cut)          — slope continuity at the cut
+    3.  G_patch'(xmax_eff, T) = G_root'(xmax_eff, T)  — G slope match with
+        the chain root at the effective right edge.
+
+    Condition 3 expands to:
+        Q'(xmax_eff) = H_root'(xmax_eff) + T·(S_phase'(xmax_eff) − S_root'(xmax_eff))
+
+    When *phase_data_by_name* is supplied the right patch chain is followed
+    (target → its target → …) so that chained patches share a common endpoint.
+    When T = 0 the formula reduces to pure H-slope matching at xmax_eff.
+
+    Parameters
+    ----------
+    phase_data        : PhaseData  — phase being patched
+    target_phase_data : PhaseData  — target phase whose slope is matched at xmax
+    x_cut             : float      — cut-off composition (right patch covers [x_cut, xmax_eff])
+    T                 : float      — temperature for G slope matching (default 0 → H only)
+    phase_data_by_name : dict | None — full {name: PhaseData} mapping for chain resolution
+
+    Returns
+    -------
+    list[float] — [q0, q1, q2]
+    """
+    import numpy as np
+    pv  = np.polynomial.polynomial.polyval
+    pd_d = np.polynomial.polynomial.polyder
+
+    # Resolve patch chain: follow target's right-patch chain to the root.
+    if phase_data_by_name is not None:
+        root_pd, xmax = _resolve_right_patch_chain(target_phase_data, phase_data_by_name)
+    else:
+        root_pd, xmax = target_phase_data, phase_data.xmax
+
+    H   = np.asarray(phase_data.hs_H   or [0.0])
+    S   = np.asarray(phase_data.hs_S   or [0.0])
+    H_t = np.asarray(root_pd.hs_H or [0.0])
+    S_t = np.asarray(root_pd.hs_S or [0.0])
+
+    H_val          = float(pv(x_cut, H))
+    dH_at_cut      = float(pv(x_cut, pd_d(H))) if len(H) > 1 else 0.0
+    dH_t_at_xmax   = float(pv(xmax,  pd_d(H_t))) if len(H_t) > 1 else 0.0
+    dS_at_xmax     = float(pv(xmax,  pd_d(S)))  if len(S)   > 1 else 0.0
+    dS_t_at_xmax   = float(pv(xmax,  pd_d(S_t))) if len(S_t) > 1 else 0.0
+
+    slope_target = dH_t_at_xmax + float(T) * (dS_at_xmax - dS_t_at_xmax)
+
+    dx = xmax - x_cut
+    if abs(dx) < 1e-10:
+        h = list(H)
+        return (h + [0.0] * max(0, 3 - len(h)))[:3]
+
+    q2 = (slope_target - dH_at_cut) / (2.0 * dx)
+    q1 = dH_at_cut - 2.0 * q2 * x_cut
+    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
+    return [q0, q1, q2]
+
+
 # ---------------------------------------------------------------------------
 # UI widgets
 # ---------------------------------------------------------------------------
+
+_PATCH_STEPS = 1000   # integer resolution for patch composition sliders
+
 
 class _FloatSpinBox(QDoubleSpinBox):
     """General-purpose float spinbox: range ±1e9, 6 decimals, step 0.001."""
@@ -803,6 +1062,7 @@ class PhaseEditorWidget(QFrame):
     """
 
     remove_requested = Signal()
+    patch_changed = Signal()   # emitted when any patch slider or combo changes
 
     def __init__(self, energy_form='HS', parent=None):
         super().__init__(parent)
@@ -885,8 +1145,70 @@ class PhaseEditorWidget(QFrame):
         hs_layout.addWidget(self._S_row)
         hs_layout.addWidget(self._V_enable_cb)
         hs_layout.addWidget(self._V_row)
+
+        # ---- Patch controls ----
+        self._patch_left_phase_name = ''   # requested target, used by update_patch_phase_list
+        self._patch_right_phase_name = ''
+
+        self._left_patch_cb = QCheckBox('Apply left patch')
+        self._left_patch_container = QWidget()
+        lp_layout = QHBoxLayout(self._left_patch_container)
+        lp_layout.setContentsMargins(16, 0, 0, 0)
+        lp_layout.setSpacing(6)
+        self._left_patch_slider = QSlider(Qt.Horizontal)
+        self._left_patch_slider.setRange(0, _PATCH_STEPS)
+        self._left_patch_slider.setValue(0)
+        self._left_patch_val_lbl = QLabel('0.0000')
+        self._left_patch_val_lbl.setMinimumWidth(52)
+        self._left_patch_phase_combo = QComboBox()
+        self._left_patch_phase_combo.setMinimumWidth(80)
+        lp_layout.addWidget(self._left_patch_slider)
+        lp_layout.addWidget(self._left_patch_val_lbl)
+        lp_layout.addWidget(self._left_patch_phase_combo)
+        self._left_patch_container.setVisible(False)
+        self._left_patch_cb.toggled.connect(self._left_patch_container.setVisible)
+        self._left_patch_cb.toggled.connect(lambda _: self.patch_changed.emit())
+        self._left_patch_slider.valueChanged.connect(self._update_patch_labels)
+        self._left_patch_slider.valueChanged.connect(
+            lambda _: self.patch_changed.emit())
+        self._left_patch_phase_combo.currentIndexChanged.connect(
+            self._on_left_patch_combo_changed)
+
+        self._right_patch_cb = QCheckBox('Apply right patch')
+        self._right_patch_container = QWidget()
+        rp_layout = QHBoxLayout(self._right_patch_container)
+        rp_layout.setContentsMargins(16, 0, 0, 0)
+        rp_layout.setSpacing(6)
+        self._right_patch_slider = QSlider(Qt.Horizontal)
+        self._right_patch_slider.setRange(0, _PATCH_STEPS)
+        self._right_patch_slider.setValue(_PATCH_STEPS)
+        self._right_patch_val_lbl = QLabel('1.0000')
+        self._right_patch_val_lbl.setMinimumWidth(52)
+        self._right_patch_phase_combo = QComboBox()
+        self._right_patch_phase_combo.setMinimumWidth(80)
+        rp_layout.addWidget(self._right_patch_slider)
+        rp_layout.addWidget(self._right_patch_val_lbl)
+        rp_layout.addWidget(self._right_patch_phase_combo)
+        self._right_patch_container.setVisible(False)
+        self._right_patch_cb.toggled.connect(self._right_patch_container.setVisible)
+        self._right_patch_cb.toggled.connect(lambda _: self.patch_changed.emit())
+        self._right_patch_slider.valueChanged.connect(self._update_patch_labels)
+        self._right_patch_slider.valueChanged.connect(
+            lambda _: self.patch_changed.emit())
+        self._right_patch_phase_combo.currentIndexChanged.connect(
+            self._on_right_patch_combo_changed)
+
+        hs_layout.addWidget(self._left_patch_cb)
+        hs_layout.addWidget(self._left_patch_container)
+        hs_layout.addWidget(self._right_patch_cb)
+        hs_layout.addWidget(self._right_patch_container)
+
         self._stack.addWidget(hs_widget)   # index 0
         self._update_eq_label()            # set initial text
+
+        # Connect xmin/xmax spinboxes to update patch slider labels when range changes.
+        self._xmin_sb.valueChanged.connect(self._update_patch_labels)
+        self._xmax_sb.valueChanged.connect(self._update_patch_labels)
 
         # Poly page (index 1)
         poly_page = QWidget()
@@ -967,6 +1289,56 @@ class PhaseEditorWidget(QFrame):
 
     # -- private helpers ----------------------------------------------------
 
+    def _patch_slider_to_x(self, slider_val):
+        xmin = self._xmin_sb.value()
+        xmax = self._xmax_sb.value()
+        return xmin + slider_val * (xmax - xmin) / _PATCH_STEPS
+
+    def _x_to_patch_slider(self, x):
+        xmin = self._xmin_sb.value()
+        xmax = self._xmax_sb.value()
+        if xmax == xmin:
+            return 0
+        return int(round((x - xmin) / (xmax - xmin) * _PATCH_STEPS))
+
+    def _update_patch_labels(self, _=None):
+        x_left  = self._patch_slider_to_x(self._left_patch_slider.value())
+        x_right = self._patch_slider_to_x(self._right_patch_slider.value())
+        self._left_patch_val_lbl.setText(f'{x_left:.4f}')
+        self._right_patch_val_lbl.setText(f'{x_right:.4f}')
+
+    def _on_left_patch_combo_changed(self, _=None):
+        """Track user's manual combo selection and emit patch_changed."""
+        self._patch_left_phase_name = self._left_patch_phase_combo.currentText()
+        self.patch_changed.emit()
+
+    def _on_right_patch_combo_changed(self, _=None):
+        """Track user's manual combo selection and emit patch_changed."""
+        self._patch_right_phase_name = self._right_patch_phase_combo.currentText()
+        self.patch_changed.emit()
+
+    def update_patch_phase_list(self, names: list):
+        """Repopulate both patch phase dropdowns with *names* (other phases).
+
+        The stored _patch_*_phase_name (set at set_phase_data() time, or updated
+        when the user changes the combo) takes priority over whatever Qt may have
+        auto-selected.  This prevents Qt's automatic index-0 selection from
+        overriding the intended target when phases are loaded in a particular order.
+        """
+        for combo, attr in (
+                (self._left_patch_phase_combo, '_patch_left_phase_name'),
+                (self._right_patch_phase_combo, '_patch_right_phase_name')):
+            # Stored name has priority; fall back to current combo text only when
+            # no name has been set (e.g. a brand-new phase with no patch).
+            wanted = getattr(self, attr, '') or combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            idx = combo.findText(wanted)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
     def _on_type_changed(self, phase_type):
         """Switch to VLE page when type becomes 'gas'; back to HS otherwise."""
         if phase_type == 'gas' and self._energy_form == 'HS':
@@ -1028,6 +1400,14 @@ class PhaseEditorWidget(QFrame):
             pd.hs_S = self._S_row.get_coeffs()
             pd.hs_V = self._V_row.get_coeffs() if self._V_enable_cb.isChecked() else None
         pd.poly = self._poly_widget.get_coeffs()
+        pd.patch_left = (self._patch_slider_to_x(self._left_patch_slider.value())
+                         if self._left_patch_cb.isChecked() else None)
+        pd.patch_right = (self._patch_slider_to_x(self._right_patch_slider.value())
+                          if self._right_patch_cb.isChecked() else None)
+        pd.patch_left_phase = (self._left_patch_phase_combo.currentText()
+                               if self._left_patch_cb.isChecked() else '')
+        pd.patch_right_phase = (self._right_patch_phase_combo.currentText()
+                                if self._right_patch_cb.isChecked() else '')
         return pd
 
     def set_phase_data(self, data: PhaseData):
@@ -1065,19 +1445,35 @@ class PhaseEditorWidget(QFrame):
             # Raw H/S data (including old-style gas phases) — show HS page.
             self._vle_mode = False
 
+        # Restore patch state.
+        if data.patch_left is not None:
+            self._left_patch_cb.setChecked(True)
+            self._left_patch_slider.setValue(self._x_to_patch_slider(data.patch_left))
+        else:
+            self._left_patch_cb.setChecked(False)
+            self._left_patch_slider.setValue(0)
+        if data.patch_right is not None:
+            self._right_patch_cb.setChecked(True)
+            self._right_patch_slider.setValue(self._x_to_patch_slider(data.patch_right))
+        else:
+            self._right_patch_cb.setChecked(False)
+            self._right_patch_slider.setValue(_PATCH_STEPS)
+        self._update_patch_labels()
+
+        # Store requested patch-phase names; applied by update_patch_phase_list().
+        self._patch_left_phase_name = getattr(data, 'patch_left_phase', '') or ''
+        self._patch_right_phase_name = getattr(data, 'patch_right_phase', '') or ''
+        # Apply immediately if the combos are already populated.
+        for combo, name in (
+                (self._left_patch_phase_combo, self._patch_left_phase_name),
+                (self._right_patch_phase_combo, self._patch_right_phase_name)):
+            if name:
+                idx = combo.findText(name)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
         self._update_stack_page()
 
-    def set_highlight(self, severity=None):
-        """Apply a colored border or clear it based on warning severity."""
-        from pde_check import Severity
-        if severity is None:
-            self.setStyleSheet('')
-        else:
-            colors = {Severity.ERROR:   '#cc0000',
-                      Severity.WARNING: '#b85000',
-                      Severity.INFO:    '#1a5ca0'}
-            c = colors[severity]
-            self.setStyleSheet(f'PhaseEditorWidget {{ border: 2px solid {c}; }}')
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1490,7 @@ class BuilderWindow(QDialog):
     """
 
     system_applied = Signal(object)
+    patch_changed  = Signal(object)   # emitted with a preview System on patch slider move
 
     def __init__(self, system=None, parent=None):
         super().__init__(parent)
@@ -1104,6 +1501,7 @@ class BuilderWindow(QDialog):
         self._phase_editors = []   # list[PhaseEditorWidget]
         self._last_names    = {}   # PhaseEditorWidget → last accepted name
         self._comp_edits = []      # list[QLineEdit]
+        self._current_T  = None   # kept in sync by MainWindow via set_current_T()
 
         root = QVBoxLayout(self)
 
@@ -1213,23 +1611,6 @@ class BuilderWindow(QDialog):
         add_phase_btn.clicked.connect(lambda: self._add_phase())
         root.addWidget(add_phase_btn)
 
-        # ---- Consistency check panel ----
-        warn_group = QGroupBox('Consistency Checks')
-        warn_layout = QVBoxLayout(warn_group)
-        warn_layout.setContentsMargins(4, 4, 4, 4)
-        self._warn_scroll = QScrollArea()
-        self._warn_scroll.setWidgetResizable(True)
-        self._warn_scroll.setMaximumHeight(130)
-        self._warn_scroll.setMinimumHeight(48)
-        self._warn_contents = QWidget()
-        self._warn_box = QVBoxLayout(self._warn_contents)
-        self._warn_box.setContentsMargins(2, 2, 2, 2)
-        self._warn_box.setSpacing(4)
-        self._warn_box.addStretch()
-        self._warn_scroll.setWidget(self._warn_contents)
-        warn_layout.addWidget(self._warn_scroll)
-        root.addWidget(warn_group)
-
         # ---- Button row ----
         btn_row = QHBoxLayout()
         load_btn = QPushButton('Load XML\u2026')
@@ -1254,9 +1635,6 @@ class BuilderWindow(QDialog):
         else:
             self._add_component_edit('A')
             self._add_component_edit('B')
-
-        # Run checks immediately so the panel is populated on first open
-        self._run_and_show_checks()
 
     # ------------------------------------------------------------------
     # Component management
@@ -1308,6 +1686,7 @@ class BuilderWindow(QDialog):
             editor._name_edit.setText(self._last_names.get(editor, 'phase'))
         else:
             self._last_names[editor] = new_name
+            self._refresh_patch_phase_lists()
 
     def _add_phase(self, data=None):
         form = self._form_combo.currentText()
@@ -1321,10 +1700,18 @@ class BuilderWindow(QDialog):
         editor.remove_requested.connect(lambda e=editor: self._remove_phase(e))
         editor._name_edit.editingFinished.connect(
             lambda e=editor: self._on_phase_name_changed(e))
+        editor.patch_changed.connect(self._on_patch_changed)
         # Insert before the bottom stretch.
         count = self._phases_layout.count()
         self._phases_layout.insertWidget(count - 1, editor)
         self._phase_editors.append(editor)
+        self._refresh_patch_phase_lists()
+
+    def _refresh_patch_phase_lists(self):
+        """Update each phase editor's patch-phase dropdowns with all other phase names."""
+        for editor in self._phase_editors:
+            names = [e._name_edit.text() for e in self._phase_editors if e is not editor]
+            editor.update_patch_phase_list(names)
 
     def _remove_phase(self, editor):
         self._last_names.pop(editor, None)
@@ -1332,6 +1719,7 @@ class BuilderWindow(QDialog):
             self._phase_editors.remove(editor)
         self._phases_layout.removeWidget(editor)
         editor.setParent(None)
+        self._refresh_patch_phase_lists()
 
     # ------------------------------------------------------------------
     # Data collection / population
@@ -1387,6 +1775,7 @@ class BuilderWindow(QDialog):
 
         for phase_data in sd.phases:
             self._add_phase(phase_data)
+        self._refresh_patch_phase_lists()
 
     # ------------------------------------------------------------------
     # Button slots
@@ -1413,144 +1802,34 @@ class BuilderWindow(QDialog):
             except Exception as exc:
                 QMessageBox.warning(self, 'Save Error', str(exc))
 
-    def _show_warnings(self, warnings):
-        """Render consistency-check warnings into the warning panel."""
-        from pde_check import Severity
+    # ------------------------------------------------------------------
+    # Patch slider live-preview support
+    # ------------------------------------------------------------------
 
-        # ---- C: clear all phase highlights ----
-        for editor in self._phase_editors:
-            editor.set_highlight(None)
+    def set_current_T(self, T: float):
+        """Called by MainWindow when the temperature slider moves."""
+        self._current_T = float(T)
 
-        # ---- C: apply highlights (first match per phase name wins) ----
-        highlighted = set()
-        for w in warnings:
-            for name in w.phase_names:
-                if name not in highlighted:
-                    for editor in self._phase_editors:
-                        if editor._name_edit.text() == name:
-                            editor.set_highlight(w.severity)
-                            highlighted.add(name)
-                            break
+    def _on_patch_changed(self):
+        """Emit a preview system when a left-patch slider or combo changes.
 
-        # ---- clear warning box ----
-        while self._warn_box.count():
-            item = self._warn_box.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        energy_form = self._form_combo.currentText()
-        colour_map = {Severity.ERROR:   '#cc0000',
-                      Severity.WARNING: '#b85000',
-                      Severity.INFO:    '#1a5ca0'}
-        icon_map   = {Severity.ERROR:   '⚠',
-                      Severity.WARNING: '●',
-                      Severity.INFO:    'ⅈ'}
-
-        if not warnings:
-            lbl = QLabel('✓ No issues found.')
-            lbl.setStyleSheet('color: #2a7a2a; font-weight: bold;')
-            self._warn_box.addWidget(lbl)
-            self._warn_box.addStretch()
-            return
-
-        for w in warnings:
-            row_widget = QWidget()
-            row_layout = QVBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(1)
-
-            c  = colour_map[w.severity]
-            ic = icon_map[w.severity]
-            ph = f' [{", ".join(w.phase_names)}]' if w.phase_names else ''
-
-            # top line: icon + message + optional Fix button
-            top = QHBoxLayout()
-            top.setSpacing(4)
-            msg_lbl = QLabel(f'{ic} {w.message}{ph}')
-            msg_lbl.setStyleSheet(f'color: {c}; font-weight: bold;')
-            msg_lbl.setWordWrap(True)
-            top.addWidget(msg_lbl, 1)
-
-            # B: Fix buttons — only for HS form
-            # if energy_form == 'HS':
-            #     if w.fix_hs is not None:
-            #         fix_btn = QPushButton('Fix All →')
-            #         fix_btn.setFixedWidth(64)
-            #         fix_btn.setToolTip(
-            #             'Correct H and S to satisfy all 4 consistency conditions '
-            #             f'(G and dG/dx at both endpoints) for {w.phase_names[0]}'
-            #         )
-            #         fix_btn.clicked.connect(lambda checked=False, _w=w: self._apply_fix(_w))
-            #         top.addWidget(fix_btn)
-            #     elif w.fix_delta is not None:
-            #         fix_btn = QPushButton('Fix G →')
-            #         fix_btn.setFixedWidth(52)
-            #         fix_btn.setToolTip(
-            #             f'Apply H₀ correction ({w.fix_delta:+.4g}) to {w.phase_names[0]}'
-            #         )
-            #         fix_btn.clicked.connect(lambda checked=False, _w=w: self._apply_fix(_w))
-            #         top.addWidget(fix_btn)
-
-            top_widget = QWidget()
-            top_widget.setLayout(top)
-            row_layout.addWidget(top_widget)
-
-            # detail line
-            det_lbl = QLabel(w.detail)
-            det_lbl.setStyleSheet('color: #555; font-size: 10px;')
-            det_lbl.setWordWrap(True)
-            row_layout.addWidget(det_lbl)
-
-            self._warn_box.addWidget(row_widget)
-
-        self._warn_box.addStretch()
-
-    def _apply_fix(self, w):
-        """Apply the one-click correction stored in a ConsistencyWarning.
-
-        Handles two cases:
-          fix_hs    — minimum-norm H+S correction satisfying all 4 conditions
-          fix_delta — simple H₀ shift to equalise G at one endpoint
+        The emitted system uses the current T for the G slope matching in the
+        patch polynomial.  The main window listens and redraws GxCanvas without
+        performing a full UI reload.
         """
-        if not w.phase_names:
-            return
-
-        if w.fix_hs is not None:
-            target_name = w.fix_hs['target_name']
-            dH = w.fix_hs['dH']
-            dS = w.fix_hs['dS']
-            for editor in self._phase_editors:
-                if editor._name_edit.text() == target_name:
-                    pd = editor.get_phase_data()
-                    pd.hs_H = _extend_and_add(pd.hs_H, dH)
-                    pd.hs_S = _extend_and_add(pd.hs_S, dS)
-                    editor.set_phase_data(pd)
-                    break
-        elif w.fix_delta is not None:
-            target_name = w.phase_names[0]
-            for editor in self._phase_editors:
-                if editor._name_edit.text() == target_name:
-                    pd = editor.get_phase_data()
-                    if not pd.hs_H:
-                        pd.hs_H = [0.0]
-                    pd.hs_H[0] += w.fix_delta
-                    editor.set_phase_data(pd)
-                    break
-        else:
-            return
-
-        self._run_and_show_checks()
-
-    def _run_and_show_checks(self):
-        """Collect current UI state, run all consistency checks, refresh warning panel."""
         try:
             sd = self._collect_system_data()
-            system = sd.to_system()
-            from pde_check import run_all_checks
-            warnings = run_all_checks(system)
+            if not sd.phases:
+                return
+            t = self._current_T if self._current_T is not None else sd.T_initial
+            system = sd.to_system(current_T=t)
+            self.patch_changed.emit(system)
         except Exception:
-            warnings = []
-        self._show_warnings(warnings)
+            pass   # silently ignore during live drag
+
+    # ------------------------------------------------------------------
+    # Button slots
+    # ------------------------------------------------------------------
 
     def _on_apply(self) -> bool:
         """Apply current state. Returns True on success, False on error."""
@@ -1560,19 +1839,11 @@ class BuilderWindow(QDialog):
                 QMessageBox.warning(self, 'Apply Error',
                                     'Add at least one phase before applying.')
                 return False
-            system = sd.to_system()
+            t = self._current_T if self._current_T is not None else sd.T_initial
+            system = sd.to_system(current_T=t)
         except Exception as exc:
             QMessageBox.warning(self, 'Apply Error', str(exc))
             return False
-        try:
-            from pde_check import run_all_checks
-            warnings = run_all_checks(system)
-        except ImportError:
-            warnings = []
-        except Exception as check_exc:
-            warnings = []
-            print(f'[pde_check] Checker error: {check_exc}')
-        self._show_warnings(warnings)
         self.system_applied.emit(system)
         return True
 
@@ -1589,13 +1860,8 @@ class BuilderWindow(QDialog):
             try:
                 sd = self._collect_system_data()
                 if sd.phases:
-                    system = sd.to_system()
-                    try:
-                        from pde_check import run_all_checks
-                        warnings = run_all_checks(system)
-                    except Exception:
-                        warnings = []
-                    self._show_warnings(warnings)
+                    t = self._current_T if self._current_T is not None else sd.T_initial
+                    system = sd.to_system(current_T=t)
                     self.system_applied.emit(system)
             except Exception:
                 pass
