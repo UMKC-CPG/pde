@@ -38,9 +38,10 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Patch, Rectangle as MplRectangle
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox,
-                                QColorDialog, QComboBox, QDialog, QGridLayout,
+                                QColorDialog, QComboBox, QDialog,
+                                QFileDialog, QFormLayout, QGridLayout,
                                 QHBoxLayout, QLabel, QMainWindow, QMenu,
-                                QProgressBar, QPushButton,
+                                QProgressBar, QPushButton, QSpinBox,
                                 QSlider, QStackedWidget, QVBoxLayout, QWidget)
 
 from pde_compute import compute_equilibrium
@@ -1276,6 +1277,11 @@ class MainWindow(QMainWindow):
                 'Opens 3D T-P-x phase diagram.\n'
                 'Requires full grid \u2014 click \u201cPre-compute full T-P-x\u201d first.')
 
+        # ---- Export button ----
+        self._export_btn = QPushButton('Export\u2026')
+        self._export_btn.setToolTip(
+            'Export phase diagram to HDF5 + XDMF for ParaView.')
+
         # ---- Builder button ----
         self._builder_btn = QPushButton('Builder\u2026')
         self._builder_btn.clicked.connect(self._open_builder)
@@ -1283,6 +1289,8 @@ class MainWindow(QMainWindow):
         # ---- top row layout ----
         top_row = QHBoxLayout()
         top_row.addWidget(self._builder_btn)
+        top_row.addSpacing(8)
+        top_row.addWidget(self._export_btn)
         top_row.addSpacing(16)
         if self._viz3d_btn is not None:
             top_row.addWidget(self._viz3d_btn)
@@ -1339,6 +1347,7 @@ class MainWindow(QMainWindow):
             self._precompute_btn.clicked.connect(self._on_precompute_clicked)
         if self._viz3d_btn is not None:
             self._viz3d_btn.clicked.connect(self._on_3d_view_clicked)
+        self._export_btn.clicked.connect(self._on_export_clicked)
         self._reveal_cb.toggled.connect(self._on_reveal_all_toggled)
         self._colors_btn.clicked.connect(self._on_colors_clicked)
         self._res_combo.currentIndexChanged.connect(self._on_resolution_changed)
@@ -1424,6 +1433,204 @@ class MainWindow(QMainWindow):
             self._full_grid, T_arr, P_arr, self.system)
         self._viz3d_window = Viz3DWindow(diagram, colors=self._colors)
         self._viz3d_window.show()
+
+    def _on_export_clicked(self):
+        """Open a dialog to configure and run HDF5 + XDMF export."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Export Phase Diagram')
+        layout = QVBoxLayout()
+
+        # --- Mode selector ---
+        has_pressure = self.system.has_pressure
+        mode_combo = QComboBox()
+        mode_combo.addItem('2D slice (field-x)')
+        if has_pressure:
+            mode_combo.addItem('3D T-P-x volume')
+            mode_combo.setCurrentIndex(1)
+        layout.addWidget(mode_combo)
+
+        # --- Stacked options for each mode ---
+        stack = QStackedWidget()
+
+        # -- Page 0: 2D slice options --
+        page_2d = QWidget()
+        form_2d = QFormLayout()
+
+        nx_spin_2d = QSpinBox()
+        nx_spin_2d.setRange(10, 2000)
+        nx_spin_2d.setValue(200)
+        form_2d.addRow('Composition points (n_x):', nx_spin_2d)
+
+        nf_spin = QSpinBox()
+        nf_spin.setRange(10, 2000)
+        nf_spin.setValue(200)
+        form_2d.addRow('Field points (n_field):', nf_spin)
+
+        field_combo = QComboBox()
+        for f in self.system.fields:
+            field_combo.addItem(f'{f.symbol} ({f.name})')
+        field_combo.setCurrentIndex(self._primary_idx)
+        form_2d.addRow('Sweep field:', field_combo)
+
+        page_2d.setLayout(form_2d)
+        stack.addWidget(page_2d)
+
+        # -- Page 1: 3D T-P-x options --
+        page_3d = QWidget()
+        form_3d = QFormLayout()
+
+        nx_spin_3d = QSpinBox()
+        nx_spin_3d.setRange(10, 500)
+        nx_spin_3d.setValue(
+            self._n_steps if has_pressure else 100)
+        form_3d.addRow('Composition points (n_x):', nx_spin_3d)
+
+        nt_spin = QSpinBox()
+        nt_spin.setRange(10, 500)
+        nt_spin.setValue(self._n_steps if has_pressure else 100)
+        form_3d.addRow('Temperature points (n_T):', nt_spin)
+
+        np_spin = QSpinBox()
+        np_spin.setRange(10, 500)
+        np_spin.setValue(self._n_steps if has_pressure else 50)
+        form_3d.addRow('Pressure points (n_P):', np_spin)
+
+        if has_pressure:
+            T_f = self.system.T_field
+            P_f = self.system.P_field
+            range_label = QLabel(
+                f'T: {T_f.min_val}\u2013{T_f.max_val} {T_f.unit},  '
+                f'P: {P_f.min_val}\u2013{P_f.max_val} {P_f.unit}')
+            range_label.setStyleSheet('color: grey; font-style: italic;')
+            form_3d.addRow('Ranges:', range_label)
+
+            if self._full_grid is not None:
+                cache_label = QLabel(
+                    f'Pre-computed grid available '
+                    f'({self._n_steps}\u00d7{self._n_steps})')
+                cache_label.setStyleSheet(
+                    'color: green; font-style: italic;')
+                form_3d.addRow('Cache:', cache_label)
+
+        page_3d.setLayout(form_3d)
+        stack.addWidget(page_3d)
+
+        if has_pressure:
+            stack.setCurrentIndex(1)
+
+        mode_combo.currentIndexChanged.connect(stack.setCurrentIndex)
+        layout.addWidget(stack)
+
+        # --- Buttons ---
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton('Export')
+        cancel_btn = QPushButton('Cancel')
+        btn_row.addStretch()
+        btn_row.addWidget(export_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        dlg.setLayout(layout)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        def do_export():
+            mode = mode_combo.currentIndex()
+            dlg.accept()
+
+            import re
+            title = self.system.title or 'phase_diagram'
+            default_name = re.sub(r'[^\w\-.]', '_', title).strip('_').lower()
+            if mode == 1:
+                default_name += '_3d'
+            default_name += '.hdf5'
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Save HDF5 file', default_name,
+                'HDF5 Files (*.hdf5);;All Files (*)')
+            if not path:
+                return
+
+            if mode == 0:
+                self._do_export_2d(path, nx_spin_2d.value(),
+                                   nf_spin.value(),
+                                   field_combo.currentIndex())
+            else:
+                self._do_export_3d(path, nx_spin_3d.value(),
+                                   nt_spin.value(), np_spin.value())
+
+        export_btn.clicked.connect(do_export)
+        dlg.exec()
+
+    def _do_export_2d(self, path, n_x, n_field, pfi):
+        """Run the 2D field-x export with a progress bar."""
+        fixed = {}
+        for i, f in enumerate(self.system.fields):
+            if i != pfi:
+                fixed[f.name] = self._current_val(i)
+
+        from pde_export import export_binary_Tx
+
+        bar = QProgressBar(self)
+        bar.setRange(0, n_field)
+        bar.setFormat('Exporting 2D... %v / %m')
+        self.statusBar().addWidget(bar, 1)
+        bar.show()
+
+        def on_progress(done, total):
+            bar.setValue(done)
+            QApplication.processEvents()
+
+        try:
+            xdmf = export_binary_Tx(
+                self.system, path,
+                n_x=n_x, n_field=n_field,
+                primary_field_idx=pfi,
+                fixed_field_values=fixed,
+                progress_cb=on_progress)
+            self.statusBar().showMessage(f'Exported: {xdmf}', 8000)
+        except Exception as e:
+            self.statusBar().showMessage(f'Export failed: {e}', 8000)
+        finally:
+            self.statusBar().removeWidget(bar)
+
+    def _do_export_3d(self, path, n_x, n_T, n_P):
+        """Run the 3D T-P-x export with a progress bar."""
+        from pde_export import export_3d_TPx
+
+        # Reuse the cached grid when dimensions match.
+        grid = None
+        if (self._full_grid is not None
+                and len(self._full_grid) == n_T
+                and len(self._full_grid[0]) == n_P):
+            grid = self._full_grid
+
+        total = n_T * n_P
+        bar = QProgressBar(self)
+        bar.setRange(0, total)
+        fmt = ('Writing HDF5...' if grid
+               else 'Exporting 3D...')
+        bar.setFormat(f'{fmt} %v / %m')
+        self.statusBar().addWidget(bar, 1)
+        bar.show()
+
+        def on_progress(done, total):
+            bar.setValue(done)
+            QApplication.processEvents()
+
+        try:
+            xdmf = export_3d_TPx(
+                self.system, path,
+                n_x=n_x, n_T=n_T, n_P=n_P,
+                progress_cb=on_progress,
+                precomputed_grid=grid)
+            msg = f'Exported: {xdmf}'
+            if grid:
+                msg += ' (used cached grid)'
+            self.statusBar().showMessage(msg, 8000)
+        except Exception as e:
+            self.statusBar().showMessage(
+                f'Export failed: {e}', 8000)
+        finally:
+            self.statusBar().removeWidget(bar)
 
     def _on_builder_closed(self, result=None):
         """Deactivate handle-drag edit mode when the builder window closes."""
