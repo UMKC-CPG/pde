@@ -350,6 +350,116 @@ def compute_vle_gas_hs(liq_H, liq_S, T_bp_A, T_bp_B, L_A, L_B):
 
 
 # ---------------------------------------------------------------------------
+# Patch-H computation helpers (shared by parser and builder)
+# ---------------------------------------------------------------------------
+
+def compute_left_patch_H(H, S, H_target, S_target,
+                         xmin, x_cut, T_ref):
+    """Return left-patch enthalpy quadratic [q0, q1, q2].
+
+    Constructs a quadratic enthalpy replacement for the left tail of a
+    phase (x <= x_cut) that ensures both G and dG/dx continuity at the
+    cut point.  At xmin the patch slope matches the target phase's dG/dx,
+    ensuring a smooth blend.  Slope matching is evaluated at the reference
+    temperature T_ref.
+
+    Parameters
+    ----------
+    H, S               : array-like
+        Own phase H(x) and S(x) coefficient lists in ascending order.
+    H_target, S_target : array-like
+        Target phase H(x) and S(x) coefficient lists in ascending order.
+    xmin  : float — own phase lower composition bound
+    x_cut : float — left-patch / interior boundary
+    T_ref : float — reference temperature for slope matching
+    """
+    H = np.asarray(H)
+    S = np.asarray(S)
+    H_target = np.asarray(H_target)
+    S_target = np.asarray(S_target)
+    H_val = float(polyval(x_cut, H))
+    dH_at_cut = (
+        float(polyval(x_cut, polyder(H)))
+        if len(H) > 1 else 0.0)
+    dH_tgt_at_xmin = (
+        float(polyval(xmin, polyder(H_target)))
+        if len(H_target) > 1 else 0.0)
+    dS_at_xmin = (
+        float(polyval(xmin, polyder(S)))
+        if len(S) > 1 else 0.0)
+    dS_tgt_at_xmin = (
+        float(polyval(xmin, polyder(S_target)))
+        if len(S_target) > 1 else 0.0)
+    slope_target = (
+        dH_tgt_at_xmin
+        + float(T_ref)
+        * (dS_at_xmin - dS_tgt_at_xmin))
+    dx = x_cut - xmin
+    if abs(dx) < 1e-10:
+        h = H.tolist()
+        return (
+            h + [0.0] * max(0, 3 - len(h))
+        )[:3]
+    q2 = (dH_at_cut - slope_target) / (2.0 * dx)
+    q1 = slope_target - 2.0 * q2 * xmin
+    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
+    return [q0, q1, q2]
+
+
+def compute_right_patch_H(H, S, H_target, S_target,
+                          xmax, x_cut, T_ref):
+    """Return right-patch enthalpy quadratic [q0, q1, q2].
+
+    Constructs a quadratic enthalpy replacement for the right tail of a
+    phase (x > x_cut) that ensures both G and dG/dx continuity at the
+    cut point.  At xmax the patch slope matches the target phase's dG/dx,
+    ensuring a smooth blend.  Mirror of compute_left_patch_H; the slope
+    matching is evaluated at the reference temperature T_ref.
+
+    Parameters
+    ----------
+    H, S               : array-like
+        Own phase H(x) and S(x) coefficient lists in ascending order.
+    H_target, S_target : array-like
+        Target phase H(x) and S(x) coefficient lists in ascending order.
+    xmax  : float — own phase upper composition bound
+    x_cut : float — interior / right-patch boundary
+    T_ref : float — reference temperature for slope matching
+    """
+    H = np.asarray(H)
+    S = np.asarray(S)
+    H_target = np.asarray(H_target)
+    S_target = np.asarray(S_target)
+    H_val = float(polyval(x_cut, H))
+    dH_at_cut = (
+        float(polyval(x_cut, polyder(H)))
+        if len(H) > 1 else 0.0)
+    dH_tgt_at_xmax = (
+        float(polyval(xmax, polyder(H_target)))
+        if len(H_target) > 1 else 0.0)
+    dS_at_xmax = (
+        float(polyval(xmax, polyder(S)))
+        if len(S) > 1 else 0.0)
+    dS_tgt_at_xmax = (
+        float(polyval(xmax, polyder(S_target)))
+        if len(S_target) > 1 else 0.0)
+    slope_target = (
+        dH_tgt_at_xmax
+        + float(T_ref)
+        * (dS_at_xmax - dS_tgt_at_xmax))
+    dx = xmax - x_cut
+    if abs(dx) < 1e-10:
+        h = H.tolist()
+        return (
+            h + [0.0] * max(0, 3 - len(h))
+        )[:3]
+    q2 = (slope_target - dH_at_cut) / (2.0 * dx)
+    q1 = dH_at_cut - 2.0 * q2 * x_cut
+    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
+    return [q0, q1, q2]
+
+
+# ---------------------------------------------------------------------------
 # PolyModel
 # ---------------------------------------------------------------------------
 

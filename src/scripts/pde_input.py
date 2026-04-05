@@ -65,8 +65,7 @@ import pathlib
 
 from lxml import etree
 
-from pde_energy import HSModel, PiecewisePatchModel, PolyModel, compute_vle_gas_hs
-from pde_phase import Field, Phase, System
+from pde_phase import FieldSpec, PhaseSpec, SystemSpec
 
 
 # ---------------------------------------------------------------------------
@@ -113,141 +112,70 @@ def _read_v_coeffs(energy_el):
 
 
 # ---------------------------------------------------------------------------
-# HS form parsers
+# Energy coefficient extractors (data only — no model construction)
 # ---------------------------------------------------------------------------
 
-def _parse_hs_quadratic(energy_el, V_coeffs, ideal_gas, R_gas, P_ref):
-    """Parse an HS-form quadratic energy block."""
-    H_el = energy_el.find('H')
-    S_el = energy_el.find('S')
-    H_coeffs = _read_x_coeffs_from_attrs(H_el)
-    S_coeffs = _read_x_coeffs_from_attrs(S_el)
-    return HSModel(H_coeffs, S_coeffs,
-                   V_coeffs=V_coeffs, ideal_gas=ideal_gas,
-                   R_gas=R_gas, P_ref=P_ref)
+def _extract_hs_coeffs(energy_el):
+    """Extract H, S, V coefficient lists from an HS-form energy block.
 
-
-def _parse_hs_point(energy_el, V_coeffs, ideal_gas, R_gas, P_ref):
-    """Parse an HS-form point (end-member) energy block.
-
-    Expects scalar text content inside <H> and <S>.
-    A <V> element at point phases is unusual but allowed (single V0 scalar).
+    Handles both quadratic (x0/x1/x2 attributes on <H>, <S>) and point
+    (scalar text inside <H>, <S>) layouts.  Returns three plain lists
+    ready to store in PhaseSpec.model_params.
     """
-    H_val = float(energy_el.find('H').text.strip())
-    S_val = float(energy_el.find('S').text.strip())
-    return HSModel([H_val], [S_val],
-                   V_coeffs=V_coeffs, ideal_gas=ideal_gas,
-                   R_gas=R_gas, P_ref=P_ref)
+    V_coeffs = _read_v_coeffs(energy_el)
+    if energy_el.get('model') == 'point':
+        H_coeffs = [float(
+            energy_el.find('H').text.strip())]
+        S_coeffs = [float(
+            energy_el.find('S').text.strip())]
+    else:
+        H_el = energy_el.find('H')
+        S_el = energy_el.find('S')
+        H_coeffs = _read_x_coeffs_from_attrs(H_el)
+        S_coeffs = _read_x_coeffs_from_attrs(S_el)
+    return H_coeffs, S_coeffs, V_coeffs
 
 
-# ---------------------------------------------------------------------------
-# Polynomial form parser
-# ---------------------------------------------------------------------------
+def _extract_poly_coeffs(energy_el):
+    """Extract polynomial coefficient table from a poly-form energy block.
 
-def _parse_poly_energy(energy_el, V_coeffs, ideal_gas, R_gas, P_ref):
-    """Parse a polynomial-form energy block (quadratic or point).
-
-    Reads all <xi> child elements and builds the coefficient table
-    t_poly_coeffs[i] = T-polynomial for the x^i term.
+    Reads all <xi> children and builds the T-polynomial table indexed by
+    x-power.  Returns (poly_coeffs, V_coeffs) — both plain lists ready
+    to store in PhaseSpec.model_params.
     """
     t_coeffs_by_x = {}
     for child in energy_el:
         tag = child.tag
-        if tag.startswith('x') and tag[1:].isdigit():
+        if (tag.startswith('x')
+                and tag[1:].isdigit()):
             i = int(tag[1:])
-            t_coeffs_by_x[i] = _read_t_coeffs_from_attrs(child)
-    if not t_coeffs_by_x:
-        return PolyModel([[0.0]],
-                         V_coeffs=V_coeffs, ideal_gas=ideal_gas,
-                         R_gas=R_gas, P_ref=P_ref)
-    max_order = max(t_coeffs_by_x.keys())
-    coeffs = [t_coeffs_by_x.get(i, [0.0]) for i in range(max_order + 1)]
-    return PolyModel(coeffs,
-                     V_coeffs=V_coeffs, ideal_gas=ideal_gas,
-                     R_gas=R_gas, P_ref=P_ref)
-
-
-# ---------------------------------------------------------------------------
-# Patch H computation (mirrors pde_builder.compute_{left,right}_patch_H but
-# operates on plain coefficient lists to avoid a circular import).
-# ---------------------------------------------------------------------------
-
-def _compute_left_patch_H(H, S, H_t, S_t, xmin, x_cut, T):
-    """Return [q0, q1, q2] for the left patch quadratic at reference T."""
-    import numpy as np
-    pv   = np.polynomial.polynomial.polyval
-    pd_d = np.polynomial.polynomial.polyder
-    H    = np.asarray(H);  S  = np.asarray(S)
-    H_t  = np.asarray(H_t); S_t = np.asarray(S_t)
-    H_val        = float(pv(x_cut, H))
-    dH_at_cut    = float(pv(x_cut, pd_d(H)))   if len(H)   > 1 else 0.0
-    dH_t_at_xmin = float(pv(xmin,  pd_d(H_t))) if len(H_t) > 1 else 0.0
-    dS_at_xmin   = float(pv(xmin,  pd_d(S)))   if len(S)   > 1 else 0.0
-    dS_t_at_xmin = float(pv(xmin,  pd_d(S_t))) if len(S_t) > 1 else 0.0
-    slope_target = dH_t_at_xmin + float(T) * (dS_at_xmin - dS_t_at_xmin)
-    dx = x_cut - xmin
-    if abs(dx) < 1e-10:
-        h = list(H)
-        return (h + [0.0] * max(0, 3 - len(h)))[:3]
-    q2 = (dH_at_cut - slope_target) / (2.0 * dx)
-    q1 = slope_target - 2.0 * q2 * xmin
-    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
-    return [q0, q1, q2]
-
-
-def _compute_right_patch_H(H, S, H_t, S_t, xmax, x_cut, T):
-    """Return [q0, q1, q2] for the right patch quadratic at reference T."""
-    import numpy as np
-    pv   = np.polynomial.polynomial.polyval
-    pd_d = np.polynomial.polynomial.polyder
-    H    = np.asarray(H);  S  = np.asarray(S)
-    H_t  = np.asarray(H_t); S_t = np.asarray(S_t)
-    H_val        = float(pv(x_cut, H))
-    dH_at_cut    = float(pv(x_cut, pd_d(H)))   if len(H)   > 1 else 0.0
-    dH_t_at_xmax = float(pv(xmax,  pd_d(H_t))) if len(H_t) > 1 else 0.0
-    dS_at_xmax   = float(pv(xmax,  pd_d(S)))   if len(S)   > 1 else 0.0
-    dS_t_at_xmax = float(pv(xmax,  pd_d(S_t))) if len(S_t) > 1 else 0.0
-    slope_target = dH_t_at_xmax + float(T) * (dS_at_xmax - dS_t_at_xmax)
-    dx = xmax - x_cut
-    if abs(dx) < 1e-10:
-        h = list(H)
-        return (h + [0.0] * max(0, 3 - len(h)))[:3]
-    q2 = (slope_target - dH_at_cut) / (2.0 * dx)
-    q1 = dH_at_cut - 2.0 * q2 * x_cut
-    q0 = H_val - q1 * x_cut - q2 * x_cut ** 2
-    return [q0, q1, q2]
-
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
-
-def _parse_energy(energy_el, energy_form, ideal_gas, R_gas, P_ref):
-    """Create and return the appropriate EnergyModel from an <energy> element."""
-    model = energy_el.get('model')
+            t_coeffs_by_x[i] = (
+                _read_t_coeffs_from_attrs(child))
     V_coeffs = _read_v_coeffs(energy_el)
-    if energy_form == 'HS':
-        if model == 'point':
-            return _parse_hs_point(energy_el, V_coeffs, ideal_gas, R_gas, P_ref)
-        return _parse_hs_quadratic(energy_el, V_coeffs, ideal_gas, R_gas, P_ref)
-    else:
-        return _parse_poly_energy(energy_el, V_coeffs, ideal_gas, R_gas, P_ref)
+    if not t_coeffs_by_x:
+        return [[0.0]], V_coeffs
+    max_order = max(t_coeffs_by_x.keys())
+    poly_coeffs = [
+        t_coeffs_by_x.get(i, [0.0])
+        for i in range(max_order + 1)]
+    return poly_coeffs, V_coeffs
 
 
 # ---------------------------------------------------------------------------
-# Phase parser
+# Phase spec parser
 # ---------------------------------------------------------------------------
 
-def _parse_phase(phase_el, energy_form, R_gas, P_ref):
-    """Create a Phase from a <phase> element.
+def _parse_phase_spec(phase_el, energy_form):
+    """Parse a <phase> element into a PhaseSpec.
 
-    Returns a Phase object for normal phases, or a dict (VLE sentinel) when
-    the phase element contains a <vle> element instead of <energy>.  The
-    caller (parse_system) handles VLE phases in a second pass.
+    Always returns a PhaseSpec — no sentinel dicts, no model objects.
+    Cross-phase references (VLE liquid_phase) are left blank here and
+    filled in by parse_system() after all phases have been parsed.
     """
     name = phase_el.get('name')
     phase_type = phase_el.get('type')
-    ideal_gas = phase_el.get('ideal_gas', 'false').lower() == 'true'
+    ideal_gas = (phase_el.get('ideal_gas', 'false')
+                 .lower() == 'true')
 
     cr_el = phase_el.find('composition_range')
     if cr_el is not None:
@@ -256,43 +184,92 @@ def _parse_phase(phase_el, energy_form, R_gas, P_ref):
     else:
         xmin, xmax = 0.0, 1.0
 
-    # Check for VLE reparameterisation (<vle> element instead of <energy>).
+    # -- VLE gas (no <energy> block; derives H/S from liquid at build time)
     vle_el = phase_el.find('vle')
     if vle_el is not None:
-        return {
-            '_vle_sentinel': True,
-            'name':       name,
-            'phase_type': phase_type,
-            'ideal_gas':  ideal_gas,
-            'xmin':       xmin,
-            'xmax':       xmax,
-            'T_bp_A': float(vle_el.get('T_bp_A')),
-            'T_bp_B': float(vle_el.get('T_bp_B')),
-            'L_A':    float(vle_el.get('L_A')),
-            'L_B':    float(vle_el.get('L_B')),
-        }
+        return PhaseSpec(
+            name=name,
+            phase_type=phase_type,
+            xmin=xmin, xmax=xmax,
+            model_type='HS',
+            model_params={
+                'ideal_gas': ideal_gas,
+                'vle_params': {
+                    'liquid_phase':
+                        vle_el.get(
+                            'liquid_phase', ''),
+                    'T_bp_A': float(
+                        vle_el.get('T_bp_A')),
+                    'T_bp_B': float(
+                        vle_el.get('T_bp_B')),
+                    'L_A': float(
+                        vle_el.get('L_A')),
+                    'L_B': float(
+                        vle_el.get('L_B')),
+                },
+            })
 
+    # -- Normal energy block → extract coefficients
     energy_el = phase_el.find('energy')
-    model = _parse_energy(energy_el, energy_form, ideal_gas, R_gas, P_ref)
 
-    patch_left_el  = phase_el.find('patch_left')
-    patch_right_el = phase_el.find('patch_right')
-    if patch_left_el is not None or patch_right_el is not None:
-        return {
-            '_patch_sentinel': True,
-            'name':       name,
-            'phase_type': phase_type,
-            'xmin':       xmin,
-            'xmax':       xmax,
-            'energy_model': model,
-            'patch_left_x_cut':  float(patch_left_el.get('x_cut'))  if patch_left_el  is not None else None,
-            'patch_left_phase':  patch_left_el.get('phase',  '')     if patch_left_el  is not None else '',
-            'patch_right_x_cut': float(patch_right_el.get('x_cut')) if patch_right_el is not None else None,
-            'patch_right_phase': patch_right_el.get('phase', '')     if patch_right_el is not None else '',
+    if energy_form == 'HS':
+        H_coeffs, S_coeffs, V_coeffs = (
+            _extract_hs_coeffs(energy_el))
+        model_params = {
+            'H_coeffs': H_coeffs,
+            'S_coeffs': S_coeffs,
+            'V_coeffs': V_coeffs,
+            'ideal_gas': ideal_gas,
         }
+        # Check for patch elements (HS form only).
+        patch_left_el = phase_el.find('patch_left')
+        patch_right_el = phase_el.find(
+            'patch_right')
+        if (patch_left_el is not None
+                or patch_right_el is not None):
+            model_params['patch_left_phase'] = (
+                patch_left_el.get('phase', '')
+                if patch_left_el is not None
+                else None)
+            model_params['patch_left_x'] = (
+                float(patch_left_el.get('x_cut'))
+                if patch_left_el is not None
+                else None)
+            model_params['patch_right_phase'] = (
+                patch_right_el.get('phase', '')
+                if patch_right_el is not None
+                else None)
+            model_params['patch_right_x'] = (
+                float(patch_right_el.get('x_cut'))
+                if patch_right_el is not None
+                else None)
+            return PhaseSpec(
+                name=name,
+                phase_type=phase_type,
+                xmin=xmin, xmax=xmax,
+                model_type='piecewise_patch',
+                model_params=model_params)
 
-    return Phase(name=name, phase_type=phase_type, energy_model=model,
-                 xmin=xmin, xmax=xmax)
+        return PhaseSpec(
+            name=name,
+            phase_type=phase_type,
+            xmin=xmin, xmax=xmax,
+            model_type='HS',
+            model_params=model_params)
+
+    # -- Polynomial energy form
+    poly_coeffs, V_coeffs = (
+        _extract_poly_coeffs(energy_el))
+    return PhaseSpec(
+        name=name,
+        phase_type=phase_type,
+        xmin=xmin, xmax=xmax,
+        model_type='polynomial',
+        model_params={
+            'poly_coeffs': poly_coeffs,
+            'V_coeffs': V_coeffs,
+            'ideal_gas': ideal_gas,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -300,167 +277,88 @@ def _parse_phase(phase_el, energy_form, R_gas, P_ref):
 # ---------------------------------------------------------------------------
 
 def parse_system(infile):
-    """Parse *infile* (path to an XML input file) and return a System object.
+    """Parse *infile* and return a System.
 
-    Accepts two XML schemas:
+    Internally constructs a SystemSpec from the XML, then calls
+    spec.to_system() which handles all dependency resolution (VLE,
+    patches) via topological sort.
 
-    New schema — a single <fields> block:
-        <fields>
-          <field name="temperature" symbol="T" unit="K"
-                 min="250" max="500" initial="400"/>
-          <field name="pressure" symbol="P" unit="atm"
-                 min="0.5" max="5.0" initial="1.0"
-                 R_gas="8.314e-3" P_ref="1.0"/>
-        </fields>
-
-    Legacy schema (all existing demo files) — separate <temperature> and
-    optional <pressure> blocks.  Both schemas produce identical System objects.
+    Accepts two field schemas (new <fields> block or legacy separate
+    <temperature>/<pressure> blocks) — both produce identical results.
     """
     tree = etree.parse(infile)
     root = tree.getroot()
 
-    # System block
+    # -- System metadata ---------------------------------------------------
     sys_el = root.find('system')
-    components = sys_el.find('components').text.strip().split()
-    energy_form = sys_el.find('energy_form').text.strip()
+    components = (
+        sys_el.find('components')
+        .text.strip().split())
+    energy_form = (
+        sys_el.find('energy_form')
+        .text.strip())
 
-    # Title (optional <title> element; fall back to stripped filename)
+    # -- Title (optional; fall back to filename) ---------------------------
     title_el = root.find('title')
     if title_el is not None and title_el.text:
         title = title_el.text.strip()
     else:
-        name = pathlib.Path(infile).name
+        fname = pathlib.Path(infile).name
         for ext in ('.xml', '.in'):
-            if name.endswith(ext):
-                name = name[:-len(ext)]
-        title = name
+            if fname.endswith(ext):
+                fname = fname[:-len(ext)]
+        title = fname
 
-    # ------------------------------------------------------------------
-    # Field parsing — new <fields> schema or legacy <temperature>/<pressure>
-    # ------------------------------------------------------------------
+    # -- Fields ------------------------------------------------------------
     fields_el = root.find('fields')
     if fields_el is not None:
-        fields, R_gas, P_ref = _parse_fields_block(fields_el)
+        field_specs = _parse_field_specs_block(
+            fields_el)
     else:
-        fields, R_gas, P_ref = _parse_legacy_fields(root)
+        field_specs = _parse_legacy_field_specs(
+            root)
 
-    # Phases — two-pass to resolve VLE gas phases against the liquid baseline.
-    raw = [_parse_phase(ph_el, energy_form, R_gas, P_ref)
-           for ph_el in root.findall('phase')]
+    # -- Phases ------------------------------------------------------------
+    phase_specs = [
+        _parse_phase_spec(ph_el, energy_form)
+        for ph_el in root.findall('phase')]
 
-    # First pass: collect normal phases; find liquid baseline H/S.
-    phases = []
-    liq_H = [0.0]
-    liq_S = [0.0]
-    liq_found = False
-    pending_vle = []
-    pending_patches = []
+    # Post-process: fill in VLE liquid_phase references.  The XML does not
+    # name the liquid explicitly; the convention is "first liquid phase
+    # in declaration order".
+    liquid_name = ''
+    for ps in phase_specs:
+        if ps.phase_type == 'liquid':
+            liquid_name = ps.name
+            break
+    for ps in phase_specs:
+        vle = ps.model_params.get('vle_params')
+        if vle is not None and not vle.get(
+                'liquid_phase'):
+            vle['liquid_phase'] = liquid_name
 
-    for item in raw:
-        if isinstance(item, dict) and item.get('_vle_sentinel'):
-            pending_vle.append(item)
-        elif isinstance(item, dict) and item.get('_patch_sentinel'):
-            # Add as a plain phase first (base HSModel); upgrade in third pass.
-            base_phase = Phase(name=item['name'], phase_type=item['phase_type'],
-                               energy_model=item['energy_model'],
-                               xmin=item['xmin'], xmax=item['xmax'])
-            phases.append(base_phase)
-            pending_patches.append(item)
-            if (not liq_found
-                    and item['phase_type'] == 'liquid'
-                    and isinstance(item['energy_model'], HSModel)):
-                liq_H = item['energy_model'].H_coeffs.tolist()
-                liq_S = item['energy_model'].S_coeffs.tolist()
-                liq_found = True
-        else:
-            phases.append(item)
-            if (not liq_found
-                    and item.phase_type == 'liquid'
-                    and isinstance(item.energy_model, HSModel)):
-                liq_H = item.energy_model.H_coeffs.tolist()
-                liq_S = item.energy_model.S_coeffs.tolist()
-                liq_found = True
-
-    # Second pass: build VLE gas phases.
-    for vp in pending_vle:
-        H_gas, S_gas = compute_vle_gas_hs(
-            liq_H, liq_S,
-            vp['T_bp_A'], vp['T_bp_B'],
-            vp['L_A'],    vp['L_B'],
-        )
-        model = HSModel(H_gas, S_gas,
-                        ideal_gas=vp['ideal_gas'],
-                        R_gas=R_gas, P_ref=P_ref)
-        model.vle_params = {
-            'T_bp_A': vp['T_bp_A'], 'T_bp_B': vp['T_bp_B'],
-            'L_A':    vp['L_A'],    'L_B':    vp['L_B'],
-        }
-        phases.append(Phase(
-            name=vp['name'],
-            phase_type=vp['phase_type'],
-            energy_model=model,
-            xmin=vp['xmin'],
-            xmax=vp['xmax'],
-        ))
-
-    # Third pass: upgrade patched phases to PiecewisePatchModel.
-    if pending_patches:
-        T_ref = fields[0].initial_val if fields else 0.0
-        phase_by_name = {p.name: p for p in phases}
-        for pp in pending_patches:
-            base_model = pp['energy_model']
-            H_orig    = base_model.H_coeffs.tolist()
-            S_coeffs  = base_model.S_coeffs.tolist()
-            H_left    = None
-            x_cut_left        = pp['patch_left_x_cut']
-            patch_left_phase  = pp['patch_left_phase']
-            H_right   = None
-            x_cut_right       = pp['patch_right_x_cut']
-            patch_right_phase = pp['patch_right_phase']
-            if x_cut_left is not None and patch_left_phase:
-                tgt = phase_by_name.get(patch_left_phase)
-                if tgt is not None and isinstance(tgt.energy_model, HSModel):
-                    tm = tgt.energy_model
-                    H_left = _compute_left_patch_H(
-                        H_orig, S_coeffs,
-                        tm.H_coeffs.tolist(), tm.S_coeffs.tolist(),
-                        pp['xmin'], x_cut_left, T_ref)
-            if x_cut_right is not None and patch_right_phase:
-                tgt = phase_by_name.get(patch_right_phase)
-                if tgt is not None and isinstance(tgt.energy_model, HSModel):
-                    tm = tgt.energy_model
-                    H_right = _compute_right_patch_H(
-                        H_orig, S_coeffs,
-                        tm.H_coeffs.tolist(), tm.S_coeffs.tolist(),
-                        pp['xmax'], x_cut_right, T_ref)
-            patch_model = PiecewisePatchModel(
-                H_orig, S_coeffs,
-                H_left=H_left, x_cut_left=x_cut_left,
-                H_right=H_right, x_cut_right=x_cut_right,
-                V_coeffs=(base_model.V_coeffs.tolist()
-                          if base_model.V_coeffs is not None else None),
-                ideal_gas=base_model.ideal_gas,
-                R_gas=base_model.R_gas,
-                P_ref=base_model.P_ref,
-            )
-            patch_model.patch_left_phase_name  = patch_left_phase  or ''
-            patch_model.patch_right_phase_name = patch_right_phase or ''
-            phase_by_name[pp['name']].energy_model = patch_model
-
-    return System(
-        components=components,
-        phases=phases,
-        energy_form=energy_form,
-        fields=fields,
+    # -- Assemble spec and build -------------------------------------------
+    spec = SystemSpec(
         title=title,
+        components=components,
+        energy_form=energy_form,
+        fields=field_specs,
+        phases=phase_specs,
     )
+    return spec.to_system()
 
 
-def _parse_fields_block(fields_el):
-    """Parse a <fields> element and return (list[Field], R_gas, P_ref)."""
-    fields = []
-    R_gas = 0.0
-    P_ref = 1.0
+# ---------------------------------------------------------------------------
+# Field spec parsers
+# ---------------------------------------------------------------------------
+
+def _parse_field_specs_block(fields_el):
+    """Parse a <fields> element into a list of FieldSpec objects.
+
+    R_gas and P_ref are stored in the pressure FieldSpec's extras dict
+    (consumed by make_energy_model at build time).
+    """
+    field_specs = []
     for f_el in fields_el.findall('field'):
         name = f_el.get('name')
         symbol = f_el.get('symbol', name)
@@ -468,45 +366,63 @@ def _parse_fields_block(fields_el):
         min_val = float(f_el.get('min'))
         max_val = float(f_el.get('max'))
         initial_val = float(f_el.get('initial'))
-        fields.append(Field(name=name, symbol=symbol, unit=unit,
-                            min_val=min_val, max_val=max_val,
-                            initial_val=initial_val))
-        # R_gas and P_ref are stored on the pressure field element
-        # (Phase 1 transitional convention; will move to CouplingTerm in Phase 2)
+        extras = {}
         if name == 'pressure':
             if f_el.get('R_gas') is not None:
-                R_gas = float(f_el.get('R_gas'))
+                extras['R_gas'] = float(
+                    f_el.get('R_gas'))
             if f_el.get('P_ref') is not None:
-                P_ref = float(f_el.get('P_ref'))
-    return fields, R_gas, P_ref
+                extras['P_ref'] = float(
+                    f_el.get('P_ref'))
+        field_specs.append(FieldSpec(
+            name=name, symbol=symbol,
+            unit=unit, min_val=min_val,
+            max_val=max_val,
+            initial_val=initial_val,
+            extras=extras))
+    return field_specs
 
 
-def _parse_legacy_fields(root):
+def _parse_legacy_field_specs(root):
     """Parse legacy <temperature> and optional <pressure> blocks.
 
-    Returns (list[Field], R_gas, P_ref) — same shape as _parse_fields_block.
+    Returns a list of FieldSpec objects — same shape as
+    _parse_field_specs_block.
     """
     temp_el = root.find('temperature')
     T_min = float(temp_el.find('min').text)
     T_max = float(temp_el.find('max').text)
-    T_initial = float(temp_el.find('initial').text)
-    t_field = Field(name='temperature', symbol='T', unit='K',
-                    min_val=T_min, max_val=T_max, initial_val=T_initial)
+    T_initial = float(
+        temp_el.find('initial').text)
+    t_spec = FieldSpec(
+        name='temperature', symbol='T',
+        unit='K', min_val=T_min,
+        max_val=T_max,
+        initial_val=T_initial)
 
     pres_el = root.find('pressure')
     if pres_el is None:
-        return [t_field], 0.0, 1.0
+        return [t_spec]
 
     P_min = float(pres_el.find('min').text)
     P_max = float(pres_el.find('max').text)
-    P_initial = float(pres_el.find('initial').text)
+    P_initial = float(
+        pres_el.find('initial').text)
     R_gas_el = pres_el.find('R_gas')
-    R_gas = float(R_gas_el.text) if R_gas_el is not None else 0.0
     P_ref_el = pres_el.find('P_ref')
-    P_ref = float(P_ref_el.text) if P_ref_el is not None else 1.0
     unit_el = pres_el.find('unit')
-    P_unit = unit_el.text.strip() if unit_el is not None else ''
+    extras = {}
+    if R_gas_el is not None:
+        extras['R_gas'] = float(R_gas_el.text)
+    if P_ref_el is not None:
+        extras['P_ref'] = float(P_ref_el.text)
+    P_unit = (unit_el.text.strip()
+              if unit_el is not None else '')
 
-    p_field = Field(name='pressure', symbol='P', unit=P_unit,
-                    min_val=P_min, max_val=P_max, initial_val=P_initial)
-    return [t_field, p_field], R_gas, P_ref
+    p_spec = FieldSpec(
+        name='pressure', symbol='P',
+        unit=P_unit, min_val=P_min,
+        max_val=P_max,
+        initial_val=P_initial,
+        extras=extras)
+    return [t_spec, p_spec]
