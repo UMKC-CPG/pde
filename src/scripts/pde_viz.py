@@ -141,34 +141,28 @@ def _compute_ylim(precomputed):
     return (all_G.min() - margin, all_G.max() + margin)
 
 
-def _extract_field_values(precomputed, field):
-    """Extract the primary field values from a list of EqResult as a numpy array."""
-    if field.name == 'temperature':
-        return np.array([r.T for r in precomputed])
-    elif field.name == 'pressure':
-        return np.array([r.P for r in precomputed])
-    return np.array([r.T for r in precomputed])  # fallback for future fields
 
+def _G_from_phase_spec(spec, x, T, P=0.0,
+                       R_gas=0.0, P_ref=1.0):
+    """Evaluate G(x, T[, P]) from a PhaseSpec (HS form).
 
-def _G_from_phase_data(pd, x, T, P=0.0, R_gas=0.0, P_ref=1.0):
-    """Evaluate G(x, T[, P]) directly from a PhaseData object.
+    Lightweight evaluator used during interactive
+    editing.  Mirrors HSModel.gibbs():
+        G = H(x) − T·S(x) [+ P·V(x)] [+ R·T·ln(P/P₀)]
 
-    Mirrors HSModel.gibbs():
-        G = H(x) − T·S(x)  [+ P·V(x)]  [+ R·T·ln(P/P₀)]
-
-    Uses the same ascending-order coefficient convention as HSModel.
-    x may be a scalar or a numpy array.  Only HS form is supported; returns
-    zeros for any other form (callers should guard with energy_form check).
-    All pressure-related parameters default to 0/0/1 so that callers without
-    pressure support remain backward-compatible and produce the same result.
+    *x* may be scalar or numpy array.  Only HS-form
+    specs are supported; polynomial phases should not
+    reach this path (guarded by the caller).
     """
-    H_coeffs = pd.hs_H if pd.hs_H else [0.0]
-    S_coeffs = pd.hs_S if pd.hs_S else [0.0]
-    G = (np.polynomial.polynomial.polyval(x, H_coeffs)
-         - T * np.polynomial.polynomial.polyval(x, S_coeffs))
-    if pd.hs_V and P != 0.0:
-        G = G + P * np.polynomial.polynomial.polyval(x, pd.hs_V)
-    if pd.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
+    H = spec.H_coeffs or [0.0]
+    S = spec.S_coeffs or [0.0]
+    pv = np.polynomial.polynomial.polyval
+    G = pv(x, H) - T * pv(x, S)
+    V = spec.V_coeffs
+    if V and P != 0.0:
+        G = G + P * pv(x, V)
+    if (spec.ideal_gas and R_gas != 0.0
+            and P > 0.0 and P_ref > 0.0):
         G = G + R_gas * T * np.log(P / P_ref)
     return G
 
@@ -182,16 +176,15 @@ class _DragState:
     """All state for one in-progress G(x) handle drag.
 
     Fields are sized for future extension:
-      snapshot  — PhaseData copy before the drag → enables Ctrl+Z undo (Phase 5)
-      T_ref     — temperature at drag start → two-temperature H+S solve (Phase 8)
-      P_ref     — pressure at drag start    → Phase 8 extension
-      handle_idx — which of the 3 handles is being dragged;
-                   −1 is reserved for whole-curve drag (Interaction B, future)
+      snapshot  — PhaseSpec copy before drag (Ctrl+Z)
+      T_ref     — temperature at drag start
+      P_ref     — pressure at drag start
+      handle_idx — which handle; −1 = rigid shift
     """
     phase_name:   str
     handle_idx:   int     # 0 = left endpoint, 1 = midpoint, 2 = right endpoint
     y_press_data: float   # data-y at button_press_event (drag reference origin)
-    snapshot:     object  # deep copy of PhaseData BEFORE the drag (for Phase 5 undo)
+    snapshot:     object  # deep copy of PhaseSpec before drag (for undo)
     T_ref:        float   # temperature when drag started (for Phase 8)
     P_ref:        float   # pressure when drag started (for Phase 8)
     x_press_data: float = 0.0   # data-x at press (Phase 3 horizontal reference)
@@ -213,7 +206,7 @@ class GxCanvas(FigureCanvasQTAgg):
     When set_edit_mode('handles') is called (by MainWindow when the builder
     opens), diamond drag handles appear on each HS-form G(x) curve.  Dragging
     a handle vertically fits H₀, H₁, H₂ via a 3-point quadratic solve and
-    emits phase_edited(phase_name, updated_PhaseData).  Dragging an endpoint
+    emits phase_edited(phase_name, updated_PhaseSpec).  Dragging an endpoint
     handle horizontally updates xmin or xmax and emits the same signal.
 
     Edit modes stored in _edit_mode
@@ -225,7 +218,7 @@ class GxCanvas(FigureCanvasQTAgg):
     'anchors' : future — anchor-point least-squares fitting (Interaction C)
     """
 
-    # Emitted on drag release: (phase_name: str, updated_data: PhaseData)
+    # Emitted on drag release: (phase_name, PhaseSpec)
     phase_edited = Signal(str, object)
 
     def __init__(self, system, y_lim=None, colors=None):
@@ -239,20 +232,15 @@ class GxCanvas(FigureCanvasQTAgg):
         self._last_result = None
 
         # ---- edit-mode state ----
-        # _edit_mode     : current mode string (see class docstring)
-        # _live_phase_data: dict[name, PhaseData] kept live by handle drags;
-        #                   G curves are recomputed from this dict in redraw()
-        #                   so edits persist across T-slider moves (hull will lag
-        #                   behind until the user clicks Apply in the builder)
-        # _phase_line_artists / _phase_orig_y / _phase_orig_x: matplotlib Line2D
-        #                   + its original y- and x-data, rebuilt each redraw()
-        #                   for use by _on_motion (rigid shift needs both axes)
-        # _handle_info   : {phase_name: [{'x':, 'G':, 'artist':}, ...]}
-        #                   rebuilt each redraw() from _live_phase_data
-        # _drag_state    : _DragState while a drag is in progress, else None
-        # _*_cid         : mpl event connection IDs (None when disconnected)
+        # _edit_mode : current mode string
+        # _live_phase_specs : dict[name, PhaseSpec]
+        #   kept live by handle drags; G curves are
+        #   recomputed from specs in redraw() so edits
+        #   persist across T-slider moves.
+        # _handle_info : per-phase handle metadata
+        # _drag_state  : _DragState or None
         self._edit_mode          = 'off'
-        self._live_phase_data    = None
+        self._live_phase_specs    = None
         self._phase_line_artists = {}
         self._phase_orig_y       = {}
         self._phase_orig_x       = {}
@@ -277,28 +265,35 @@ class GxCanvas(FigureCanvasQTAgg):
         for x, G, phase in result.phase_curves:
             c = self._colors[phase.name]
 
-            # In edit mode, replace G with values from _live_phase_data so the
+            # In edit mode, replace G with values from _live_phase_specs so the
             # displayed curves always reflect handle drags even across T-slider
             # moves.  The convex hull will lag behind until Apply is clicked
             # (acceptable Phase 2 limitation; fixed in Phase 4 via live recompute).
             G_plot = G
             if (self._edit_mode != 'off'
-                    and self._live_phase_data is not None
+                    and self._live_phase_specs is not None
                     and not phase.is_point
                     and self.system.energy_form == 'HS'):
-                pd = self._live_phase_data.get(phase.name)
-                # VLE gas phases: hs_H/hs_S are [0.0] placeholders in live_data;
-                # use the precomputed G from result.phase_curves instead.
-                if pd is not None and not pd.is_vle_gas:
-                    # For patched phases the precomputed G (from PiecewisePatchModel)
-                    # already reflects the piecewise shape; _G_from_phase_data only
-                    # knows the plain hs_H polynomial and would draw the wrong curve.
-                    has_patch = ((pd.patch_left  is not None and pd.patch_left_phase)
-                                 or (pd.patch_right is not None and pd.patch_right_phase))
+                ps = self._live_phase_specs.get(
+                    phase.name)
+                # VLE gas: H/S are derived from liquid;
+                # use precomputed G instead.
+                if (ps is not None
+                        and not ps.is_vle_gas):
+                    # Patched phases: precomputed G
+                    # already has the piecewise shape.
+                    has_patch = (
+                        (ps.patch_left_x is not None
+                         and ps.patch_left_phase)
+                        or (ps.patch_right_x
+                            is not None
+                            and ps.patch_right_phase))
                     if not has_patch:
-                        G_plot = _G_from_phase_data(
-                            pd, x, result.T, result.P,
-                            self.system.R_gas, self.system.P_ref)
+                        G_plot = _G_from_phase_spec(
+                            ps, x, result.T,
+                            result.P,
+                            self.system.R_gas,
+                            self.system.P_ref)
 
             if phase.is_point:
                 ax.plot(x, G_plot, 'o', color=c, markersize=9,
@@ -367,51 +362,50 @@ class GxCanvas(FigureCanvasQTAgg):
     # Interactive edit mode (Phases 2–4 — handle-drag framework)
     # ------------------------------------------------------------------
 
-    def set_edit_mode(self, mode: str, live_phase_data=None):
-        """Switch between display-only and interactive editing modes.
+    def set_edit_mode(self, mode: str,
+                      live_specs=None):
+        """Switch between display-only and interactive
+        editing modes.
 
         Parameters
         ----------
         mode : str
-            'off'     — normal display, no handles (default)
-            'handles' — 3 diamond handles per HS phase (Phases 3+4, current)
-            'direct'  — reserved for future Interaction B (direct curve grab)
-            'anchors' — reserved for future Interaction C (anchor-point fit)
-        live_phase_data : dict[str, PhaseData] or None
-            Initial live PhaseData per phase.  When None and switching into a
-            non-off mode, data is initialised from self.system automatically.
-            Passing live_phase_data explicitly lets the caller preserve edits
-            across reloads (e.g. after MainWindow.reload_system).
+            'off', 'handles', 'direct', 'anchors'
+        live_specs : dict[str, PhaseSpec] or None
+            Initial PhaseSpec dict.  When None and
+            entering a non-off mode, specs must have
+            been set by the caller (MainWindow always
+            provides them).
         """
-        if live_phase_data is not None:
-            self._live_phase_data = dict(live_phase_data)
+        if live_specs is not None:
+            self._live_phase_specs = dict(
+                live_specs)
 
         if mode == self._edit_mode:
-            # Same mode: refresh live data and redraw handles if supplied.
-            if live_phase_data is not None and self._last_result is not None:
+            if (live_specs is not None
+                    and self._last_result is not None):
                 self.redraw(self._last_result)
             return
 
-        self._edit_mode  = mode
+        self._edit_mode = mode
         self._drag_state = None
 
         if mode == 'off':
-            # Disconnect all event handlers.
-            for attr in ('_press_cid', '_move_cid', '_release_cid'):
+            for attr in ('_press_cid',
+                         '_move_cid',
+                         '_release_cid'):
                 cid = getattr(self, attr)
                 if cid is not None:
                     self.mpl_disconnect(cid)
                     setattr(self, attr, None)
-            self._live_phase_data = None
+            self._live_phase_specs = None
             if self._last_result is not None:
                 self.redraw(self._last_result)
             return
 
-        # Entering a non-off mode — initialise live data if not provided.
-        if self._live_phase_data is None:
-            from pde_builder import SystemData
-            sd = SystemData.from_system(self.system)
-            self._live_phase_data = {pd.name: pd for pd in sd.phases}
+        # Entering non-off mode.
+        if self._live_phase_specs is None:
+            self._live_phase_specs = {}
 
         # Connect event handlers (guard against double-connection).
         if self._press_cid is None:
@@ -429,7 +423,7 @@ class GxCanvas(FigureCanvasQTAgg):
         """Draw diamond handles for each editable HS phase (called from redraw).
 
         Three handles per phase at x = xmin, midpoint, xmax.  G values are
-        computed from _live_phase_data at result.T so they stay consistent
+        computed from _live_phase_specs at result.T so they stay consistent
         with the overridden G curves drawn earlier in redraw().
 
         Fills self._handle_info so that _on_press / _on_motion / _on_release
@@ -441,7 +435,7 @@ class GxCanvas(FigureCanvasQTAgg):
           'direct' — _draw_edit_overlay delegates to a separate overlay method.
           'anchors'— same; anchor positions are stored in a separate dict.
         """
-        if self._live_phase_data is None:
+        if self._live_phase_specs is None:
             return
         T = result.T
         P = result.P
@@ -459,7 +453,7 @@ class GxCanvas(FigureCanvasQTAgg):
             from pde_energy import PiecewisePatchModel as _PPM
             if isinstance(phase.energy_model, _PPM):
                 continue
-            pd = self._live_phase_data.get(phase.name)
+            pd = self._live_phase_specs.get(phase.name)
             if pd is None:
                 continue
             xmin = pd.xmin
@@ -469,7 +463,7 @@ class GxCanvas(FigureCanvasQTAgg):
             c = self._colors.get(phase.name, 'k')
             self._handle_info[phase.name] = []
             for hx in handle_xs:
-                G_val = float(_G_from_phase_data(pd, hx, T, P, R_gas, P_ref))
+                G_val = float(_G_from_phase_spec(pd, hx, T, P, R_gas, P_ref))
                 artist, = self.ax.plot(
                     hx, G_val, 'D',
                     color=c, markersize=10,
@@ -514,8 +508,8 @@ class GxCanvas(FigureCanvasQTAgg):
                     best_phase = phase_name
             if best_phase is None:
                 return
-            pd = (self._live_phase_data.get(best_phase)
-                  if self._live_phase_data else None)
+            pd = (self._live_phase_specs.get(best_phase)
+                  if self._live_phase_specs else None)
             # Freeze axes autoscaling for the duration of the drag so that
             # set_xdata() in _on_motion doesn't trigger a y-axis rescale
             # that makes curves disappear.  redraw() (called on release via
@@ -556,8 +550,8 @@ class GxCanvas(FigureCanvasQTAgg):
         if best_phase is None:
             return
 
-        pd = (self._live_phase_data.get(best_phase)
-              if self._live_phase_data else None)
+        pd = (self._live_phase_specs.get(best_phase)
+              if self._live_phase_specs else None)
         shift_held = bool(mods & Qt.ShiftModifier)
         self._drag_state = _DragState(
             phase_name   = best_phase,
@@ -609,8 +603,8 @@ class GxCanvas(FigureCanvasQTAgg):
                 ds.drag_axis = 'vertical'
 
         phase_name = ds.phase_name
-        pd = (self._live_phase_data.get(phase_name)
-              if self._live_phase_data else None)
+        pd = (self._live_phase_specs.get(phase_name)
+              if self._live_phase_specs else None)
         if pd is None:
             return
         line = self._phase_line_artists.get(phase_name)
@@ -651,11 +645,11 @@ class GxCanvas(FigureCanvasQTAgg):
             except Exception:
                 return
             xs = line.get_xdata()
-            line.set_ydata(_G_from_phase_data(new_pd, xs, T, P, R_gas, P_ref))
+            line.set_ydata(_G_from_phase_spec(new_pd, xs, T, P, R_gas, P_ref))
             # Update all 3 handle artists to their fitted G values.
             for info in info_list:
                 fitted_G = float(
-                    _G_from_phase_data(new_pd, info['x'], T, P, R_gas, P_ref))
+                    _G_from_phase_spec(new_pd, info['x'], T, P, R_gas, P_ref))
                 info['artist'].set_ydata([fitted_G])
 
         else:
@@ -668,27 +662,27 @@ class GxCanvas(FigureCanvasQTAgg):
                 new_xmin = pd.xmin
                 new_xmax = float(np.clip(new_x, pd.xmin + 0.02, 1.0))
             xs      = np.linspace(new_xmin, new_xmax, len(line.get_xdata()))
-            G_vals  = _G_from_phase_data(pd, xs, T, P, R_gas, P_ref)
+            G_vals  = _G_from_phase_spec(pd, xs, T, P, R_gas, P_ref)
             line.set_xdata(xs)
             line.set_ydata(G_vals)
             # Move dragged endpoint handle.
             dragged_x = new_xmin if ds.handle_idx == 0 else new_xmax
             dragged_G = float(
-                _G_from_phase_data(pd, dragged_x, T, P, R_gas, P_ref))
+                _G_from_phase_spec(pd, dragged_x, T, P, R_gas, P_ref))
             self._handle_info[phase_name][ds.handle_idx]['artist'].set_xdata(
                 [dragged_x])
             self._handle_info[phase_name][ds.handle_idx]['artist'].set_ydata(
                 [dragged_G])
             # Move midpoint handle.
             xmid  = 0.5 * (new_xmin + new_xmax)
-            G_mid = float(_G_from_phase_data(pd, xmid, T, P, R_gas, P_ref))
+            G_mid = float(_G_from_phase_spec(pd, xmid, T, P, R_gas, P_ref))
             self._handle_info[phase_name][1]['artist'].set_xdata([xmid])
             self._handle_info[phase_name][1]['artist'].set_ydata([G_mid])
 
         self.draw_idle()
 
     def _on_release(self, event):
-        """Finalise the drag: apply to PhaseData and emit phase_edited.
+        """Finalise the drag: apply to PhaseSpec and emit phase_edited.
 
         Routes to apply_xrange_drag (Phase 3 horizontal) or apply_handle_drag
         (Phase 4 vertical) depending on the drag axis determined during motion.
@@ -706,8 +700,8 @@ class GxCanvas(FigureCanvasQTAgg):
                 self.redraw(self._last_result)
             return
 
-        pd = (self._live_phase_data.get(ds.phase_name)
-              if self._live_phase_data else None)
+        pd = (self._live_phase_specs.get(ds.phase_name)
+              if self._live_phase_specs else None)
         if pd is None:
             return
 
@@ -770,8 +764,8 @@ class GxCanvas(FigureCanvasQTAgg):
                     self.redraw(self._last_result)
                 return
 
-        if self._live_phase_data is not None:
-            self._live_phase_data[ds.phase_name] = new_pd
+        if self._live_phase_specs is not None:
+            self._live_phase_specs[ds.phase_name] = new_pd
 
         # Notify the main window — it will update the builder spinboxes and
         # trigger a live equilibrium recompute to refresh the hull.
@@ -807,7 +801,7 @@ class SweepCanvas(FigureCanvasQTAgg):
         super().__init__(fig)
         self.ax = fig.add_subplot(111)
 
-        self._prim_values = _extract_field_values(precomputed, primary_field)
+        self._prim_values = np.array([r.field_values[primary_field.name] for r in precomputed])
         self._setup_axes()
         self._draw_full_diagram()
         self._add_cover_and_cursor(primary_field.initial_val)
@@ -877,7 +871,7 @@ class SweepCanvas(FigureCanvasQTAgg):
         if current_val is None:
             current_val = self.primary_field.initial_val
         self.precomputed = precomputed
-        self._prim_values = _extract_field_values(precomputed, self.primary_field)
+        self._prim_values = np.array([r.field_values[self.primary_field.name] for r in precomputed])
         self._lowest_val = current_val
         self.ax.cla()
         self._setup_axes()
@@ -936,25 +930,38 @@ class SweepCanvas(FigureCanvasQTAgg):
 # ---------------------------------------------------------------------------
 
 class FullGridWorker(QThread):
-    """Compute the full N_T_STEPS × N_P_STEPS grid in a background thread.
+    """Compute a full field0 × field1 grid in a
+    background thread.
 
-    Supports pause/resume via a threading.Event and clean abort via a flag.
+    Parameters
+    ----------
+    system    : System
+    field0    : Field — outer loop (rows)
+    f0_values : ndarray — values for field0
+    field1    : Field — inner loop (columns)
+    f1_values : ndarray — values for field1
+
+    Emits grid[i0][i1] of EqResult on finished.
+    Supports pause/resume and clean abort.
     """
 
-    progress = Signal(int, int)   # (n_done, n_total)
-    finished = Signal(object)     # grid: list[list[EqResult]]
+    progress = Signal(int, int)
+    finished = Signal(object)
 
-    def __init__(self, system, T_values, P_values):
+    def __init__(self, system, field0, f0_values,
+                 field1, f1_values):
         super().__init__()
-        self._system      = system
-        self._T_values    = T_values
-        self._P_values    = P_values
-        self._run_event   = threading.Event()
-        self._run_event.set()   # start in the running state
-        self._abort       = False
+        self._system = system
+        self._field0 = field0
+        self._field1 = field1
+        self._f0_values = f0_values
+        self._f1_values = f1_values
+        self._run_event = threading.Event()
+        self._run_event.set()
+        self._abort = False
 
     def pause(self):
-        """Block the worker at the next loop iteration."""
+        """Block at the next loop iteration."""
         self._run_event.clear()
 
     def resume(self):
@@ -962,23 +969,32 @@ class FullGridWorker(QThread):
         self._run_event.set()
 
     def abort(self):
-        """Ask the worker to stop; unblocks it if currently paused."""
+        """Ask the worker to stop."""
         self._abort = True
         self._run_event.set()
 
     def run(self):
-        n_total = len(self._T_values) * len(self._P_values)
+        n0 = len(self._f0_values)
+        n1 = len(self._f1_values)
+        n_total = n0 * n1
         done = 0
         grid = []
-        for T in self._T_values:        # outer: N_T_STEPS rows
+        f0_name = self._field0.name
+        f1_name = self._field1.name
+        for v0 in self._f0_values:
             row = []
-            for P in self._P_values:    # inner: N_P_STEPS cols
-                self._run_event.wait()  # blocks here while paused
+            for v1 in self._f1_values:
+                self._run_event.wait()
                 if self._abort:
                     return
-                row.append(compute_equilibrium(self._system, T, P))
+                fv = {f0_name: v0,
+                      f1_name: v1}
+                row.append(
+                    compute_equilibrium(
+                        self._system, fv))
                 done += 1
-                self.progress.emit(done, n_total)
+                self.progress.emit(
+                    done, n_total)
             grid.append(row)
         self.finished.emit(grid)
 
@@ -1141,13 +1157,16 @@ class ColorDialog(QDialog):
 
 class MainWindow(QMainWindow):
 
-    def __init__(self, system, precomputed_Tx, precomputed_Px=None):
+    def __init__(self, system, precomputed_Tx,
+                 precomputed_Px=None, spec=None):
         super().__init__()
-        self._builder      = None   # BuilderWindow (single instance, persists across reloads)
-        self._worker       = None
+        self._builder = None
+        self._worker = None
         self._worker_state = 'idle'
         self._color_dialog = None
-        self._init_system_state(system, precomputed_Tx, precomputed_Px)
+        self._system_spec = spec
+        self._init_system_state(
+            system, precomputed_Tx, precomputed_Px)
         self._build_central_widget()
 
     # ------------------------------------------------------------------
@@ -1169,13 +1188,13 @@ class MainWindow(QMainWindow):
         self._field_arr   = [None] * n_fields
 
         self._precomputed[0] = precomputed_Tx
-        self._field_arr[0]   = _extract_field_values(precomputed_Tx, system.fields[0])
+        self._field_arr[0]   = np.array([r.field_values[system.fields[0].name] for r in precomputed_Tx])
 
         if n_fields > 1:
             f1 = system.fields[1]
             if precomputed_Px is not None:
                 self._precomputed[1] = precomputed_Px
-                self._field_arr[1]   = _extract_field_values(precomputed_Px, f1)
+                self._field_arr[1]   = np.array([r.field_values[f1.name] for r in precomputed_Px])
             else:
                 # Placeholder until lazy computation.
                 self._field_arr[1] = np.linspace(f1.max_val, f1.min_val, self._n_steps)
@@ -1188,10 +1207,23 @@ class MainWindow(QMainWindow):
         self._worker_state = 'idle'
         self._viz3d_window = None
 
-        self._colors          = _color_map(system.phases)
-        self._two_phase_color = _TWO_PHASE_COLOR
-        self._two_phase_hatch = _TWO_PHASE_HATCH
-        self._color_dialog    = None
+        # Preserve user-chosen colors across reloads.
+        # Only assign fresh defaults for phases that
+        # were not present before (or on first init).
+        prev = getattr(self, '_colors', None)
+        if prev is None:
+            self._colors = _color_map(system.phases)
+        else:
+            fresh = _color_map(system.phases)
+            self._colors = {
+                p.name: prev.get(p.name,
+                                 fresh[p.name])
+                for p in system.phases}
+        if not hasattr(self, '_two_phase_color'):
+            self._two_phase_color = _TWO_PHASE_COLOR
+        if not hasattr(self, '_two_phase_hatch'):
+            self._two_phase_hatch = _TWO_PHASE_HATCH
+        self._color_dialog = None
 
     def _build_central_widget(self):
         """Build (or rebuild) all Qt widgets, canvases, layouts, signal connections.
@@ -1264,18 +1296,28 @@ class MainWindow(QMainWindow):
         self._precompute_status = None
         self._viz3d_btn         = None
         if len(system.fields) > 1:
-            self._precompute_btn = QPushButton('Pre-compute full T-P-x')
+            f0s = system.fields[0].symbol
+            f1s = system.fields[1].symbol
+            grid_label = (
+                f'{f0s}-{f1s}-x')
+            self._precompute_btn = QPushButton(
+                f'Pre-compute full {grid_label}')
             n_total = self._n_steps ** 2
             self._precompute_bar = QProgressBar()
-            self._precompute_bar.setRange(0, n_total)
+            self._precompute_bar.setRange(
+                0, n_total)
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(False)
             self._precompute_status = QLabel('')
-            self._viz3d_btn = QPushButton('3D View\u2026')
-            self._viz3d_btn.setEnabled(self._full_grid is not None)
+            self._viz3d_btn = QPushButton(
+                '3D View\u2026')
+            self._viz3d_btn.setEnabled(
+                self._full_grid is not None)
             self._viz3d_btn.setToolTip(
-                'Opens 3D T-P-x phase diagram.\n'
-                'Requires full grid \u2014 click \u201cPre-compute full T-P-x\u201d first.')
+                f'Opens 3D {grid_label} phase '
+                f'diagram.\nRequires full grid '
+                f'\u2014 click \u201cPre-compute '
+                f'full {grid_label}\u201d first.')
 
         # ---- Export button ----
         self._export_btn = QPushButton('Export\u2026')
@@ -1359,8 +1401,16 @@ class MainWindow(QMainWindow):
     # Builder integration
     # ------------------------------------------------------------------
 
-    def reload_system(self, system):
-        """Rebuild the entire UI for a new system (called by the builder on Apply)."""
+    def reload_system(self, system, spec=None):
+        """Rebuild the UI for a new system (called by
+        builder on Apply).
+
+        Parameters
+        ----------
+        system : System  — live runtime objects
+        spec   : SystemSpec or None — canonical spec;
+            stored for builder/edit-mode reuse.
+        """
         if self._worker is not None:
             self._worker.abort()
             self._worker.wait()
@@ -1369,69 +1419,95 @@ class MainWindow(QMainWindow):
         if self._viz3d_window is not None:
             self._viz3d_window.close()
             self._viz3d_window = None
-        print('Applying builder changes...', end=' ', flush=True)
-        # Use current secondary value if available, else use new system's initial.
+        if spec is not None:
+            self._system_spec = spec
+        print('Applying builder changes...',
+              end=' ', flush=True)
         fixed_vals = {}
         if len(system.fields) > 1:
             try:
-                fixed_vals = {f.name: self._current_val(i)
-                              for i, f in enumerate(self.system.fields)
-                              if i != 0
-                              if i < len(self._field_sliders)}
+                fixed_vals = {
+                    f.name: self._current_val(i)
+                    for i, f in enumerate(
+                        self.system.fields)
+                    if i != 0
+                    if i < len(self._field_sliders)}
             except (IndexError, AttributeError):
-                fixed_vals = {f.name: f.initial_val
-                              for f in system.fields[1:]}
-        precomputed_Tx = precompute_sweep_diagram(system, 0, fixed_vals)
+                fixed_vals = {
+                    f.name: f.initial_val
+                    for f in system.fields[1:]}
+        precomputed_Tx = precompute_sweep_diagram(
+            system, 0, fixed_vals)
         print('done.')
-        self._init_system_state(system, precomputed_Tx, None)
+        self._init_system_state(
+            system, precomputed_Tx, None)
         self._build_central_widget()
 
-        # Re-activate edit mode on fresh canvas if builder is still open (and not closing).
-        if (self._builder is not None and self._builder.isVisible()
-                and not getattr(self._builder, '_closing', False)):
-            from pde_builder import SystemData
-            sd = SystemData.from_system(system)
-            live_data = {pd.name: pd for pd in sd.phases}
-            self.gx_canvas.set_edit_mode('handles', live_data)
-            self.gx_canvas.phase_edited.connect(self._on_phase_edited)
+        # Re-activate edit mode if builder open.
+        if (self._builder is not None
+                and self._builder.isVisible()
+                and not getattr(
+                    self._builder,
+                    '_closing', False)):
+            live = {
+                ps.name: ps
+                for ps in self._system_spec.phases}
+            self.gx_canvas.set_edit_mode(
+                'handles', live)
+            self.gx_canvas.phase_edited.connect(
+                self._on_phase_edited)
 
     def _open_builder(self):
-        """Open (or raise) the builder window, pre-populated with the current system.
+        """Open (or raise) the builder window.
 
-        Also activates handle-drag edit mode on GxCanvas so the user can
-        directly manipulate G(x) curves while the builder is open.
+        Pre-populates with the current SystemSpec and
+        activates handle-drag edit mode on GxCanvas.
         """
-        if self._builder is None or not self._builder.isVisible():
-            from pde_builder import BuilderWindow, SystemData
-            self._builder = BuilderWindow(system=self.system)
-            self._builder.system_applied.connect(self.reload_system)
-            self._builder.patch_changed.connect(self._on_patch_changed)
-            self._builder.finished.connect(self._on_builder_closed)
+        if (self._builder is None
+                or not self._builder.isVisible()):
+            from pde_builder import BuilderWindow
+            self._builder = BuilderWindow(
+                spec=self._system_spec)
+            self._builder.system_applied.connect(
+                self.reload_system)
+            self._builder.patch_changed.connect(
+                self._on_patch_changed)
+            self._builder.finished.connect(
+                self._on_builder_closed)
 
-            # Activate edit mode on the canvas with fresh live data.
-            sd        = SystemData.from_system(self.system)
-            live_data = {pd.name: pd for pd in sd.phases}
-            self.gx_canvas.set_edit_mode('handles', live_data)
-
-            # Connect phase_edited → live spinbox update + equilibrium refresh.
-            self.gx_canvas.phase_edited.connect(self._on_phase_edited)
+            live = {
+                ps.name: ps
+                for ps in self._system_spec.phases}
+            self.gx_canvas.set_edit_mode(
+                'handles', live)
+            self.gx_canvas.phase_edited.connect(
+                self._on_phase_edited)
 
         self._builder.raise_()
         self._builder.show()
 
     def _on_3d_view_clicked(self):
-        """Open (or raise) the 3D T-P-x phase diagram window."""
+        """Open (or raise) the 3-D phase diagram."""
         if (self._viz3d_window is not None
                 and self._viz3d_window.isVisible()):
             self._viz3d_window.raise_()
             return
-        from pde_3d import PhaseDiagram3D, Viz3DWindow
-        f0, f1 = self.system.fields[0], self.system.fields[1]
-        T_arr = np.linspace(f0.max_val, f0.min_val, self._n_steps)
-        P_arr = np.linspace(f1.max_val, f1.min_val, self._n_steps)
+        from pde_3d import (
+            PhaseDiagram3D, Viz3DWindow)
+        f0 = self.system.fields[0]
+        f1 = self.system.fields[1]
+        f0_arr = np.linspace(
+            f0.max_val, f0.min_val,
+            self._n_steps)
+        f1_arr = np.linspace(
+            f1.max_val, f1.min_val,
+            self._n_steps)
         diagram = PhaseDiagram3D.from_grid(
-            self._full_grid, T_arr, P_arr, self.system)
-        self._viz3d_window = Viz3DWindow(diagram, colors=self._colors)
+            self._full_grid,
+            f0, f0_arr, f1, f1_arr,
+            self.system)
+        self._viz3d_window = Viz3DWindow(
+            diagram, colors=self._colors)
         self._viz3d_window.show()
 
     def _on_export_clicked(self):
@@ -1640,34 +1716,45 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
-    def _on_phase_edited(self, name, new_pd):
+    def _on_phase_edited(self, name, new_spec):
         """Live-update after a G(x) handle drag.
 
-        1. Pushes the new PhaseData into the builder's spinboxes so the two
-           UIs stay in sync.
-        2. Recomputes equilibrium with a temporary system that has the edited
-           phase, giving a correct hull at the current T and P without waiting
-           for the user to click Apply.
+        1. Pushes the new PhaseSpec into the builder
+           spinboxes so the two UIs stay in sync.
+        2. Recomputes equilibrium from the updated
+           SystemSpec so the hull is correct at the
+           current T and P.
 
-        The sweep canvases are NOT updated here — they remain valid for
-        the pre-Apply system and are refreshed only when Apply is clicked.
+        Sweep canvases are NOT updated — they remain
+        valid for the pre-Apply system.
         """
-        if self._builder is not None and self._builder.isVisible():
-            self._builder.update_phase_data(name, new_pd)
+        if (self._builder is not None
+                and self._builder.isVisible()):
+            self._builder.update_phase_spec(
+                name, new_spec)
 
-        from pde_builder import SystemData
-        sd = SystemData.from_system(self.system)
-        for i, pd in enumerate(sd.phases):
-            if pd.name == name:
-                sd.phases[i] = new_pd
+        # Update the live SystemSpec.
+        import copy
+        for i, ps in enumerate(
+                self._system_spec.phases):
+            if ps.name == name:
+                self._system_spec.phases[i] = (
+                    new_spec)
                 break
+
+        # Build a temporary system with current T.
+        build = copy.deepcopy(self._system_spec)
         t = self._current_val(0)
-        tmp_system = sd.to_system(current_T=t)
+        for fs in build.fields:
+            if fs.name == 'temperature':
+                fs.initial_val = t
+                break
+        tmp_system = build.to_system()
         fv = {f.name: self._current_val(i)
-              for i, f in enumerate(self.system.fields)}
-        result = compute_equilibrium(tmp_system,
-                                     fv.get('temperature', 0.0),
-                                     fv.get('pressure', 0.0))
+              for i, f in enumerate(
+                  self.system.fields)}
+        result = compute_equilibrium(
+            tmp_system, fv)
         self.gx_canvas.redraw(result)
 
 
@@ -1681,9 +1768,8 @@ class MainWindow(QMainWindow):
         fv = {f.name: self._current_val(i)
               for i, f in enumerate(self.system.fields)}
         try:
-            result = compute_equilibrium(patched_system,
-                                         fv.get('temperature', 0.0),
-                                         fv.get('pressure', 0.0))
+            result = compute_equilibrium(
+                patched_system, fv)
             self.gx_canvas.redraw(result)
         except Exception:
             pass
@@ -1710,10 +1796,10 @@ class MainWindow(QMainWindow):
             idx = int(np.argmin(np.abs(prim_arr - prim_val)))
             return self._precomputed[self._primary_idx][idx]
         fv = {f.name: self._current_val(i)
-              for i, f in enumerate(self.system.fields)}
-        return compute_equilibrium(self.system,
-                                   fv.get('temperature', 0.0),
-                                   fv.get('pressure', 0.0))
+              for i, f in enumerate(
+                  self.system.fields)}
+        return compute_equilibrium(
+            self.system, fv)
 
     # ------------------------------------------------------------------
     # Slots
@@ -1762,9 +1848,12 @@ class MainWindow(QMainWindow):
             return
 
         self._precomputed[prim_idx] = new_data
-        self._field_arr[prim_idx] = _extract_field_values(
-            new_data, self.system.fields[prim_idx])
-        self.gx_canvas._y_lim = _compute_ylim(new_data)
+        pf = self.system.fields[prim_idx]
+        self._field_arr[prim_idx] = np.array([
+            r.field_values[pf.name]
+            for r in new_data])
+        self.gx_canvas._y_lim = (
+            _compute_ylim(new_data))
         prim_val = self._current_val(prim_idx)
         sweep = self._sweep_canvases.get(prim_idx)
         if sweep is not None:
@@ -1797,7 +1886,9 @@ class MainWindow(QMainWindow):
             self.system, prim_idx, fixed_vals, n_steps=self._n_steps)
         print('done.')
         self._precomputed[prim_idx] = new_data
-        self._field_arr[prim_idx] = _extract_field_values(new_data, prim_field)
+        self._field_arr[prim_idx] = np.array([
+            r.field_values[prim_field.name]
+            for r in new_data])
         self.gx_canvas._y_lim = _compute_ylim(new_data)
         prim_val = self._current_val(prim_idx)
         sweep = self._sweep_canvases.get(prim_idx)
@@ -1833,8 +1924,10 @@ class MainWindow(QMainWindow):
                 self.system, new_primary_idx, fixed_vals, self._n_steps)
             print('done.')
             self._precomputed[new_primary_idx] = new_data
-            self._field_arr[new_primary_idx] = _extract_field_values(
-                new_data, prim_field)
+            self._field_arr[new_primary_idx] = (
+                np.array([
+                    r.field_values[prim_field.name]
+                    for r in new_data]))
             self.gx_canvas._y_lim = _compute_ylim(new_data)
 
         # Create SweepCanvas for new primary if not already existing.
@@ -1888,10 +1981,17 @@ class MainWindow(QMainWindow):
             self._precompute_bar.setValue(0)
             self._precompute_bar.setVisible(True)
             self._precompute_status.setText('Computing... 0%')
-            f0, f1 = self.system.fields[0], self.system.fields[1]
-            T_values = np.linspace(f0.max_val, f0.min_val, self._n_steps)
-            P_values = np.linspace(f1.max_val, f1.min_val, self._n_steps)
-            self._worker = FullGridWorker(self.system, T_values, P_values)
+            f0 = self.system.fields[0]
+            f1 = self.system.fields[1]
+            f0_vals = np.linspace(
+                f0.max_val, f0.min_val,
+                self._n_steps)
+            f1_vals = np.linspace(
+                f1.max_val, f1.min_val,
+                self._n_steps)
+            self._worker = FullGridWorker(
+                self.system, f0, f0_vals,
+                f1, f1_vals)
             self._worker.progress.connect(self._on_grid_progress)
             self._worker.finished.connect(self._on_grid_ready)
             self._worker.start()
@@ -1916,8 +2016,10 @@ class MainWindow(QMainWindow):
         self._worker_state = 'done'
         self._precompute_bar.setVisible(False)
         n_total = self._n_steps ** 2
-        self._precompute_status.setText(f'Cached ({n_total:,} evaluations)')
-        self._precompute_btn.setText('Full T-P-x cached')
+        self._precompute_status.setText(
+            f'Cached ({n_total:,} evaluations)')
+        self._precompute_btn.setText(
+            'Full grid cached')
         self._precompute_btn.setEnabled(False)
         if self._viz3d_btn is not None:
             self._viz3d_btn.setEnabled(True)
@@ -1963,8 +2065,10 @@ class MainWindow(QMainWindow):
                       if i != prim_idx}
         self._precomputed[prim_idx] = precompute_sweep_diagram(
             self.system, prim_idx, fixed_vals, n_steps=n_steps)
-        self._field_arr[prim_idx] = _extract_field_values(
-            self._precomputed[prim_idx], self.system.fields[prim_idx])
+        _pf = self.system.fields[prim_idx]
+        self._field_arr[prim_idx] = np.array([
+            r.field_values[_pf.name]
+            for r in self._precomputed[prim_idx]])
         self.gx_canvas._y_lim = _compute_ylim(self._precomputed[prim_idx])
 
         # Recompute already-computed secondary sweeps.
@@ -1976,8 +2080,10 @@ class MainWindow(QMainWindow):
                          for j, f in enumerate(self.system.fields) if j != i}
                 self._precomputed[i] = precompute_sweep_diagram(
                     self.system, i, fixed, n_steps=n_steps)
-                self._field_arr[i] = _extract_field_values(
-                    self._precomputed[i], self.system.fields[i])
+                _fi = self.system.fields[i]
+                self._field_arr[i] = np.array([
+                    r.field_values[_fi.name]
+                    for r in self._precomputed[i]])
             else:
                 f = self.system.fields[i]
                 self._field_arr[i] = np.linspace(f.max_val, f.min_val, n_steps)
@@ -2028,9 +2134,8 @@ def precompute_sweep_diagram(system, primary_field_idx, fixed_field_values,
     results = []
     for v in prim_values:
         fv[pf.name] = v
-        results.append(compute_equilibrium(system,
-                                           fv.get('temperature', 0.0),
-                                           fv.get('pressure', 0.0)))
+        results.append(
+            compute_equilibrium(system, fv))
     return results
 
 
@@ -2050,54 +2155,112 @@ def precompute_Px_diagram(system, T, n_steps=N_P_STEPS):
     return precompute_sweep_diagram(system, p_idx, {'temperature': T}, n_steps)
 
 
-def launch_ui(system):
-    """Pre-compute the phase diagram(s) and open the interactive window."""
-    if len(system.fields) > 1:
-        f0, f1 = system.fields[0], system.fields[1]
+def launch_ui(system, spec=None):
+    """Pre-compute the phase diagram(s) and open the
+    interactive window.
+
+    Parameters
+    ----------
+    system : System — runtime objects
+    spec   : SystemSpec or None — canonical spec for
+        the builder; when None the builder will not
+        have a spec until the user loads one.
+    """
+    # Ternary+ systems are not yet supported by
+    # the interactive visualisation (see TODO C-11).
+    # Show a diagnostic and exit gracefully.
+    if system.n_components > 2:
         print(
-            f'Pre-computing {f0.symbol}-x diagram at '
-            f'{f1.symbol} = {f1.initial_val:.3g}'
+            f'\nSystem has {system.n_components}'
+            f' components '
+            f'({", ".join(system.components)}).'
+            f'\nTernary+ interactive '
+            f'visualisation is not yet '
+            f'implemented (C-11).'
+            f'\nThe computation pipeline works'
+            f' — use the Python API:\n'
+            f'  from pde_input import '
+            f'parse_system\n'
+            f'  from pde_compute import '
+            f'compute_equilibrium\n'
+            f'  system = parse_system(infile)\n'
+            f'  eq = compute_equilibrium('
+            f'system, {{\"temperature\": T}})\n')
+        sys.exit(0)
+
+    if len(system.fields) > 1:
+        f0 = system.fields[0]
+        f1 = system.fields[1]
+        print(
+            f'Pre-computing {f0.symbol}-x diagram'
+            f' at {f1.symbol}'
+            f' = {f1.initial_val:.3g}'
             + (f' {f1.unit}' if f1.unit else '')
             + f' ({N_T_STEPS} evaluations)...',
             end=' ', flush=True)
         precomputed_Tx = precompute_sweep_diagram(
-            system, 0, {f1.name: f1.initial_val})
+            system, 0,
+            {f1.name: f1.initial_val})
         precomputed_Px = None
         print('done.')
     else:
-        print('Pre-computing phase diagram...', end=' ', flush=True)
-        precomputed_Tx = precompute_Tx_diagram(system)
+        print('Pre-computing phase diagram...',
+              end=' ', flush=True)
+        precomputed_Tx = precompute_Tx_diagram(
+            system)
         precomputed_Px = None
         print('done.')
 
-    app = QApplication.instance() or QApplication(sys.argv)
-    window = MainWindow(system, precomputed_Tx, precomputed_Px)
+    app = (QApplication.instance()
+           or QApplication(sys.argv))
+    window = MainWindow(
+        system, precomputed_Tx,
+        precomputed_Px, spec=spec)
     window.resize(1200, 650)
     window.show()
     sys.exit(app.exec())
 
 
 def _make_default_system():
-    """Return a minimal single-phase System for use when no input file is given."""
-    from pde_energy import HSModel
-    from pde_phase import Field, Phase, System
-    liq = Phase('liquid', 'liquid',
-                HSModel([8.0, -2.0, 2.0], [0.01]),
-                0.0, 1.0)
-    t_field = Field(name='temperature', symbol='T', unit='K',
-                    min_val=500, max_val=1500, initial_val=1500)
-    return System(['A', 'B'], [liq], 'HS', fields=[t_field], title='New System')
+    """Return (System, SystemSpec) for a minimal
+    single-phase system used when no input file is
+    given.
+    """
+    from pde_phase import (
+        FieldSpec, PhaseSpec, SystemSpec)
+    spec = SystemSpec(
+        title='New System',
+        components=['A', 'B'],
+        energy_form='HS',
+        fields=[FieldSpec(
+            name='temperature', symbol='T',
+            unit='K', min_val=500,
+            max_val=1500, initial_val=1500)],
+        phases=[PhaseSpec(
+            name='liquid', phase_type='liquid',
+            xmin=0.0, xmax=1.0,
+            model_type='HS',
+            model_params={
+                'H_coeffs': [8.0, -2.0, 2.0],
+                'S_coeffs': [0.01],
+            })])
+    return spec.to_system(), spec
 
 
 def launch_ui_empty():
-    """Launch with a minimal default system and open the builder automatically."""
-    system = _make_default_system()
-    print('Pre-computing default phase diagram...', end=' ', flush=True)
+    """Launch with a minimal default system and open
+    the builder automatically.
+    """
+    system, spec = _make_default_system()
+    print('Pre-computing default phase diagram...',
+          end=' ', flush=True)
     precomputed_Tx = precompute_Tx_diagram(system)
     print('done.')
-    app = QApplication.instance() or QApplication(sys.argv)
-    window = MainWindow(system, precomputed_Tx)
+    app = (QApplication.instance()
+           or QApplication(sys.argv))
+    window = MainWindow(
+        system, precomputed_Tx, spec=spec)
     window.resize(1200, 650)
     window.show()
-    window._open_builder()   # auto-open builder with default system
+    window._open_builder()
     sys.exit(app.exec())

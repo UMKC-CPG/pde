@@ -97,6 +97,16 @@ class PhaseSpec:
         patch_right_phase : str | None
         patch_right_x     : float | None
 
+    'calphad':
+        calphad_phase : str
+            Phase name in the TDB file (e.g.
+            'LIQUID', 'FCC_A1', 'HCP_A3').
+        components    : list[str]
+            Element names in PDE composition
+            order (e.g. ['AL', 'MG']).  Set
+            automatically by the parser from
+            the system-level <components>.
+
     Cross-phase references (liquid_phase,
     patch_left_phase, etc.) store phase *names*,
     resolved at build time by topological sort.
@@ -109,7 +119,8 @@ class PhaseSpec:
     xmin        : float — lower composition bound
     xmax        : float — upper composition bound
     model_type  : str   — 'HS'|'polynomial'|
-                          'piecewise_patch'
+                          'piecewise_patch'|
+                          'calphad'
     model_params: dict  — model-specific parameters
     """
     name:         str
@@ -119,29 +130,168 @@ class PhaseSpec:
     model_type:   str   = 'HS'
     model_params: dict  = field(default_factory=dict)
 
+    # ---------------------------------------------------------
+    # Convenience properties — permanent read/write API for
+    # the model_params dict.  Used by the builder UI, the
+    # fitting functions (apply_handle_drag, etc.), and the
+    # G(x) canvas edit overlay.
+    # ---------------------------------------------------------
+
+    @property
+    def H_coeffs(self):
+        """H(x) polynomial coefficients (HS/patch)."""
+        return self.model_params.get(
+            'H_coeffs', [0.0])
+
+    @H_coeffs.setter
+    def H_coeffs(self, value):
+        self.model_params['H_coeffs'] = value
+
+    @property
+    def S_coeffs(self):
+        """S(x) polynomial coefficients (HS/patch)."""
+        return self.model_params.get(
+            'S_coeffs', [0.0])
+
+    @S_coeffs.setter
+    def S_coeffs(self, value):
+        self.model_params['S_coeffs'] = value
+
+    @property
+    def V_coeffs(self):
+        """V(x) molar-volume coefficients, or None."""
+        return self.model_params.get('V_coeffs')
+
+    @V_coeffs.setter
+    def V_coeffs(self, value):
+        self.model_params['V_coeffs'] = value
+
+    @property
+    def ideal_gas(self):
+        """True when ideal-gas R*T*ln(P/P0) applies."""
+        return self.model_params.get(
+            'ideal_gas', False)
+
+    @ideal_gas.setter
+    def ideal_gas(self, value):
+        self.model_params['ideal_gas'] = value
+
+    @property
+    def poly_coeffs(self):
+        """Polynomial table [x_power][T_power]."""
+        return self.model_params.get(
+            'poly_coeffs', [[0.0]])
+
+    @poly_coeffs.setter
+    def poly_coeffs(self, value):
+        self.model_params['poly_coeffs'] = value
+
+    @property
+    def vle_params(self):
+        """VLE reparametrisation dict, or None."""
+        return self.model_params.get('vle_params')
+
+    @vle_params.setter
+    def vle_params(self, value):
+        if value is None:
+            self.model_params.pop(
+                'vle_params', None)
+        else:
+            self.model_params['vle_params'] = value
+
+    @property
+    def patch_left_x(self):
+        """Left-patch cut-off composition, or None."""
+        return self.model_params.get(
+            'patch_left_x')
+
+    @patch_left_x.setter
+    def patch_left_x(self, value):
+        self.model_params['patch_left_x'] = value
+
+    @property
+    def patch_right_x(self):
+        """Right-patch cut-off composition, or None."""
+        return self.model_params.get(
+            'patch_right_x')
+
+    @patch_right_x.setter
+    def patch_right_x(self, value):
+        self.model_params['patch_right_x'] = value
+
+    @property
+    def patch_left_phase(self):
+        """Left-patch target phase name, or ''."""
+        return self.model_params.get(
+            'patch_left_phase', '')
+
+    @patch_left_phase.setter
+    def patch_left_phase(self, value):
+        self.model_params['patch_left_phase'] = value
+
+    @property
+    def patch_right_phase(self):
+        """Right-patch target phase name, or ''."""
+        return self.model_params.get(
+            'patch_right_phase', '')
+
+    @patch_right_phase.setter
+    def patch_right_phase(self, value):
+        self.model_params[
+            'patch_right_phase'] = value
+
+    @property
+    def calphad_phase(self):
+        """TDB phase name (CALPHAD only)."""
+        return self.model_params.get(
+            'calphad_phase', '')
+
+    @calphad_phase.setter
+    def calphad_phase(self, value):
+        self.model_params[
+            'calphad_phase'] = value
+
+    @property
+    def is_vle_gas(self):
+        """True when this is a VLE-derived gas phase."""
+        return (self.phase_type == 'gas'
+                and self.vle_params is not None)
+
     def make_energy_model(self, specs_by_name,
-                          built, field_specs):
+                          built, field_specs,
+                          tdb_db=None):
         """Build the EnergyModel for this PhaseSpec.
 
-        Dispatches on model_type, constructing the appropriate EnergyModel
-        subclass.  Resolves cross-phase references (VLE liquid, patch
-        targets) via specs_by_name for coefficient data and built for
-        models already constructed during the topological sort.
+        Dispatches on model_type, constructing the
+        appropriate EnergyModel subclass.  Resolves
+        cross-phase references (VLE liquid, patch
+        targets) via specs_by_name for coefficient
+        data and built for models already constructed
+        during the topological sort.
 
         Parameters
         ----------
         specs_by_name : dict[str, PhaseSpec]
-            Every phase spec in the system, keyed by name.  Supplies
-            coefficient data from dependency phases (e.g. the liquid
-            phase providing H/S for VLE gas derivation).
+            Every phase spec in the system, keyed by
+            name.  Supplies coefficient data from
+            dependency phases (e.g. the liquid phase
+            providing H/S for VLE gas derivation).
         built : dict[str, EnergyModel]
-            Models already built during the topological walk.  Used by
-            piecewise-patch phases to obtain the target phase's H and S
-            coefficient arrays for patch slope matching.
+            Models already built during the topo walk.
+            Used by piecewise-patch phases to obtain
+            the target phase's H and S coefficient
+            arrays for patch slope matching.
         field_specs : list[FieldSpec]
-            System field specs.  Pressure-field extras supply R_gas and
-            P_ref; the temperature field's initial_val gives the reference
+            System field specs.  Pressure-field extras
+            supply R_gas and P_ref; the temperature
+            field's initial_val gives the reference
             temperature for patch-H computation.
+        tdb_db : pycalphad.Database or None
+            Pre-loaded TDB database for CALPHAD
+            systems.  Shared across all phases in
+            the system; loaded once by
+            SystemSpec.to_system().  None for
+            non-CALPHAD systems.
 
         Returns
         -------
@@ -150,7 +300,7 @@ class PhaseSpec:
         Raises
         ------
         ValueError
-            If model_type is not 'HS', 'polynomial', or 'piecewise_patch'.
+            If model_type is unrecognised.
         """
         # Local import avoids a module-level spec-to-energy dependency.
         from pde_energy import (
@@ -287,6 +437,19 @@ class PhaseSpec:
                 right_phase or '')
             return patch
 
+        # -- CALPHAD model (pycalphad TDB) --------
+        if self.model_type == 'calphad':
+            from pde_energy import CALPHADModel
+            if tdb_db is None:
+                raise ValueError(
+                    "CALPHAD model requires a "
+                    "loaded TDB database "
+                    "(tdb_db is None)")
+            return CALPHADModel(
+                tdb_db,
+                mp['calphad_phase'],
+                mp['components'])
+
         raise ValueError(
             f"Unknown model_type: "
             f"{self.model_type!r}")
@@ -375,25 +538,59 @@ class SystemSpec:
     ----------
     title       : str        — display title
     components  : list[str]  — component names
-    energy_form : str        — 'HS' or 'polynomial'
+    energy_form : str        — 'HS'|'polynomial'|
+                               'calphad'
     fields      : list[FieldSpec] — sweepable fields
     phases      : list[PhaseSpec] — phase specs
+    tdb_path    : str        — path to TDB file
+                               (CALPHAD only; '' when
+                               not applicable)
+    units       : dict       — declared unit system,
+                               e.g. {'energy': 'kJ/mol',
+                               'temperature': 'K',
+                               'pressure': 'atm'}.
+                               Human-readable record;
+                               used for R_gas validation
+                               at parse time.  Empty
+                               dict means unspecified.
     """
     title:       str
     components:  list
     energy_form: str
     fields:      list = field(default_factory=list)
     phases:      list = field(default_factory=list)
+    tdb_path:    str  = ''
+    units:       dict = field(default_factory=dict)
 
     def to_system(self):
         """Build a System from this SystemSpec.
 
-        Topologically sorts phases by cross-phase dependencies, builds
-        each phase's EnergyModel via make_energy_model(), then assembles
-        the runtime System.  Phase ordering in the result preserves the
-        spec's original declaration order (not the build order), keeping
-        UI legend and colour assignment stable.
+        Topologically sorts phases by cross-phase
+        dependencies, builds each phase's EnergyModel
+        via make_energy_model(), then assembles the
+        runtime System.  Phase ordering in the result
+        preserves the spec's original declaration
+        order (not the build order), keeping UI legend
+        and colour assignment stable.
+
+        For CALPHAD systems the TDB file is loaded
+        once here and the resulting Database object is
+        shared across all phase model constructors.
         """
+        # Load TDB database once for CALPHAD systems.
+        tdb_db = None
+        if (self.energy_form == 'calphad'
+                and self.tdb_path):
+            try:
+                import pycalphad as _pc
+            except ImportError as exc:
+                raise ImportError(
+                    "pycalphad is required for "
+                    "CALPHAD energy models.  "
+                    "Install it with:  pip "
+                    "install pycalphad") from exc
+            tdb_db = _pc.Database(self.tdb_path)
+
         edges = _dependency_edges(self.phases)
         order = _topo_sort(self.phases, edges)
 
@@ -404,15 +601,17 @@ class SystemSpec:
         for ps in order:
             model = ps.make_energy_model(
                 specs_by_name, built,
-                self.fields)
+                self.fields, tdb_db=tdb_db)
             built[ps.name] = model
 
         # Preserve declaration order for UI/legend
         # stability (not the topo build order).
+        n_comp = len(self.components)
         phases = [
             Phase(ps.name, ps.phase_type,
                   built[ps.name],
-                  ps.xmin, ps.xmax)
+                  ps.xmin, ps.xmax,
+                  n_components=n_comp)
             for ps in self.phases
         ]
 
@@ -427,6 +626,179 @@ class SystemSpec:
             self.components, phases,
             self.energy_form, fields,
             self.title)
+
+    # ---------------------------------------------------------
+    # XML serialisation
+    # ---------------------------------------------------------
+
+    def to_xml_str(self):
+        """Serialise this SystemSpec to a pretty-printed
+        XML string parseable by parse_system_spec().
+
+        Uses the <fields> schema (not the legacy
+        separate-element schema).
+        """
+        from lxml import etree
+
+        root = etree.Element('pde')
+        if self.title:
+            etree.SubElement(
+                root, 'title').text = self.title
+
+        sys_el = etree.SubElement(root, 'system')
+        etree.SubElement(
+            sys_el, 'components'
+        ).text = ' '.join(self.components)
+        etree.SubElement(
+            sys_el, 'energy_form'
+        ).text = self.energy_form
+        if self.tdb_path:
+            etree.SubElement(
+                sys_el, 'tdb'
+            ).text = self.tdb_path
+        if self.units:
+            units_el = etree.SubElement(
+                sys_el, 'units')
+            for key in sorted(self.units):
+                units_el.set(
+                    key, self.units[key])
+
+        # -- Fields ---------------------------------
+        fields_el = etree.SubElement(root, 'fields')
+        for fs in self.fields:
+            f_el = etree.SubElement(
+                fields_el, 'field')
+            f_el.set('name', fs.name)
+            f_el.set('symbol', fs.symbol)
+            if fs.unit:
+                f_el.set('unit', fs.unit)
+            f_el.set('min', _fmt(fs.min_val))
+            f_el.set('max', _fmt(fs.max_val))
+            f_el.set(
+                'initial', _fmt(fs.initial_val))
+            for k, v in fs.extras.items():
+                f_el.set(k, _fmt(v))
+
+        # -- Phases -------------------------------------------
+        for ps in self.phases:
+            self._emit_phase_xml(root, ps)
+
+        return etree.tostring(
+            root, pretty_print=True,
+            encoding='unicode')
+
+    @staticmethod
+    def _emit_phase_xml(root, ps):
+        """Append a <phase> element for *ps* to *root*.
+
+        Handles all three model types (HS, polynomial,
+        piecewise_patch) and VLE gas phases.
+        """
+        from lxml import etree
+
+        phase_el = etree.SubElement(root, 'phase')
+        phase_el.set('name', ps.name)
+        phase_el.set('type', ps.phase_type)
+        if ps.ideal_gas:
+            phase_el.set('ideal_gas', 'true')
+
+        is_point = (ps.xmin == ps.xmax)
+        if ps.xmin != 0.0 or ps.xmax != 1.0:
+            cr = etree.SubElement(
+                phase_el, 'composition_range')
+            cr.set('xmin', _fmt(ps.xmin))
+            cr.set('xmax', _fmt(ps.xmax))
+
+        # VLE gas: emit <vle> instead of <energy>.
+        vle = ps.vle_params
+        if vle is not None:
+            vle_el = etree.SubElement(
+                phase_el, 'vle')
+            for key in ('T_bp_A', 'T_bp_B',
+                        'L_A', 'L_B'):
+                if key in vle:
+                    vle_el.set(key, _fmt(vle[key]))
+            return
+
+        # CALPHAD: <energy model="calphad" phase="…"/>
+        if ps.model_type == 'calphad':
+            energy_el = etree.SubElement(
+                phase_el, 'energy')
+            energy_el.set('model', 'calphad')
+            energy_el.set(
+                'phase',
+                ps.model_params.get(
+                    'calphad_phase', ''))
+            return
+
+        energy_el = etree.SubElement(
+            phase_el, 'energy')
+        energy_el.set(
+            'model',
+            'point' if is_point else 'quadratic')
+
+        mt = ps.model_type
+        if mt in ('HS', 'piecewise_patch'):
+            H = ps.H_coeffs
+            S = ps.S_coeffs
+            if is_point:
+                etree.SubElement(
+                    energy_el, 'H'
+                ).text = _fmt(H[0] if H else 0.0)
+                etree.SubElement(
+                    energy_el, 'S'
+                ).text = _fmt(S[0] if S else 0.0)
+            else:
+                H_el = etree.SubElement(
+                    energy_el, 'H')
+                for i, c in enumerate(H):
+                    H_el.set(f'x{i}', _fmt(c))
+                S_el = etree.SubElement(
+                    energy_el, 'S')
+                for i, c in enumerate(S):
+                    S_el.set(f'x{i}', _fmt(c))
+            V = ps.V_coeffs
+            if V:
+                V_el = etree.SubElement(
+                    energy_el, 'V')
+                for i, c in enumerate(V):
+                    V_el.set(f'x{i}', _fmt(c))
+
+        elif mt == 'polynomial':
+            poly = ps.poly_coeffs
+            for i, t_row in enumerate(poly):
+                x_el = etree.SubElement(
+                    energy_el, f'x{i}')
+                for j, c in enumerate(t_row):
+                    x_el.set(f'a{j}', _fmt(c))
+            V = ps.V_coeffs
+            if V:
+                V_el = etree.SubElement(
+                    energy_el, 'V')
+                for i, c in enumerate(V):
+                    V_el.set(f'x{i}', _fmt(c))
+
+        # Patch metadata (piecewise_patch only).
+        if mt == 'piecewise_patch':
+            lx = ps.patch_left_x
+            lp = ps.patch_left_phase
+            if lx is not None and lp:
+                pl = etree.SubElement(
+                    phase_el, 'patch_left')
+                pl.set('x_cut', _fmt(lx))
+                pl.set('phase', lp)
+            rx = ps.patch_right_x
+            rp = ps.patch_right_phase
+            if rx is not None and rp:
+                pr = etree.SubElement(
+                    phase_el, 'patch_right')
+                pr.set('x_cut', _fmt(rx))
+                pr.set('phase', rp)
+
+
+def _fmt(v):
+    """Format a float for XML (no trailing zeros)."""
+    return f'{v:.10g}'
 
 
 # ---------------------------------------------------------------
@@ -457,39 +829,115 @@ class Field:
     initial_val: float
 
 
+def _simplex_grid(n_components, n_divisions):
+    """Uniform grid on the (N-1)-simplex.
+
+    Generates all compositions (x_1, ..., x_N) with
+    x_i = k_i / n_divisions for non-negative integers
+    k_i summing to n_divisions.  Returns the
+    independent coordinates [x_2, ..., x_N] as an
+    (m, N-1) array.  x_1 = 1 - sum is implied.
+
+    For binary (N=2), returns shape (n_divisions+1, 1).
+
+    Parameters
+    ----------
+    n_components : int — number of components N
+    n_divisions  : int — grid resolution
+
+    Returns
+    -------
+    ndarray, shape (m, N-1)
+    """
+    N = n_components
+    n = n_divisions
+    points = []
+
+    def _recurse(remaining, depth, current):
+        if depth == N - 1:
+            current.append(remaining)
+            points.append(current[:])
+            current.pop()
+            return
+        for i in range(remaining + 1):
+            current.append(i)
+            _recurse(
+                remaining - i,
+                depth + 1, current)
+            current.pop()
+
+    _recurse(n, 0, [])
+
+    arr = np.array(points, dtype=float) / n
+    return arr[:, 1:]   # drop x_1; shape (m, N-1)
+
+
 class Phase:
     """One thermodynamic phase.
 
     Attributes
     ----------
-    name         : str   — user-given label (e.g. 'liquid', 'alpha')
-    phase_type   : str   — 'gas', 'liquid', 'solid', or 'end_member'
-    energy_model : EnergyModel — instance from pde_energy
-    xmin, xmax   : float — valid composition range [0, 1]
-                           For end-members xmin == xmax (degenerate point).
+    name         : str   — user-given label
+    phase_type   : str   — 'gas'|'liquid'|'solid'|
+                           'end_member'
+    energy_model : EnergyModel — from pde_energy
+    xmin, xmax   : float — composition range (binary)
+    n_components : int   — number of components in
+                           the system (default 2)
     """
 
-    def __init__(self, name, phase_type, energy_model, xmin=0.0, xmax=1.0):
+    def __init__(self, name, phase_type,
+                 energy_model,
+                 xmin=0.0, xmax=1.0,
+                 n_components=2):
         self.name = name
         self.phase_type = phase_type
         self.energy_model = energy_model
         self.xmin = xmin
         self.xmax = xmax
+        self.n_components = n_components
 
     @property
     def is_point(self):
-        """True when this phase exists at a single composition (end-member)."""
+        """True when this phase exists at a single
+        composition (end-member).
+        """
         return self.xmin == self.xmax
 
-    def gibbs(self, x, T, P=0.0):
-        """Evaluate G(x, T, P) via the phase's energy model."""
-        return self.energy_model.gibbs(x, T, P)
+    def gibbs(self, x, field_values):
+        """Evaluate G(x) at the given field values.
+
+        Parameters
+        ----------
+        x : array-like
+            Binary: shape (n,).
+            Ternary+: shape (n, N-1).
+        field_values : dict[str, float]
+        """
+        return self.energy_model.gibbs(
+            x, field_values)
 
     def composition_grid(self, n_points=500):
-        """Return a linearly spaced composition array over [xmin, xmax]."""
+        """Composition sample points.
+
+        Binary:   (n,) array via linspace.
+        Ternary+: (m, N-1) array on the simplex.
+        """
         if self.is_point:
             return np.array([self.xmin])
-        return np.linspace(self.xmin, self.xmax, n_points)
+        if self.n_components == 2:
+            return np.linspace(
+                self.xmin, self.xmax,
+                n_points)
+        # Simplex grid.  Choose n_divisions so
+        # the point count is close to n_points.
+        # For N=3: m = (d+1)(d+2)/2 ≈ n_points
+        #   → d ≈ sqrt(2·n_points) - 1.5
+        N = self.n_components
+        d = max(10, int(
+            (2.0 * n_points) ** (1.0 / (N - 1))
+        ))
+        return _simplex_grid(N, d)
 
 
 class System:

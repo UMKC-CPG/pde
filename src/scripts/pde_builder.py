@@ -2,590 +2,241 @@
 """
 Graphical builder for PDE input systems.
 
-Provides:
-  PhaseData   — pure-Python data container for one phase
-  SystemData  — pure-Python container for the full system, with
-                to_system(), to_xml_str(), from_system(), from_xml()
-  BuilderWindow — QDialog editor; emits system_applied(System) on Apply
+Provides
+--------
+  BuilderWindow — QDialog editor that works directly with
+      SystemSpec / PhaseSpec.  Emits system_applied(System,
+      SystemSpec) on Apply.
+  Fitting functions — apply_handle_drag, apply_rigid_shift,
+      apply_xrange_drag (operate on PhaseSpec objects).
 
-Usage from pde_viz.py:
-  from pde_builder import BuilderWindow
-  builder = BuilderWindow(system=current_system)
-  builder.system_applied.connect(main_window.reload_system)
-  builder.show()
+Usage from pde_viz.py::
+
+    from pde_builder import BuilderWindow
+    builder = BuilderWindow(spec=system_spec)
+    builder.system_applied.connect(
+        main_window.reload_system)
+    builder.show()
 """
 
 import os
 import sys
 
-_script_dir = os.path.dirname(os.path.abspath(__file__))
+_script_dir = os.path.dirname(
+    os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
 import copy
-from dataclasses import dataclass, field
 
-from lxml import etree
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QScrollArea, QSlider, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog,
+    QDoubleSpinBox, QFileDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox,
+    QPushButton, QScrollArea, QSlider,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from pde_energy import HSModel, PiecewisePatchModel, PolyModel, compute_vle_gas_hs
-from pde_phase import Field, Phase, System
+from pde_phase import (
+    FieldSpec, PhaseSpec, SystemSpec,
+)
 
 
-# ---------------------------------------------------------------------------
-# Formatting helper
-# ---------------------------------------------------------------------------
-
-def _fmt(v):
-    """Format a float for XML output (no trailing zeros, up to 10 sig figs)."""
-    return f'{v:.10g}'
-
-
-# ---------------------------------------------------------------------------
-# Data model (pure Python, no Qt)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PhaseData:
-    """All data needed to describe one phase in either energy form."""
-    name: str = 'phase'
-    phase_type: str = 'solid'    # 'solid' | 'liquid' | 'gas' | 'end_member'
-    xmin: float = 0.0
-    xmax: float = 1.0
-    ideal_gas: bool = False
-    # HS form
-    hs_H: list = field(default_factory=lambda: [0.0])
-    hs_S: list = field(default_factory=lambda: [0.0])
-    hs_V: list = field(default_factory=lambda: None)   # None → no PV term
-    # Polynomial form: poly[i][j] = coefficient for x^i * T^j
-    poly: list = field(default_factory=lambda: [[0.0]])
-    # VLE reparameterisation (gas phases only)
-    # When not None: {'T_bp_A': float, 'T_bp_B': float, 'L_A': float, 'L_B': float}
-    vle: dict = field(default=None)
-    # Patch cutoffs: composition value within [xmin, xmax], or None = no patch
-    patch_left: object = field(default=None)   # float | None
-    patch_right: object = field(default=None)  # float | None
-    # Target phase name for each patch (empty string = none selected)
-    patch_left_phase: str = field(default='')
-    patch_right_phase: str = field(default='')
-
-    @property
-    def is_vle_gas(self) -> bool:
-        """True when this is a gas phase using the VLE reparameterisation."""
-        return self.phase_type == 'gas' and self.vle is not None
-
-
-@dataclass
-class SystemData:
-    """Full system data container."""
-    title: str = 'New System'
-    components: list = field(default_factory=lambda: ['A', 'B'])
-    energy_form: str = 'HS'
-    T_min: float = 500.0
-    T_max: float = 1500.0
-    T_initial: float = 1500.0
-    has_pressure: bool = False
-    P_min: float = 1.0
-    P_max: float = 5.0
-    P_initial: float = 1.0
-    R_gas: float = 0.0
-    P_ref: float = 1.0
-    P_unit: str = ''
-    phases: list = field(default_factory=list)
-
-    # ------------------------------------------------------------------
-    # Build live objects
-    # ------------------------------------------------------------------
-
-    def to_system(self, current_T=None) -> System:
-        """Construct and return a live System object.
-
-        Parameters
-        ----------
-        current_T : float or None
-            Temperature to use when computing left-patch polynomials (G slope
-            matching).  Defaults to self.T_initial when None.
-        """
-        T_patch = float(current_T) if current_T is not None else self.T_initial
-        R_gas = self.R_gas if self.has_pressure else 0.0
-        P_ref = self.P_ref if self.has_pressure else 1.0
-
-        # Index PhaseData by name for patch target look-ups.
-        phase_data_by_name = {pd.name: pd for pd in self.phases}
-
-        # First pass: build all non-VLE phases; collect first liquid's H/S.
-        phases = []
-        liq_H = [0.0]
-        liq_S = [0.0]
-        liq_found = False
-        pending_vle = []   # list of PhaseData for VLE gas phases
-
-        for pd in self.phases:
-            if pd.is_vle_gas:
-                pending_vle.append(pd)
-                continue
-
-            V_coeffs = pd.hs_V if pd.hs_V else None
-
-            # Build energy model — use PiecewisePatchModel when patches are set.
-            has_left  = (self.energy_form == 'HS'
-                         and pd.patch_left is not None
-                         and pd.patch_left_phase
-                         and pd.patch_left > pd.xmin + 1e-10)
-            has_right = (self.energy_form == 'HS'
-                         and pd.patch_right is not None
-                         and pd.patch_right_phase
-                         and pd.patch_right < pd.xmax - 1e-10)
-
-            if has_left or has_right:
-                H_left, x_cut_left   = None, None
-                H_right, x_cut_right = None, None
-                xmin_eff = pd.xmin
-                xmax_eff = pd.xmax
-                if has_left:
-                    tpd = phase_data_by_name.get(pd.patch_left_phase)
-                    if tpd is not None:
-                        H_left = compute_left_patch_H(
-                            pd, tpd, pd.patch_left, T=T_patch,
-                            phase_data_by_name=phase_data_by_name)
-                        x_cut_left = pd.patch_left
-                        # Extend xmin to chain root's xmin.
-                        _, xmin_eff = _resolve_left_patch_chain(tpd, phase_data_by_name)
-                        xmin_eff = min(pd.xmin, xmin_eff)
-                if has_right:
-                    tpd = phase_data_by_name.get(pd.patch_right_phase)
-                    if tpd is not None:
-                        H_right = compute_right_patch_H(
-                            pd, tpd, pd.patch_right, T=T_patch,
-                            phase_data_by_name=phase_data_by_name)
-                        x_cut_right = pd.patch_right
-                        # Extend xmax to chain root's xmax.
-                        _, xmax_eff = _resolve_right_patch_chain(tpd, phase_data_by_name)
-                        xmax_eff = max(pd.xmax, xmax_eff)
-                if H_left is not None or H_right is not None:
-                    model = PiecewisePatchModel(
-                        pd.hs_H, pd.hs_S,
-                        H_left=H_left, x_cut_left=x_cut_left,
-                        H_right=H_right, x_cut_right=x_cut_right,
-                        V_coeffs=V_coeffs,
-                        ideal_gas=pd.ideal_gas,
-                        R_gas=R_gas, P_ref=P_ref,
-                    )
-                    if H_left  is not None:
-                        model.patch_left_phase_name  = pd.patch_left_phase
-                    if H_right is not None:
-                        model.patch_right_phase_name = pd.patch_right_phase
-                else:
-                    model = HSModel(pd.hs_H, pd.hs_S,
-                                    V_coeffs=V_coeffs,
-                                    ideal_gas=pd.ideal_gas,
-                                    R_gas=R_gas, P_ref=P_ref)
-                    xmin_eff = pd.xmin
-                    xmax_eff = pd.xmax
-            elif self.energy_form == 'HS':
-                model = HSModel(pd.hs_H, pd.hs_S,
-                                V_coeffs=V_coeffs,
-                                ideal_gas=pd.ideal_gas,
-                                R_gas=R_gas, P_ref=P_ref)
-                xmin_eff = pd.xmin
-                xmax_eff = pd.xmax
-            else:
-                model = PolyModel(pd.poly,
-                                  V_coeffs=V_coeffs,
-                                  ideal_gas=pd.ideal_gas,
-                                  R_gas=R_gas, P_ref=P_ref)
-                xmin_eff = pd.xmin
-                xmax_eff = pd.xmax
-            phases.append(Phase(
-                name=pd.name,
-                phase_type=pd.phase_type,
-                energy_model=model,
-                xmin=xmin_eff,
-                xmax=xmax_eff,
-            ))
-            if pd.phase_type == 'liquid' and not liq_found and self.energy_form == 'HS':
-                liq_H = list(pd.hs_H) if pd.hs_H else [0.0]
-                liq_S = list(pd.hs_S) if pd.hs_S else [0.0]
-                liq_found = True
-
-        # Second pass: build VLE gas phases using compute_vle_gas_hs().
-        for pd in pending_vle:
-            vp = pd.vle
-            H_gas, S_gas = compute_vle_gas_hs(
-                liq_H, liq_S,
-                vp['T_bp_A'], vp['T_bp_B'],
-                vp['L_A'],    vp['L_B'],
-            )
-            V_coeffs = pd.hs_V if pd.hs_V else None
-            model = HSModel(H_gas, S_gas,
-                            V_coeffs=V_coeffs,
-                            ideal_gas=pd.ideal_gas,
-                            R_gas=R_gas, P_ref=P_ref)
-            model.vle_params = dict(vp)
-            phases.append(Phase(
-                name=pd.name,
-                phase_type=pd.phase_type,
-                energy_model=model,
-                xmin=pd.xmin,
-                xmax=pd.xmax,
-            ))
-
-        t_field = Field(name='temperature', symbol='T', unit='K',
-                        min_val=self.T_min, max_val=self.T_max,
-                        initial_val=self.T_initial)
-        fields = [t_field]
-        if self.has_pressure:
-            p_field = Field(name='pressure', symbol='P',
-                            unit=self.P_unit,
-                            min_val=self.P_min, max_val=self.P_max,
-                            initial_val=self.P_initial)
-            fields.append(p_field)
-
-        return System(
-            components=list(self.components),
-            phases=phases,
-            energy_form=self.energy_form,
-            fields=fields,
-            title=self.title,
-        )
-
-    # ------------------------------------------------------------------
-    # XML serialisation
-    # ------------------------------------------------------------------
-
-    def to_xml_str(self) -> str:
-        """Return a pretty-printed XML string parseable by pde_input."""
-        root = etree.Element('pde')
-
-        if self.title:
-            etree.SubElement(root, 'title').text = self.title
-
-        sys_el = etree.SubElement(root, 'system')
-        etree.SubElement(sys_el, 'components').text = ' '.join(self.components)
-        etree.SubElement(sys_el, 'energy_form').text = self.energy_form
-
-        fields_el = etree.SubElement(root, 'fields')
-        t_el = etree.SubElement(fields_el, 'field')
-        t_el.set('name', 'temperature')
-        t_el.set('symbol', 'T')
-        t_el.set('unit', 'K')
-        t_el.set('min', _fmt(self.T_min))
-        t_el.set('max', _fmt(self.T_max))
-        t_el.set('initial', _fmt(self.T_initial))
-        if self.has_pressure:
-            p_el = etree.SubElement(fields_el, 'field')
-            p_el.set('name', 'pressure')
-            p_el.set('symbol', 'P')
-            p_el.set('unit', self.P_unit)
-            p_el.set('min', _fmt(self.P_min))
-            p_el.set('max', _fmt(self.P_max))
-            p_el.set('initial', _fmt(self.P_initial))
-            if self.R_gas:
-                p_el.set('R_gas', _fmt(self.R_gas))
-            p_el.set('P_ref', _fmt(self.P_ref))
-
-        for pd in self.phases:
-            phase_el = etree.SubElement(root, 'phase')
-            phase_el.set('name', pd.name)
-            phase_el.set('type', pd.phase_type)
-            if pd.ideal_gas:
-                phase_el.set('ideal_gas', 'true')
-
-            is_point = (pd.xmin == pd.xmax)
-            if pd.xmin != 0.0 or pd.xmax != 1.0:
-                cr_el = etree.SubElement(phase_el, 'composition_range')
-                cr_el.set('xmin', _fmt(pd.xmin))
-                cr_el.set('xmax', _fmt(pd.xmax))
-
-            # VLE gas phases: emit <vle> element instead of <energy>.
-            if pd.is_vle_gas:
-                vp = pd.vle
-                vle_el = etree.SubElement(phase_el, 'vle')
-                vle_el.set('T_bp_A', _fmt(vp['T_bp_A']))
-                vle_el.set('T_bp_B', _fmt(vp['T_bp_B']))
-                vle_el.set('L_A',    _fmt(vp['L_A']))
-                vle_el.set('L_B',    _fmt(vp['L_B']))
-                continue
-
-            energy_el = etree.SubElement(phase_el, 'energy')
-            energy_el.set('model', 'point' if is_point else 'quadratic')
-
-            if self.energy_form == 'HS':
-                if is_point:
-                    etree.SubElement(energy_el, 'H').text = _fmt(
-                        pd.hs_H[0] if pd.hs_H else 0.0)
-                    etree.SubElement(energy_el, 'S').text = _fmt(
-                        pd.hs_S[0] if pd.hs_S else 0.0)
-                else:
-                    H_el = etree.SubElement(energy_el, 'H')
-                    for i, c in enumerate(pd.hs_H):
-                        H_el.set(f'x{i}', _fmt(c))
-                    S_el = etree.SubElement(energy_el, 'S')
-                    for i, c in enumerate(pd.hs_S):
-                        S_el.set(f'x{i}', _fmt(c))
-                if pd.hs_V:
-                    V_el = etree.SubElement(energy_el, 'V')
-                    for i, c in enumerate(pd.hs_V):
-                        V_el.set(f'x{i}', _fmt(c))
-            else:
-                for i, t_coeffs in enumerate(pd.poly):
-                    x_el = etree.SubElement(energy_el, f'x{i}')
-                    for j, c in enumerate(t_coeffs):
-                        x_el.set(f'a{j}', _fmt(c))
-                if pd.hs_V:
-                    V_el = etree.SubElement(energy_el, 'V')
-                    for i, c in enumerate(pd.hs_V):
-                        V_el.set(f'x{i}', _fmt(c))
-
-            # Patch metadata (HS form only; patches not supported for polynomial form).
-            if pd.patch_left is not None and pd.patch_left_phase:
-                pl_el = etree.SubElement(phase_el, 'patch_left')
-                pl_el.set('x_cut', _fmt(pd.patch_left))
-                pl_el.set('phase', pd.patch_left_phase)
-            if pd.patch_right is not None and pd.patch_right_phase:
-                pr_el = etree.SubElement(phase_el, 'patch_right')
-                pr_el.set('x_cut', _fmt(pd.patch_right))
-                pr_el.set('phase', pd.patch_right_phase)
-
-        return etree.tostring(root, pretty_print=True, encoding='unicode')
-
-    # ------------------------------------------------------------------
-    # Class-method constructors
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_system(cls, system) -> 'SystemData':
-        """Populate a SystemData from a live System object."""
-        sd = cls()
-        sd.title = system.title
-        sd.components = list(system.components)
-        sd.energy_form = system.energy_form
-        sd.T_min = system.T_min
-        sd.T_max = system.T_max
-        sd.T_initial = system.T_initial
-        sd.has_pressure = system.has_pressure
-        sd.P_min = system.P_min
-        sd.P_max = system.P_max
-        sd.P_initial = system.P_initial
-        sd.R_gas = system.R_gas
-        sd.P_ref = system.P_ref
-        sd.P_unit = system.P_unit
-
-        sd.phases = []
-        for phase in system.phases:
-            pd = PhaseData()
-            pd.name = phase.name
-            pd.phase_type = phase.phase_type
-            pd.xmin = phase.xmin
-            pd.xmax = phase.xmax
-            model = phase.energy_model
-            if isinstance(model, PiecewisePatchModel):
-                pd.ideal_gas = model.ideal_gas
-                pd.hs_V = (model.V_coeffs.tolist()
-                           if model.V_coeffs is not None else None)
-                pd.hs_H = model.H_orig.tolist()
-                pd.hs_S = model.S_coeffs.tolist()
-                pd.poly = [[0.0]]
-                if model.x_cut_left is not None:
-                    pd.patch_left       = model.x_cut_left
-                    pd.patch_left_phase = model.patch_left_phase_name
-                if model.x_cut_right is not None:
-                    pd.patch_right       = model.x_cut_right
-                    pd.patch_right_phase = model.patch_right_phase_name
-            elif isinstance(model, HSModel):
-                pd.ideal_gas = model.ideal_gas
-                pd.hs_V = (model.V_coeffs.tolist()
-                           if model.V_coeffs is not None else None)
-                # Recover VLE parameterisation if present.
-                vp = getattr(model, 'vle_params', None)
-                if vp is not None:
-                    pd.vle = dict(vp)
-                    pd.hs_H = [0.0]
-                    pd.hs_S = [0.0]
-                else:
-                    pd.hs_H = model.H_coeffs.tolist()
-                    pd.hs_S = model.S_coeffs.tolist()
-                pd.poly = [[0.0]]
-            elif isinstance(model, PolyModel):
-                pd.ideal_gas = model.ideal_gas
-                pd.poly = [c.tolist() for c in model.coeffs]
-                pd.hs_V = (model.V_coeffs.tolist()
-                           if model.V_coeffs is not None else None)
-                pd.hs_H = [0.0]
-                pd.hs_S = [0.0]
-            sd.phases.append(pd)
-
-        return sd
-
-    @classmethod
-    def from_xml(cls, path) -> 'SystemData':
-        """Parse an existing XML file and return a SystemData."""
-        from pde_input import parse_system
-        system = parse_system(path)
-        return cls.from_system(system)
-
-
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------
 # Fitting layer — pure Python, no Qt
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------
 
 
-def apply_handle_drag(phase_data, drag_handle_idx,
-                      handles_x, handles_G, T, energy_form,
-                      P=0.0, R_gas=0.0, P_ref=1.0,
+def apply_handle_drag(phase_spec, drag_handle_idx,
+                      handles_x, handles_G, T,
+                      energy_form, P=0.0,
+                      R_gas=0.0, P_ref=1.0,
                       fit_target='H'):
-    """Return updated PhaseData after a vertical G(x) handle drag.
+    """Return updated PhaseSpec after a vertical
+    G(x) handle drag.
 
     *fit_target* selects which polynomial is fitted:
-      'H'  (default) — adjust H₀, H₁, H₂; keep S unchanged.
-      'S'            — adjust S₀, S₁, S₂; keep H unchanged.
+      'H'  (default) — adjust H₀, H₁, H₂; keep S.
+      'S'            — adjust S₀, S₁, S₂; keep H.
 
-    In both cases higher-order coefficients (index ≥ 3) are preserved.
+    Higher-order coefficients (index >= 3) are kept.
 
     Parameters
     ----------
-    phase_data      : PhaseData   — original data (not modified in place)
-    drag_handle_idx : int         — which handle was dragged (0=left, 1=mid, 2=right)
-    handles_x       : list[float] — x positions of all handles (fixed during drag)
-    handles_G       : list[float] — target full G values after drag (including pressure
-                                    terms), new G at drag handle; original G at the
-                                    other two as polynomial constraints
-    T               : float       — temperature at which the drag occurred
-    energy_form     : str         — 'HS' or 'polynomial'
-    P               : float       — pressure at drag time (default 0; backward-compatible)
-    R_gas           : float       — ideal-gas constant for the system (default 0)
-    P_ref           : float       — reference pressure for ideal-gas term (default 1)
-    fit_target      : str         — 'H' or 'S' (default 'H')
+    phase_spec      : PhaseSpec — not modified
+    drag_handle_idx : int       — 0=left, 1=mid, 2=right
+    handles_x       : list[float] — handle x positions
+    handles_G       : list[float] — target full G values
+    T               : float     — temperature at drag
+    energy_form     : str       — 'HS' or 'polynomial'
+    P               : float     — pressure (default 0)
+    R_gas           : float     — gas constant (default 0)
+    P_ref           : float     — reference P (default 1)
+    fit_target      : str       — 'H' or 'S' (default 'H')
 
     Returns
     -------
-    PhaseData — deep copy of phase_data with updated coefficients.
+    PhaseSpec — deep copy with updated coefficients.
     """
     import numpy as np
 
-    new_data = copy.deepcopy(phase_data)
+    new_spec = copy.deepcopy(phase_spec)
 
     if energy_form != 'HS':
-        # Polynomial form editing deferred to a later phase.
-        return new_data
+        return new_spec
 
     xs = np.asarray(handles_x, dtype=float)
 
-    # --- helper: remove PV and ideal-gas contributions from target G values ---
-    net_G = np.asarray(handles_G, dtype=float).copy()
-    if phase_data.hs_V and P != 0.0:
-        V_vals = np.polynomial.polynomial.polyval(xs, np.asarray(phase_data.hs_V))
-        net_G  = net_G - P * V_vals
-    if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
-        net_G = net_G - R_gas * T * np.log(P / P_ref)
+    # Remove PV and ideal-gas contributions from
+    # target G values to isolate H - T*S.
+    net_G = np.asarray(
+        handles_G, dtype=float).copy()
+    V = phase_spec.V_coeffs
+    if V and P != 0.0:
+        V_vals = np.polynomial.polynomial.polyval(
+            xs, np.asarray(V))
+        net_G = net_G - P * V_vals
+    if (phase_spec.ideal_gas and R_gas != 0.0
+            and P > 0.0 and P_ref > 0.0):
+        net_G -= R_gas * T * np.log(P / P_ref)
 
-    # Vandermonde matrix [1, x, x²] for each handle position.
-    A = np.column_stack([np.ones(3), xs, xs ** 2])
+    # Vandermonde [1, x, x²] for each handle.
+    A = np.column_stack(
+        [np.ones(3), xs, xs ** 2])
 
     if fit_target == 'S':
-        # ---- S-mode: keep H fixed, adjust S₀, S₁, S₂ ----
-        # G = H(x) - T·S(x)  →  S(x) = (H(x) - G(x)) / T
+        # -- S-mode: keep H, adjust S₀, S₁, S₂ --
+        # G = H - T·S  →  S = (H - G) / T
         if abs(T) < 1e-10:
-            return new_data   # cannot solve for S at T ≈ 0
-        H_all  = np.asarray(phase_data.hs_H or [0.0])
-        H_vals = np.polynomial.polynomial.polyval(xs, H_all)
+            return new_spec
+        H_all = np.asarray(
+            phase_spec.H_coeffs or [0.0])
+        H_vals = np.polynomial.polynomial.polyval(
+            xs, H_all)
         S_target = (H_vals - net_G) / T
 
-        S_all  = np.asarray(phase_data.hs_S or [0.0])
-        S_high = S_all[3:] if len(S_all) > 3 else np.array([])
+        S_all = np.asarray(
+            phase_spec.S_coeffs or [0.0])
+        S_high = (S_all[3:]
+                  if len(S_all) > 3
+                  else np.array([]))
 
-        # Subtract high-order S contribution at handle positions.
+        # Subtract high-order S at handle positions.
         S_high_at_xs = np.zeros(3)
         for k, s_k in enumerate(S_high):
             S_high_at_xs += s_k * xs ** (k + 3)
         S_low_target = S_target - S_high_at_xs
 
         try:
-            S_low_new    = np.linalg.solve(A, S_low_target)
-            new_data.hs_S = list(S_low_new) + list(S_high)
+            S_low_new = np.linalg.solve(
+                A, S_low_target)
+            new_spec.S_coeffs = (
+                list(S_low_new) + list(S_high))
         except np.linalg.LinAlgError:
-            # Degenerate geometry — fall back to uniform S₀ shift.
-            x_drag       = handles_x[drag_handle_idx]
-            H_at_drag    = float(np.polynomial.polynomial.polyval(x_drag, H_all))
-            net_G_drag   = float(net_G[drag_handle_idx])
-            S_target_drag = (H_at_drag - net_G_drag) / T
-            S_current_drag = float(np.polynomial.polynomial.polyval(x_drag, S_all))
-            new_S        = list(phase_data.hs_S or [0.0])
+            # Degenerate — uniform S₀ shift.
+            x_drag = handles_x[drag_handle_idx]
+            H_at = float(
+                np.polynomial.polynomial.polyval(
+                    x_drag, H_all))
+            net_G_at = float(
+                net_G[drag_handle_idx])
+            S_want = (H_at - net_G_at) / T
+            S_now = float(
+                np.polynomial.polynomial.polyval(
+                    x_drag, S_all))
+            new_S = list(
+                phase_spec.S_coeffs or [0.0])
             if not new_S:
                 new_S = [0.0]
-            new_S[0]    += S_target_drag - S_current_drag
-            new_data.hs_S = new_S
+            new_S[0] += S_want - S_now
+            new_spec.S_coeffs = new_S
 
     else:
-        # ---- H-mode (default): keep S fixed, adjust H₀, H₁, H₂ ----
-        # Invert G = H - T·S  →  H = net_G + T·S
-        S_coeffs = np.asarray(phase_data.hs_S or [0.0])
-        S_vals   = np.polynomial.polynomial.polyval(xs, S_coeffs)
+        # -- H-mode: keep S, adjust H₀, H₁, H₂ --
+        # H = net_G + T·S
+        S_arr = np.asarray(
+            phase_spec.S_coeffs or [0.0])
+        S_vals = np.polynomial.polynomial.polyval(
+            xs, S_arr)
         H_target = net_G + T * S_vals
 
-        H_all  = np.asarray(phase_data.hs_H or [0.0])
-        H_high = H_all[3:] if len(H_all) > 3 else np.array([])
+        H_all = np.asarray(
+            phase_spec.H_coeffs or [0.0])
+        H_high = (H_all[3:]
+                  if len(H_all) > 3
+                  else np.array([]))
 
-        # Subtract high-order H contribution at handle positions.
+        # Subtract high-order H at handle positions.
         H_high_at_xs = np.zeros(3)
         for k, h_k in enumerate(H_high):
             H_high_at_xs += h_k * xs ** (k + 3)
         H_low_target = H_target - H_high_at_xs
 
         try:
-            H_low_new    = np.linalg.solve(A, H_low_target)
-            new_data.hs_H = list(H_low_new) + list(H_high)
+            H_low_new = np.linalg.solve(
+                A, H_low_target)
+            new_spec.H_coeffs = (
+                list(H_low_new) + list(H_high))
         except np.linalg.LinAlgError:
-            # Degenerate geometry — fall back to uniform H₀ shift.
-            H_old  = np.asarray(phase_data.hs_H or [0.0])
-            S_old  = np.asarray(phase_data.hs_S or [0.0])
+            # Degenerate — uniform H₀ shift.
+            H_old = np.asarray(
+                phase_spec.H_coeffs or [0.0])
+            S_old = np.asarray(
+                phase_spec.S_coeffs or [0.0])
             x_drag = handles_x[drag_handle_idx]
-            G_old  = (np.polynomial.polynomial.polyval(x_drag, H_old)
-                      - T * np.polynomial.polynomial.polyval(x_drag, S_old))
-            if phase_data.hs_V and P != 0.0:
-                G_old += P * np.polynomial.polynomial.polyval(
-                    x_drag, np.asarray(phase_data.hs_V))
-            if phase_data.ideal_gas and R_gas != 0.0 and P > 0.0 and P_ref > 0.0:
-                G_old += R_gas * T * np.log(P / P_ref)
-            delta_G    = handles_G[drag_handle_idx] - G_old
-            new_H      = list(phase_data.hs_H or [0.0])
-            new_H[0]  += delta_G
-            new_data.hs_H = new_H
+            pv = np.polynomial.polynomial.polyval
+            G_old = (pv(x_drag, H_old)
+                     - T * pv(x_drag, S_old))
+            if V and P != 0.0:
+                G_old += P * pv(
+                    x_drag, np.asarray(V))
+            if (phase_spec.ideal_gas
+                    and R_gas != 0.0
+                    and P > 0.0
+                    and P_ref > 0.0):
+                G_old += (R_gas * T
+                          * np.log(P / P_ref))
+            delta_G = (handles_G[drag_handle_idx]
+                       - G_old)
+            new_H = list(
+                phase_spec.H_coeffs or [0.0])
+            new_H[0] += delta_G
+            new_spec.H_coeffs = new_H
 
-    return new_data
+    return new_spec
 
 
-def apply_xrange_drag(phase_data, handle_idx, new_x):
-    """Return updated PhaseData after a horizontal endpoint-handle drag (Phase 3).
+def apply_xrange_drag(phase_spec, handle_idx,
+                      new_x):
+    """Return updated PhaseSpec after a horizontal
+    endpoint-handle drag.
 
-    Adjusts xmin (handle_idx == 0) or xmax (handle_idx == 2) to *new_x*,
-    clamped to keep a minimum separation of 0.02 between xmin and xmax and
-    to stay within [0, 1].  The midpoint handle (idx 1) is not a valid target
-    for horizontal drag and is silently ignored.
+    Adjusts xmin (handle_idx == 0) or xmax
+    (handle_idx == 2) to *new_x*, clamped to keep a
+    minimum 0.02 separation and stay within [0, 1].
 
     Parameters
     ----------
-    phase_data : PhaseData — original data (not modified in place)
-    handle_idx : int       — 0 = left endpoint, 2 = right endpoint
-    new_x      : float     — new x position from the drag
+    phase_spec : PhaseSpec — not modified in place
+    handle_idx : int       — 0 = left, 2 = right
+    new_x      : float     — new x from the drag
 
     Returns
     -------
-    PhaseData — deep copy with updated xmin or xmax.
+    PhaseSpec — deep copy with updated xmin or xmax.
     """
     import numpy as np
-    new_data = copy.deepcopy(phase_data)
+    new_spec = copy.deepcopy(phase_spec)
     if handle_idx == 0:
-        new_data.xmin = float(np.clip(new_x, 0.0, phase_data.xmax - 0.02))
+        new_spec.xmin = float(np.clip(
+            new_x, 0.0,
+            phase_spec.xmax - 0.02))
     elif handle_idx == 2:
-        new_data.xmax = float(np.clip(new_x, phase_data.xmin + 0.02, 1.0))
-    return new_data
+        new_spec.xmax = float(np.clip(
+            new_x, phase_spec.xmin + 0.02, 1.0))
+    return new_spec
 
 
 def _shift_poly_coeffs(coeffs, dx):
@@ -605,146 +256,165 @@ def _shift_poly_coeffs(coeffs, dx):
     return list(reversed(result.c.tolist()))
 
 
-def apply_rigid_shift(phase_data, delta_G, delta_x=0.0):
-    """Return updated PhaseData after a rigid G(x) shift (vertical and/or horizontal).
+def apply_rigid_shift(phase_spec, delta_G,
+                      delta_x=0.0):
+    """Return updated PhaseSpec after a rigid G(x)
+    shift (vertical and/or horizontal).
 
-    *delta_G* is added to the constant H coefficient (hs_H[0]), shifting
-    G(x, T) = H(x) − T·S(x) by exactly *delta_G* at every composition and
-    temperature.
-
-    *delta_x* translates the phase's x-range: both xmin and xmax are shifted
-    by the same amount (clamped to keep them within [0, 1]).  The H and S
-    polynomial coefficients are reparameterised via p(x) → p(x − δ) so that
-    the curve shape is preserved at the new positions.
+    *delta_G* shifts H₀, translating the entire G(x,T)
+    curve vertically.  *delta_x* translates the x-range
+    and reparameterises H/S via p(x) → p(x − δ).
 
     Parameters
     ----------
-    phase_data : PhaseData — original data (not modified in place)
-    delta_G    : float     — vertical shift in G units (positive = up)
-    delta_x    : float     — horizontal translation in composition units
+    phase_spec : PhaseSpec — not modified in place
+    delta_G    : float     — vertical shift (G units)
+    delta_x    : float     — horizontal translation
 
     Returns
     -------
-    PhaseData — deep copy with updated coefficients and/or xmin/xmax.
+    PhaseSpec — deep copy with updated coefficients.
     """
     import numpy as np
-    new_data = copy.deepcopy(phase_data)
+    new_spec = copy.deepcopy(phase_spec)
     # Vertical shift: add delta_G to constant H term.
-    H = list(new_data.hs_H or [0.0])
+    H = list(new_spec.H_coeffs or [0.0])
     H[0] = H[0] + float(delta_G)
-    new_data.hs_H = H
+    new_spec.H_coeffs = H
     if delta_x != 0.0:
-        width = phase_data.xmax - phase_data.xmin
-        clamped_dx = float(np.clip(delta_x, -phase_data.xmin, 1.0 - phase_data.xmax))
+        width = phase_spec.xmax - phase_spec.xmin
+        clamped_dx = float(np.clip(
+            delta_x, -phase_spec.xmin,
+            1.0 - phase_spec.xmax))
         if clamped_dx != 0.0:
-            new_data.xmin = phase_data.xmin + clamped_dx
-            new_data.xmax = new_data.xmin + width
-            # Reparameterise H and S: p(x) → p(x − clamped_dx).
-            new_data.hs_H = _shift_poly_coeffs(new_data.hs_H, clamped_dx)
-            if new_data.hs_S:
-                new_data.hs_S = _shift_poly_coeffs(new_data.hs_S, clamped_dx)
-    return new_data
+            new_spec.xmin = (
+                phase_spec.xmin + clamped_dx)
+            new_spec.xmax = (
+                new_spec.xmin + width)
+            # Reparameterise: p(x) → p(x − dx).
+            new_spec.H_coeffs = (
+                _shift_poly_coeffs(
+                    new_spec.H_coeffs,
+                    clamped_dx))
+            S = new_spec.S_coeffs
+            if S:
+                new_spec.S_coeffs = (
+                    _shift_poly_coeffs(
+                        S, clamped_dx))
+    return new_spec
 
 
-def _resolve_right_patch_chain(target_pd, phase_data_by_name, _seen=None):
-    """Follow the right patch chain from *target_pd* to find the root PhaseData.
+def _resolve_right_patch_chain(target_spec,
+                               specs_by_name,
+                               _seen=None):
+    """Follow the right-patch chain from *target_spec*
+    to find the root PhaseSpec.
 
-    Returns ``(root_pd, xmax_eff)`` where *root_pd* is the first phase in the
-    chain that has no further right patch (or whose right-patch target cannot
-    be resolved), and *xmax_eff* = ``root_pd.xmax``.
-
-    Example:  C→B→A  returns (A, A.xmax).
+    Returns (root_spec, xmax_eff).
     """
     if _seen is None:
         _seen = set()
-    if (target_pd.patch_right_phase
-            and target_pd.patch_right is not None
-            and target_pd.name not in _seen):
-        _seen.add(target_pd.name)
-        next_pd = phase_data_by_name.get(target_pd.patch_right_phase)
-        if next_pd is not None:
-            return _resolve_right_patch_chain(next_pd, phase_data_by_name, _seen)
-    return target_pd, target_pd.xmax
+    if (target_spec.patch_right_phase
+            and target_spec.patch_right_x is not None
+            and target_spec.name not in _seen):
+        _seen.add(target_spec.name)
+        nxt = specs_by_name.get(
+            target_spec.patch_right_phase)
+        if nxt is not None:
+            return _resolve_right_patch_chain(
+                nxt, specs_by_name, _seen)
+    return target_spec, target_spec.xmax
 
 
-def _resolve_left_patch_chain(target_pd, phase_data_by_name, _seen=None):
-    """Follow the left patch chain from *target_pd* to find the root PhaseData.
+def _resolve_left_patch_chain(target_spec,
+                              specs_by_name,
+                              _seen=None):
+    """Follow the left-patch chain from *target_spec*
+    to find the root PhaseSpec.
 
-    Returns ``(root_pd, xmin_eff)`` where *root_pd* is the first phase in the
-    chain that has no further left patch, and *xmin_eff* = ``root_pd.xmin``.
+    Returns (root_spec, xmin_eff).
     """
     if _seen is None:
         _seen = set()
-    if (target_pd.patch_left_phase
-            and target_pd.patch_left is not None
-            and target_pd.name not in _seen):
-        _seen.add(target_pd.name)
-        next_pd = phase_data_by_name.get(target_pd.patch_left_phase)
-        if next_pd is not None:
-            return _resolve_left_patch_chain(next_pd, phase_data_by_name, _seen)
-    return target_pd, target_pd.xmin
+    if (target_spec.patch_left_phase
+            and target_spec.patch_left_x is not None
+            and target_spec.name not in _seen):
+        _seen.add(target_spec.name)
+        nxt = specs_by_name.get(
+            target_spec.patch_left_phase)
+        if nxt is not None:
+            return _resolve_left_patch_chain(
+                nxt, specs_by_name, _seen)
+    return target_spec, target_spec.xmin
 
 
-def compute_left_patch_H(phase_data, target_phase_data, x_cut, T=0.0,
-                         phase_data_by_name=None):
-    """Compute quadratic H coefficients Q(x) for the left patch region.
+def compute_left_patch_H(phase_spec, target_spec,
+                         x_cut, T=0.0,
+                         specs_by_name=None):
+    """Compute quadratic H coefficients Q(x) for the
+    left patch region.
 
-    Returns [q0, q1, q2] such that Q(x) = q0 + q1·x + q2·x² satisfies:
+    Returns [q0, q1, q2] satisfying:
+      1. Q(x_cut)  = H(x_cut)           — value
+      2. Q'(x_cut) = H'(x_cut)          — slope
+      3. G_patch'(xmin_eff) = G_root'(xmin_eff) — G
+         slope match at the chain-root left edge.
 
-    1.  Q(x_cut)  = H_phase(x_cut)          — value continuity at the cut
-    2.  Q'(x_cut) = H_phase'(x_cut)         — slope continuity at the cut
-    3.  G_patch'(xmin_eff, T) = G_root'(xmin_eff, T)  — G slope match with
-        the chain root at the effective left edge.
-
-    Condition 3 expands (S is shared on the left of G_patch) to:
-        Q'(xmin_eff) = H_root'(xmin_eff) + T·(S_phase'(xmin_eff) − S_root'(xmin_eff))
-
-    When *phase_data_by_name* is supplied the left patch chain is followed
-    (target → its target → …) so that chained patches share a common endpoint.
-    When T = 0 the formula reduces to pure H-slope matching at xmin_eff.
+    Condition 3 in H-space:
+      Q'(xmin) = H_root'(xmin)
+        + T·(S_phase'(xmin) − S_root'(xmin))
 
     Parameters
     ----------
-    phase_data        : PhaseData  — phase being patched
-    target_phase_data : PhaseData  — target phase whose slope is matched at xmin
-    x_cut             : float      — cut-off composition (left patch covers [xmin, x_cut])
-    T                 : float      — temperature for G slope matching (default 0 → H only)
-    phase_data_by_name : dict | None — full {name: PhaseData} mapping for chain resolution
+    phase_spec   : PhaseSpec — phase being patched
+    target_spec  : PhaseSpec — target for slope match
+    x_cut        : float     — cut-off composition
+    T            : float     — reference temperature
+    specs_by_name : dict|None — for chain resolution
 
     Returns
     -------
-    list[float] — [q0, q1, q2] (three coefficients of the quadratic patch)
+    list[float] — [q0, q1, q2]
     """
     import numpy as np
     pv = np.polynomial.polynomial.polyval
-    pd_d = np.polynomial.polynomial.polyder
+    pd = np.polynomial.polynomial.polyder
 
-    # Resolve patch chain: follow target's left-patch chain to the root.
-    if phase_data_by_name is not None:
-        root_pd, xmin_eff = _resolve_left_patch_chain(target_phase_data, phase_data_by_name)
+    if specs_by_name is not None:
+        root, xmin = _resolve_left_patch_chain(
+            target_spec, specs_by_name)
     else:
-        root_pd, xmin_eff = target_phase_data, phase_data.xmin
+        root = target_spec
+        xmin = phase_spec.xmin
 
-    xmin = xmin_eff
-    H   = np.asarray(phase_data.hs_H   or [0.0])
-    S   = np.asarray(phase_data.hs_S   or [0.0])
-    H_t = np.asarray(root_pd.hs_H or [0.0])
-    S_t = np.asarray(root_pd.hs_S or [0.0])
+    H   = np.asarray(
+        phase_spec.H_coeffs or [0.0])
+    S   = np.asarray(
+        phase_spec.S_coeffs or [0.0])
+    H_t = np.asarray(
+        root.H_coeffs or [0.0])
+    S_t = np.asarray(
+        root.S_coeffs or [0.0])
 
-    H_val          = float(pv(x_cut, H))
-    dH_at_cut      = float(pv(x_cut, pd_d(H))) if len(H) > 1 else 0.0
-    dH_t_at_xmin   = float(pv(xmin,  pd_d(H_t))) if len(H_t) > 1 else 0.0
-    dS_at_xmin     = float(pv(xmin,  pd_d(S)))  if len(S)   > 1 else 0.0
-    dS_t_at_xmin   = float(pv(xmin,  pd_d(S_t))) if len(S_t) > 1 else 0.0
+    H_val      = float(pv(x_cut, H))
+    dH_at_cut  = (float(pv(x_cut, pd(H)))
+                  if len(H) > 1 else 0.0)
+    dH_t_xmin  = (float(pv(xmin, pd(H_t)))
+                  if len(H_t) > 1 else 0.0)
+    dS_xmin    = (float(pv(xmin, pd(S)))
+                  if len(S) > 1 else 0.0)
+    dS_t_xmin  = (float(pv(xmin, pd(S_t)))
+                  if len(S_t) > 1 else 0.0)
 
-    # Target G-slope at xmin projected back to H-space:
-    slope_target = dH_t_at_xmin + float(T) * (dS_at_xmin - dS_t_at_xmin)
+    slope_target = (dH_t_xmin
+                    + float(T)
+                    * (dS_xmin - dS_t_xmin))
 
     dx = x_cut - xmin
     if abs(dx) < 1e-10:
-        # Degenerate — no patch region; return original H padded to 3 terms.
         h = list(H)
-        return (h + [0.0] * max(0, 3 - len(h)))[:3]
+        return (h + [0.0]
+                * max(0, 3 - len(h)))[:3]
 
     q2 = (dH_at_cut - slope_target) / (2.0 * dx)
     q1 = slope_target - 2.0 * q2 * xmin
@@ -752,63 +422,66 @@ def compute_left_patch_H(phase_data, target_phase_data, x_cut, T=0.0,
     return [q0, q1, q2]
 
 
-def compute_right_patch_H(phase_data, target_phase_data, x_cut, T=0.0,
-                          phase_data_by_name=None):
-    """Compute quadratic H coefficients Q(x) for the right patch region.
+def compute_right_patch_H(phase_spec, target_spec,
+                          x_cut, T=0.0,
+                          specs_by_name=None):
+    """Compute quadratic H coefficients Q(x) for the
+    right patch region.
 
-    Returns [q0, q1, q2] such that Q(x) = q0 + q1·x + q2·x² satisfies:
-
-    1.  Q(x_cut)   = H_phase(x_cut)           — value continuity at the cut
-    2.  Q'(x_cut)  = H_phase'(x_cut)          — slope continuity at the cut
-    3.  G_patch'(xmax_eff, T) = G_root'(xmax_eff, T)  — G slope match with
-        the chain root at the effective right edge.
-
-    Condition 3 expands to:
-        Q'(xmax_eff) = H_root'(xmax_eff) + T·(S_phase'(xmax_eff) − S_root'(xmax_eff))
-
-    When *phase_data_by_name* is supplied the right patch chain is followed
-    (target → its target → …) so that chained patches share a common endpoint.
-    When T = 0 the formula reduces to pure H-slope matching at xmax_eff.
+    Symmetric to compute_left_patch_H but matches the
+    G slope at xmax_eff (the chain-root right edge).
 
     Parameters
     ----------
-    phase_data        : PhaseData  — phase being patched
-    target_phase_data : PhaseData  — target phase whose slope is matched at xmax
-    x_cut             : float      — cut-off composition (right patch covers [x_cut, xmax_eff])
-    T                 : float      — temperature for G slope matching (default 0 → H only)
-    phase_data_by_name : dict | None — full {name: PhaseData} mapping for chain resolution
+    phase_spec   : PhaseSpec — phase being patched
+    target_spec  : PhaseSpec — target for slope match
+    x_cut        : float     — cut-off composition
+    T            : float     — reference temperature
+    specs_by_name : dict|None — for chain resolution
 
     Returns
     -------
     list[float] — [q0, q1, q2]
     """
     import numpy as np
-    pv  = np.polynomial.polynomial.polyval
-    pd_d = np.polynomial.polynomial.polyder
+    pv = np.polynomial.polynomial.polyval
+    pd = np.polynomial.polynomial.polyder
 
-    # Resolve patch chain: follow target's right-patch chain to the root.
-    if phase_data_by_name is not None:
-        root_pd, xmax = _resolve_right_patch_chain(target_phase_data, phase_data_by_name)
+    if specs_by_name is not None:
+        root, xmax = _resolve_right_patch_chain(
+            target_spec, specs_by_name)
     else:
-        root_pd, xmax = target_phase_data, phase_data.xmax
+        root = target_spec
+        xmax = phase_spec.xmax
 
-    H   = np.asarray(phase_data.hs_H   or [0.0])
-    S   = np.asarray(phase_data.hs_S   or [0.0])
-    H_t = np.asarray(root_pd.hs_H or [0.0])
-    S_t = np.asarray(root_pd.hs_S or [0.0])
+    H   = np.asarray(
+        phase_spec.H_coeffs or [0.0])
+    S   = np.asarray(
+        phase_spec.S_coeffs or [0.0])
+    H_t = np.asarray(
+        root.H_coeffs or [0.0])
+    S_t = np.asarray(
+        root.S_coeffs or [0.0])
 
-    H_val          = float(pv(x_cut, H))
-    dH_at_cut      = float(pv(x_cut, pd_d(H))) if len(H) > 1 else 0.0
-    dH_t_at_xmax   = float(pv(xmax,  pd_d(H_t))) if len(H_t) > 1 else 0.0
-    dS_at_xmax     = float(pv(xmax,  pd_d(S)))  if len(S)   > 1 else 0.0
-    dS_t_at_xmax   = float(pv(xmax,  pd_d(S_t))) if len(S_t) > 1 else 0.0
+    H_val      = float(pv(x_cut, H))
+    dH_at_cut  = (float(pv(x_cut, pd(H)))
+                  if len(H) > 1 else 0.0)
+    dH_t_xmax  = (float(pv(xmax, pd(H_t)))
+                  if len(H_t) > 1 else 0.0)
+    dS_xmax    = (float(pv(xmax, pd(S)))
+                  if len(S) > 1 else 0.0)
+    dS_t_xmax  = (float(pv(xmax, pd(S_t)))
+                  if len(S_t) > 1 else 0.0)
 
-    slope_target = dH_t_at_xmax + float(T) * (dS_at_xmax - dS_t_at_xmax)
+    slope_target = (dH_t_xmax
+                    + float(T)
+                    * (dS_xmax - dS_t_xmax))
 
     dx = xmax - x_cut
     if abs(dx) < 1e-10:
         h = list(H)
-        return (h + [0.0] * max(0, 3 - len(h)))[:3]
+        return (h + [0.0]
+                * max(0, 3 - len(h)))[:3]
 
     q2 = (slope_target - dH_at_cut) / (2.0 * dx)
     q1 = dH_at_cut - 2.0 * q2 * x_cut
@@ -1284,6 +957,37 @@ class PhaseEditorWidget(QFrame):
         vle_layout.addStretch()
         self._stack.addWidget(vle_page)   # index 2
 
+        # CALPHAD page (index 3)
+        calphad_page = QWidget()
+        calphad_lay = QVBoxLayout(calphad_page)
+        calphad_lay.setContentsMargins(0, 0, 0, 0)
+        calphad_lay.setSpacing(4)
+        calphad_hint = QLabel(
+            'G(x, T, P) from assessed TDB '
+            'database.\nAll thermodynamic '
+            'parameters come from the TDB '
+            'file; no manual coefficients.')
+        calphad_hint.setStyleSheet(
+            'color: #777; font-style: italic;')
+        calphad_lay.addWidget(calphad_hint)
+        calphad_row = QHBoxLayout()
+        calphad_row.addWidget(
+            QLabel('TDB phase name:'))
+        self._calphad_phase_edit = QLineEdit(
+            'LIQUID')
+        self._calphad_phase_edit.setMaximumWidth(
+            160)
+        self._calphad_phase_edit.setToolTip(
+            'Phase identifier in the TDB file'
+            ', e.g. LIQUID, FCC_A1, HCP_A3')
+        calphad_row.addWidget(
+            self._calphad_phase_edit)
+        calphad_row.addStretch()
+        calphad_lay.addLayout(calphad_row)
+        calphad_lay.addStretch()
+        self._stack.addWidget(
+            calphad_page)                 # index 3
+
         root.addWidget(self._stack)
         self.set_energy_form(energy_form)
 
@@ -1353,8 +1057,12 @@ class PhaseEditorWidget(QFrame):
         self._update_stack_page()
 
     def _update_stack_page(self):
-        """Select the correct stack page from (_energy_form, _vle_mode)."""
-        if self._energy_form == 'polynomial':
+        """Select the correct stack page from
+        (_energy_form, _vle_mode).
+        """
+        if self._energy_form == 'calphad':
+            self._stack.setCurrentIndex(3)
+        elif self._energy_form == 'polynomial':
             self._stack.setCurrentIndex(1)
         elif self._vle_mode:
             self._stack.setCurrentIndex(2)
@@ -1365,6 +1073,11 @@ class PhaseEditorWidget(QFrame):
 
     def set_energy_form(self, form):
         self._energy_form = form
+        # Hide controls not applicable to
+        # CALPHAD phases.
+        is_calphad = (form == 'calphad')
+        self._ideal_gas_cb.setVisible(
+            not is_calphad)
         self._update_stack_page()
 
     def _update_eq_label(self, _=None):
@@ -1381,96 +1094,199 @@ class PhaseEditorWidget(QFrame):
             text += '   \u2502   V(x) = V\u2080 + V\u2081\u00b7x + V\u2082\u00b7x\u00b2 + \u2026'
         self._hint_lbl.setText(text)
 
-    def get_phase_data(self) -> PhaseData:
-        pd = PhaseData()
-        pd.name = self._name_edit.text() or 'phase'
-        pd.phase_type = self._type_combo.currentText()
-        pd.xmin = self._xmin_sb.value()
-        pd.xmax = self._xmax_sb.value()
-        pd.ideal_gas = self._ideal_gas_cb.isChecked()
-        if self._vle_mode and pd.phase_type == 'gas' and self._energy_form == 'HS':
-            pd.vle = {
-                'T_bp_A': self._T_bp_A_sb.value(),
-                'T_bp_B': self._T_bp_B_sb.value(),
-                'L_A':    self._L_A_sb.value(),
-                'L_B':    self._L_B_sb.value(),
-            }
-        else:
-            pd.hs_H = self._H_row.get_coeffs()
-            pd.hs_S = self._S_row.get_coeffs()
-            pd.hs_V = self._V_row.get_coeffs() if self._V_enable_cb.isChecked() else None
-        pd.poly = self._poly_widget.get_coeffs()
-        pd.patch_left = (self._patch_slider_to_x(self._left_patch_slider.value())
-                         if self._left_patch_cb.isChecked() else None)
-        pd.patch_right = (self._patch_slider_to_x(self._right_patch_slider.value())
-                          if self._right_patch_cb.isChecked() else None)
-        pd.patch_left_phase = (self._left_patch_phase_combo.currentText()
-                               if self._left_patch_cb.isChecked() else '')
-        pd.patch_right_phase = (self._right_patch_phase_combo.currentText()
-                                if self._right_patch_cb.isChecked() else '')
-        return pd
+    def get_phase_spec(self):
+        """Collect widget state into a PhaseSpec.
 
-    def set_phase_data(self, data: PhaseData):
-        self._name_edit.setText(data.name)
-        # Block type-combo signal — we handle mode switching explicitly below.
+        Determines model_type from the energy form and
+        whether patches are enabled.  VLE gas phases use
+        model_type='HS' with a vle_params sub-dict.
+        """
+        name = (self._name_edit.text()
+                or 'phase')
+        ptype = self._type_combo.currentText()
+        xmin = self._xmin_sb.value()
+        xmax = self._xmax_sb.value()
+        ig = self._ideal_gas_cb.isChecked()
+
+        # -- VLE gas --------------------------------
+        if (self._vle_mode
+                and ptype == 'gas'
+                and self._energy_form == 'HS'):
+            return PhaseSpec(
+                name=name, phase_type=ptype,
+                xmin=xmin, xmax=xmax,
+                model_type='HS',
+                model_params={
+                    'ideal_gas': ig,
+                    'vle_params': {
+                        'liquid_phase': '',
+                        'T_bp_A': (
+                            self._T_bp_A_sb.value()),
+                        'T_bp_B': (
+                            self._T_bp_B_sb.value()),
+                        'L_A': (
+                            self._L_A_sb.value()),
+                        'L_B': (
+                            self._L_B_sb.value()),
+                    },
+                })
+
+        # -- CALPHAD form ---------------------------
+        if self._energy_form == 'calphad':
+            return PhaseSpec(
+                name=name, phase_type=ptype,
+                xmin=xmin, xmax=xmax,
+                model_type='calphad',
+                model_params={
+                    'calphad_phase': (
+                        self._calphad_phase_edit
+                        .text().strip()
+                        or 'LIQUID'),
+                })
+
+        # -- HS form --------------------------------
+        if self._energy_form == 'HS':
+            V = (self._V_row.get_coeffs()
+                 if self._V_enable_cb.isChecked()
+                 else None)
+            mp = {
+                'H_coeffs': (
+                    self._H_row.get_coeffs()),
+                'S_coeffs': (
+                    self._S_row.get_coeffs()),
+                'V_coeffs': V,
+                'ideal_gas': ig,
+            }
+            has_l = self._left_patch_cb.isChecked()
+            has_r = self._right_patch_cb.isChecked()
+            if has_l or has_r:
+                if has_l:
+                    mp['patch_left_x'] = (
+                        self._patch_slider_to_x(
+                            self._left_patch_slider
+                            .value()))
+                    mp['patch_left_phase'] = (
+                        self._left_patch_phase_combo
+                        .currentText())
+                if has_r:
+                    mp['patch_right_x'] = (
+                        self._patch_slider_to_x(
+                            self._right_patch_slider
+                            .value()))
+                    mp['patch_right_phase'] = (
+                        self._right_patch_phase_combo
+                        .currentText())
+                return PhaseSpec(
+                    name=name, phase_type=ptype,
+                    xmin=xmin, xmax=xmax,
+                    model_type='piecewise_patch',
+                    model_params=mp)
+            return PhaseSpec(
+                name=name, phase_type=ptype,
+                xmin=xmin, xmax=xmax,
+                model_type='HS',
+                model_params=mp)
+
+        # -- Polynomial form ------------------------
+        V = (self._V_row.get_coeffs()
+             if self._V_enable_cb.isChecked()
+             else None)
+        return PhaseSpec(
+            name=name, phase_type=ptype,
+            xmin=xmin, xmax=xmax,
+            model_type='polynomial',
+            model_params={
+                'poly_coeffs': (
+                    self._poly_widget.get_coeffs()),
+                'V_coeffs': V,
+                'ideal_gas': ig,
+            })
+
+    def set_phase_spec(self, spec):
+        """Populate widgets from a PhaseSpec."""
+        self._name_edit.setText(spec.name)
         self._type_combo.blockSignals(True)
-        idx = self._type_combo.findText(data.phase_type)
+        idx = self._type_combo.findText(
+            spec.phase_type)
         if idx >= 0:
             self._type_combo.setCurrentIndex(idx)
         self._type_combo.blockSignals(False)
 
-        self._xmin_sb.setValue(data.xmin)
-        self._xmax_sb.setValue(data.xmax)
-        self._ideal_gas_cb.setChecked(data.ideal_gas)
+        self._xmin_sb.setValue(spec.xmin)
+        self._xmax_sb.setValue(spec.xmax)
+        self._ideal_gas_cb.setChecked(
+            spec.ideal_gas)
 
-        # Always populate the H/S spinboxes so they hold correct values if the
-        # user switches to "Use custom H/S instead".
-        self._H_row.set_coeffs(data.hs_H or [0.0])
-        self._S_row.set_coeffs(data.hs_S or [0.0])
-        if data.hs_V:
+        # Always populate H/S so they are ready if
+        # the user switches from VLE to raw H/S.
+        self._H_row.set_coeffs(
+            spec.H_coeffs or [0.0])
+        self._S_row.set_coeffs(
+            spec.S_coeffs or [0.0])
+        V = spec.V_coeffs
+        if V:
             self._V_enable_cb.setChecked(True)
-            self._V_row.set_coeffs(data.hs_V)
+            self._V_row.set_coeffs(V)
         else:
             self._V_enable_cb.setChecked(False)
-        self._poly_widget.set_coeffs(data.poly or [[0.0]])
+        self._poly_widget.set_coeffs(
+            spec.poly_coeffs or [[0.0]])
 
-        if data.vle is not None:
-            # Explicit VLE parameterisation — populate spinboxes and show VLE page.
+        vle = spec.vle_params
+        if vle is not None:
             self._vle_mode = True
-            self._T_bp_A_sb.setValue(data.vle.get('T_bp_A', 350.0))
-            self._T_bp_B_sb.setValue(data.vle.get('T_bp_B', 400.0))
-            self._L_A_sb.setValue(data.vle.get('L_A', 1.0))
-            self._L_B_sb.setValue(data.vle.get('L_B', 1.0))
+            self._T_bp_A_sb.setValue(
+                vle.get('T_bp_A', 350.0))
+            self._T_bp_B_sb.setValue(
+                vle.get('T_bp_B', 400.0))
+            self._L_A_sb.setValue(
+                vle.get('L_A', 1.0))
+            self._L_B_sb.setValue(
+                vle.get('L_B', 1.0))
         else:
-            # Raw H/S data (including old-style gas phases) — show HS page.
             self._vle_mode = False
 
         # Restore patch state.
-        if data.patch_left is not None:
+        plx = spec.patch_left_x
+        if plx is not None:
             self._left_patch_cb.setChecked(True)
-            self._left_patch_slider.setValue(self._x_to_patch_slider(data.patch_left))
+            self._left_patch_slider.setValue(
+                self._x_to_patch_slider(plx))
         else:
             self._left_patch_cb.setChecked(False)
             self._left_patch_slider.setValue(0)
-        if data.patch_right is not None:
+        prx = spec.patch_right_x
+        if prx is not None:
             self._right_patch_cb.setChecked(True)
-            self._right_patch_slider.setValue(self._x_to_patch_slider(data.patch_right))
+            self._right_patch_slider.setValue(
+                self._x_to_patch_slider(prx))
         else:
             self._right_patch_cb.setChecked(False)
-            self._right_patch_slider.setValue(_PATCH_STEPS)
+            self._right_patch_slider.setValue(
+                _PATCH_STEPS)
         self._update_patch_labels()
 
-        # Store requested patch-phase names; applied by update_patch_phase_list().
-        self._patch_left_phase_name = getattr(data, 'patch_left_phase', '') or ''
-        self._patch_right_phase_name = getattr(data, 'patch_right_phase', '') or ''
-        # Apply immediately if the combos are already populated.
-        for combo, name in (
-                (self._left_patch_phase_combo, self._patch_left_phase_name),
-                (self._right_patch_phase_combo, self._patch_right_phase_name)):
-            if name:
-                idx = combo.findText(name)
+        # Store patch-phase names; applied by
+        # update_patch_phase_list().
+        self._patch_left_phase_name = (
+            spec.patch_left_phase or '')
+        self._patch_right_phase_name = (
+            spec.patch_right_phase or '')
+        for combo, nm in (
+                (self._left_patch_phase_combo,
+                 self._patch_left_phase_name),
+                (self._right_patch_phase_combo,
+                 self._patch_right_phase_name)):
+            if nm:
+                idx = combo.findText(nm)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
+
+        # Populate CALPHAD phase name.
+        calphad_ph = spec.calphad_phase
+        if calphad_ph:
+            self._calphad_phase_edit.setText(
+                calphad_ph)
 
         self._update_stack_page()
 
@@ -1481,18 +1297,27 @@ class PhaseEditorWidget(QFrame):
 # ---------------------------------------------------------------------------
 
 class BuilderWindow(QDialog):
-    """Non-modal dialog for building / editing the thermodynamic system.
+    """Non-modal dialog for building/editing the
+    thermodynamic system.
+
+    Works directly with SystemSpec / PhaseSpec — no
+    intermediate data model.
 
     Signals
     -------
-    system_applied : Signal(object)
-        Emitted with the newly constructed System when the user clicks Apply.
+    system_applied : Signal(object, object)
+        Emitted with (System, SystemSpec) on Apply.
+    patch_changed  : Signal(object)
+        Emitted with a preview System on patch
+        slider move.
     """
 
-    system_applied = Signal(object)
-    patch_changed  = Signal(object)   # emitted with a preview System on patch slider move
+    # (System, SystemSpec) on Apply.
+    system_applied = Signal(object, object)
+    # Preview System on patch slider move.
+    patch_changed = Signal(object)
 
-    def __init__(self, system=None, parent=None):
+    def __init__(self, spec=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle('PDE Builder')
         self.setWindowFlags(Qt.Window)   # independent (non-modal) window
@@ -1539,11 +1364,74 @@ class BuilderWindow(QDialog):
         self._form_combo = QComboBox()
         self._form_combo.addItem('HS')
         self._form_combo.addItem('polynomial')
-        self._form_combo.currentTextChanged.connect(self._on_form_changed)
+        self._form_combo.addItem('calphad')
+        self._form_combo.currentTextChanged.connect(
+            self._on_form_changed)
         sys_layout.addWidget(self._form_combo)
         sys_layout.addStretch()
 
         root.addWidget(sys_group)
+
+        # ---- TDB group (CALPHAD only) ----
+        self._tdb_group = QGroupBox(
+            'TDB Database (CALPHAD)')
+        tdb_layout = QHBoxLayout(
+            self._tdb_group)
+        tdb_layout.addWidget(
+            QLabel('TDB file:'))
+        self._tdb_path_edit = QLineEdit()
+        self._tdb_path_edit.setMinimumWidth(300)
+        self._tdb_path_edit.setToolTip(
+            'Path to a Thermo-Calc Database '
+            '(.tdb) file')
+        tdb_layout.addWidget(
+            self._tdb_path_edit)
+        browse_btn = QPushButton(
+            'Browse\u2026')
+        browse_btn.clicked.connect(
+            self._on_browse_tdb)
+        tdb_layout.addWidget(browse_btn)
+        tdb_layout.addStretch()
+        self._tdb_group.setVisible(False)
+        root.addWidget(self._tdb_group)
+
+        # ---- Units group ----
+        self._units_group = QGroupBox('Units')
+        units_lay = QHBoxLayout(
+            self._units_group)
+        units_lay.addWidget(
+            QLabel('Energy:'))
+        self._energy_unit_combo = QComboBox()
+        self._energy_unit_combo.setEditable(True)
+        for u in ('kJ/mol', 'J/mol',
+                  'cal/mol', 'kcal/mol',
+                  'eV/atom'):
+            self._energy_unit_combo.addItem(u)
+        self._energy_unit_combo.setMaximumWidth(
+            100)
+        units_lay.addWidget(
+            self._energy_unit_combo)
+        units_lay.addSpacing(8)
+        units_lay.addWidget(
+            QLabel('Temperature:'))
+        self._temp_unit_combo = QComboBox()
+        self._temp_unit_combo.setEditable(True)
+        self._temp_unit_combo.addItem('K')
+        self._temp_unit_combo.setMaximumWidth(60)
+        units_lay.addWidget(
+            self._temp_unit_combo)
+        units_lay.addSpacing(8)
+        units_lay.addWidget(
+            QLabel('Pressure:'))
+        self._pres_unit_combo = QComboBox()
+        self._pres_unit_combo.setEditable(True)
+        for u in ('atm', 'Pa', 'bar', 'kPa'):
+            self._pres_unit_combo.addItem(u)
+        self._pres_unit_combo.setMaximumWidth(80)
+        units_lay.addWidget(
+            self._pres_unit_combo)
+        units_lay.addStretch()
+        root.addWidget(self._units_group)
 
         # ---- Temperature group ----
         temp_group = QGroupBox('Temperature')
@@ -1629,9 +1517,8 @@ class BuilderWindow(QDialog):
         root.addLayout(btn_row)
 
         # ---- Populate ----
-        if system is not None:
-            sd = SystemData.from_system(system)
-            self._populate_from_system_data(sd)
+        if spec is not None:
+            self._populate_from_spec(spec)
         else:
             self._add_component_edit('A')
             self._add_component_edit('B')
@@ -1654,6 +1541,15 @@ class BuilderWindow(QDialog):
             edit = self._comp_edits.pop()
             edit.setParent(None)
 
+    def _on_browse_tdb(self):
+        """Open file dialog for TDB selection."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Select TDB file', '',
+            'TDB files (*.tdb);;'
+            'All files (*)')
+        if path:
+            self._tdb_path_edit.setText(path)
+
     # ------------------------------------------------------------------
     # Phase management
     # ------------------------------------------------------------------
@@ -1661,6 +1557,19 @@ class BuilderWindow(QDialog):
     def _on_form_changed(self, form):
         for editor in self._phase_editors:
             editor.set_energy_form(form)
+        self._tdb_group.setVisible(
+            form == 'calphad')
+        # Lock units to SI for CALPHAD systems.
+        if form == 'calphad':
+            self._energy_unit_combo.setCurrentText(
+                'J/mol')
+            self._temp_unit_combo.setCurrentText(
+                'K')
+            self._pres_unit_combo.setCurrentText(
+                'Pa')
+            self._units_group.setEnabled(False)
+        else:
+            self._units_group.setEnabled(True)
 
     def _unique_phase_name(self, base='phase'):
         """Return *base* if unused, otherwise *base_2*, *base_3*, …"""
@@ -1688,14 +1597,17 @@ class BuilderWindow(QDialog):
             self._last_names[editor] = new_name
             self._refresh_patch_phase_lists()
 
-    def _add_phase(self, data=None):
+    def _add_phase(self, spec=None):
         form = self._form_combo.currentText()
-        editor = PhaseEditorWidget(energy_form=form)
-        if data is not None:
-            data.name = self._unique_phase_name(data.name)
-            editor.set_phase_data(data)
+        editor = PhaseEditorWidget(
+            energy_form=form)
+        if spec is not None:
+            spec.name = self._unique_phase_name(
+                spec.name)
+            editor.set_phase_spec(spec)
         else:
-            editor._name_edit.setText(self._unique_phase_name('phase'))
+            editor._name_edit.setText(
+                self._unique_phase_name('phase'))
         self._last_names[editor] = editor._name_edit.text()
         editor.remove_requested.connect(lambda e=editor: self._remove_phase(e))
         editor._name_edit.editingFinished.connect(
@@ -1725,56 +1637,160 @@ class BuilderWindow(QDialog):
     # Data collection / population
     # ------------------------------------------------------------------
 
-    def _collect_system_data(self) -> SystemData:
-        sd = SystemData()
-        sd.title = self._title_edit.text()
-        sd.components = [e.text() for e in self._comp_edits if e.text()]
-        if not sd.components:
-            sd.components = ['A', 'B']
-        sd.energy_form = self._form_combo.currentText()
-        sd.T_min = self._T_min_sb.value()
-        sd.T_max = self._T_max_sb.value()
-        sd.T_initial = self._T_init_sb.value()
-        sd.has_pressure = self._pres_enable_cb.isChecked()
-        sd.P_min = self._P_min_sb.value()
-        sd.P_max = self._P_max_sb.value()
-        sd.P_initial = self._P_init_sb.value()
-        sd.P_unit = self._P_unit_edit.text()
-        sd.R_gas = self._R_gas_sb.value()
-        sd.P_ref = self._P_ref_sb.value()
-        sd.phases = [e.get_phase_data() for e in self._phase_editors]
-        return sd
+    def _collect_system_spec(self):
+        """Build a SystemSpec from current widget state.
 
-    def _populate_from_system_data(self, sd: SystemData):
-        # Clear existing phase editors.
+        Also resolves VLE liquid_phase references
+        (first liquid phase in declaration order).
+        """
+        comps = [e.text()
+                 for e in self._comp_edits
+                 if e.text()]
+        if not comps:
+            comps = ['A', 'B']
+
+        # -- Field specs --------------------------
+        t_spec = FieldSpec(
+            name='temperature', symbol='T',
+            unit='K',
+            min_val=self._T_min_sb.value(),
+            max_val=self._T_max_sb.value(),
+            initial_val=self._T_init_sb.value())
+        fspecs = [t_spec]
+        if self._pres_enable_cb.isChecked():
+            extras = {}
+            rg = self._R_gas_sb.value()
+            if rg:
+                extras['R_gas'] = rg
+            extras['P_ref'] = (
+                self._P_ref_sb.value())
+            p_spec = FieldSpec(
+                name='pressure', symbol='P',
+                unit=self._P_unit_edit.text(),
+                min_val=self._P_min_sb.value(),
+                max_val=self._P_max_sb.value(),
+                initial_val=(
+                    self._P_init_sb.value()),
+                extras=extras)
+            fspecs.append(p_spec)
+
+        # -- Phase specs --------------------------
+        pspecs = [
+            e.get_phase_spec()
+            for e in self._phase_editors]
+
+        # Resolve VLE liquid_phase references.
+        from pde_input import _resolve_vle_liquid
+        _resolve_vle_liquid(pspecs)
+
+        energy_form = (
+            self._form_combo.currentText())
+
+        # -- Units --------------------------------
+        # Collect declared units from the combos.
+        # CALPHAD systems are locked to SI; native
+        # systems read the user's selections.
+        tdb_path = ''
+        if energy_form == 'calphad':
+            tdb_path = (
+                self._tdb_path_edit.text()
+                .strip())
+            calphad_comps = [
+                c.upper() for c in comps]
+            for ps in pspecs:
+                if ps.model_type == 'calphad':
+                    ps.model_params[
+                        'components'
+                    ] = calphad_comps
+        units = {}
+        e_unit = (
+            self._energy_unit_combo
+            .currentText().strip())
+        t_unit = (
+            self._temp_unit_combo
+            .currentText().strip())
+        p_unit = (
+            self._pres_unit_combo
+            .currentText().strip())
+        if e_unit:
+            units['energy'] = e_unit
+        if t_unit:
+            units['temperature'] = t_unit
+        if p_unit:
+            units['pressure'] = p_unit
+
+        return SystemSpec(
+            title=self._title_edit.text(),
+            components=comps,
+            energy_form=energy_form,
+            fields=fspecs,
+            phases=pspecs,
+            tdb_path=tdb_path,
+            units=units,
+        )
+
+    def _populate_from_spec(self, spec):
+        """Fill all widgets from a SystemSpec."""
+        # Clear existing editors.
         for editor in list(self._phase_editors):
             self._remove_phase(editor)
-        # Clear existing component edits.
         for edit in list(self._comp_edits):
             edit.setParent(None)
         self._comp_edits.clear()
 
-        self._title_edit.setText(sd.title)
-        for comp in sd.components:
+        self._title_edit.setText(spec.title)
+        for comp in spec.components:
             self._add_component_edit(comp)
 
-        idx = self._form_combo.findText(sd.energy_form)
+        idx = self._form_combo.findText(
+            spec.energy_form)
         if idx >= 0:
             self._form_combo.setCurrentIndex(idx)
 
-        self._T_min_sb.setValue(sd.T_min)
-        self._T_max_sb.setValue(sd.T_max)
-        self._T_init_sb.setValue(sd.T_initial)
-        self._pres_enable_cb.setChecked(sd.has_pressure)
-        self._P_min_sb.setValue(sd.P_min)
-        self._P_max_sb.setValue(sd.P_max)
-        self._P_init_sb.setValue(sd.P_initial)
-        self._P_unit_edit.setText(sd.P_unit)
-        self._R_gas_sb.setValue(sd.R_gas)
-        self._P_ref_sb.setValue(sd.P_ref)
+        # TDB path (CALPHAD systems).
+        self._tdb_path_edit.setText(
+            spec.tdb_path or '')
 
-        for phase_data in sd.phases:
-            self._add_phase(phase_data)
+        # Units combos.
+        u = spec.units or {}
+        if u.get('energy'):
+            self._energy_unit_combo.setCurrentText(
+                u['energy'])
+        if u.get('temperature'):
+            self._temp_unit_combo.setCurrentText(
+                u['temperature'])
+        if u.get('pressure'):
+            self._pres_unit_combo.setCurrentText(
+                u['pressure'])
+
+        # Fill field widgets from FieldSpecs.
+        has_pres = False
+        for fs in spec.fields:
+            if fs.name == 'temperature':
+                self._T_min_sb.setValue(
+                    fs.min_val)
+                self._T_max_sb.setValue(
+                    fs.max_val)
+                self._T_init_sb.setValue(
+                    fs.initial_val)
+            elif fs.name == 'pressure':
+                has_pres = True
+                self._P_min_sb.setValue(
+                    fs.min_val)
+                self._P_max_sb.setValue(
+                    fs.max_val)
+                self._P_init_sb.setValue(
+                    fs.initial_val)
+                self._P_unit_edit.setText(
+                    fs.unit)
+                self._R_gas_sb.setValue(
+                    fs.extras.get('R_gas', 0.0))
+                self._P_ref_sb.setValue(
+                    fs.extras.get('P_ref', 1.0))
+        self._pres_enable_cb.setChecked(has_pres)
+
+        for ps in spec.phases:
+            self._add_phase(ps)
         self._refresh_patch_phase_lists()
 
     # ------------------------------------------------------------------
@@ -1783,68 +1799,91 @@ class BuilderWindow(QDialog):
 
     def _on_load(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load XML', '', 'XML files (*.xml);;All files (*)')
+            self, 'Load XML', '',
+            'XML files (*.xml);;All files (*)')
         if path:
             try:
-                sd = SystemData.from_xml(path)
-                self._populate_from_system_data(sd)
+                from pde_input import (
+                    parse_system_spec)
+                spec = parse_system_spec(path)
+                self._populate_from_spec(spec)
             except Exception as exc:
-                QMessageBox.warning(self, 'Load Error', str(exc))
+                QMessageBox.warning(
+                    self, 'Load Error', str(exc))
 
     def _on_save(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save XML', '', 'XML files (*.xml);;All files (*)')
+            self, 'Save XML', '',
+            'XML files (*.xml);;All files (*)')
         if path:
             try:
-                sd = self._collect_system_data()
+                spec = self._collect_system_spec()
                 with open(path, 'w') as fh:
-                    fh.write(sd.to_xml_str())
+                    fh.write(spec.to_xml_str())
             except Exception as exc:
-                QMessageBox.warning(self, 'Save Error', str(exc))
+                QMessageBox.warning(
+                    self, 'Save Error', str(exc))
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------
     # Patch slider live-preview support
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------
 
     def set_current_T(self, T: float):
-        """Called by MainWindow when the temperature slider moves."""
+        """Called by MainWindow on slider move."""
         self._current_T = float(T)
 
-    def _on_patch_changed(self):
-        """Emit a preview system when a left-patch slider or combo changes.
+    def _build_system_from_spec(self, spec):
+        """Build a System from *spec*, overriding T_ref
+        with the current slider temperature when set.
 
-        The emitted system uses the current T for the G slope matching in the
-        patch polynomial.  The main window listens and redraws GxCanvas without
-        performing a full UI reload.
+        Returns the (System, spec) pair.
+        """
+        build = copy.deepcopy(spec)
+        if self._current_T is not None:
+            for fs in build.fields:
+                if fs.name == 'temperature':
+                    fs.initial_val = (
+                        self._current_T)
+                    break
+        return build.to_system(), spec
+
+    def _on_patch_changed(self):
+        """Emit a preview System when a patch slider
+        or combo changes.
         """
         try:
-            sd = self._collect_system_data()
-            if not sd.phases:
+            spec = self._collect_system_spec()
+            if not spec.phases:
                 return
-            t = self._current_T if self._current_T is not None else sd.T_initial
-            system = sd.to_system(current_T=t)
+            system, _ = (
+                self._build_system_from_spec(spec))
             self.patch_changed.emit(system)
         except Exception:
-            pass   # silently ignore during live drag
+            pass
 
-    # ------------------------------------------------------------------
-    # Button slots
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------
+    # Apply / close
+    # ------------------------------------------------------
 
-    def _on_apply(self) -> bool:
-        """Apply current state. Returns True on success, False on error."""
+    def _on_apply(self):
+        """Apply current state.  Returns True on
+        success, False on error.
+        """
         try:
-            sd = self._collect_system_data()
-            if not sd.phases:
-                QMessageBox.warning(self, 'Apply Error',
-                                    'Add at least one phase before applying.')
+            spec = self._collect_system_spec()
+            if not spec.phases:
+                QMessageBox.warning(
+                    self, 'Apply Error',
+                    'Add at least one phase '
+                    'before applying.')
                 return False
-            t = self._current_T if self._current_T is not None else sd.T_initial
-            system = sd.to_system(current_T=t)
+            system, spec = (
+                self._build_system_from_spec(spec))
         except Exception as exc:
-            QMessageBox.warning(self, 'Apply Error', str(exc))
+            QMessageBox.warning(
+                self, 'Apply Error', str(exc))
             return False
-        self.system_applied.emit(system)
+        self.system_applied.emit(system, spec)
         return True
 
     def _on_close(self):
@@ -1856,28 +1895,29 @@ class BuilderWindow(QDialog):
 
     def closeEvent(self, event):
         if not getattr(self, '_closing', False):
-            # Window X button: silently apply if possible, ignore errors
             try:
-                sd = self._collect_system_data()
-                if sd.phases:
-                    t = self._current_T if self._current_T is not None else sd.T_initial
-                    system = sd.to_system(current_T=t)
-                    self.system_applied.emit(system)
+                spec = self._collect_system_spec()
+                if spec.phases:
+                    system, spec = (
+                        self._build_system_from_spec(
+                            spec))
+                    self.system_applied.emit(
+                        system, spec)
             except Exception:
                 pass
         event.accept()
 
-    # ------------------------------------------------------------------
-    # Canvas-edit integration (called by GxCanvas via MainWindow)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------
+    # Canvas-edit integration
+    # ------------------------------------------------------
 
-    def update_phase_data(self, name: str, data: PhaseData):
-        """Update the spinboxes for phase *name* with fresh PhaseData.
-
-        Called by the G-x canvas (via MainWindow._on_phase_edited) whenever
-        the user drags a handle.  Silently no-ops when the phase is not found.
+    def update_phase_spec(self, name, spec):
+        """Update spinboxes for phase *name* from a
+        PhaseSpec.  Called by GxCanvas via MainWindow
+        after a handle drag.  Silently no-ops when the
+        phase is not found.
         """
         for editor in self._phase_editors:
             if editor._name_edit.text() == name:
-                editor.set_phase_data(data)
+                editor.set_phase_spec(spec)
                 return

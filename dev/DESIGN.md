@@ -174,32 +174,35 @@ coefficients, patch polynomials, and response coefficients.
 
 ## 3. XML Input (`pde_input.py`)
 
-### 3.1 Dual schema
+### 3.1 XML → SystemSpec → System
 
-Two XML schemas produce identical `System` objects:
+`parse_system()` is a thin XML → `SystemSpec` translator.
+It builds a list of `FieldSpec` and `PhaseSpec` objects
+from the XML elements, assembles a `SystemSpec`, and
+calls `spec.to_system()`.  All dependency resolution
+(VLE gas derivation, patch-H construction) happens inside
+`to_system()` via topological sort — the parser itself
+has no multi-pass logic.
 
-- **New schema** (builder output): `<fields>` block with `<field name=…
-  symbol=… unit=… min=… max=… initial=… />` elements. R_gas and P_ref live
-  on the `<field name="pressure">` element.
-- **Legacy schema** (demo files): separate `<temperature>` and optional
-  `<pressure>` blocks.
+The XML uses a `<fields>` block with `<field name=…
+symbol=… unit=… min=… max=… initial=… />` elements.
+R_gas and P_ref live on the `<field name="pressure">`
+element's extras.  A legacy fallback parser for old
+`<temperature>`/`<pressure>` blocks still exists in the
+code (`_parse_legacy_field_specs`) but is dead code
+slated for removal — backward compatibility with prior
+XML formats is not required.
 
-### 3.2 Three-pass parsing
+### 3.2 VLE elements
 
-`parse_system()` is a three-pass function:
+VLE gas phases use a `<vle T_bp_A=… T_bp_B=… L_A=…
+L_B=…/>` element inside `<phase>`.  The parser stores
+these as `vle_params` inside the `PhaseSpec.model_params`
+dict.  The liquid-phase reference is filled in by
+convention (first liquid in declaration order) after all
+phase specs are parsed.
 
-1. Parse all non-VLE, non-patch phases normally.
-2. Resolve VLE gas phases using the first liquid's H/S coefficients.
-3. Upgrade patched phases to `PiecewisePatchModel` using helper functions
-   `_compute_left_patch_H` / `_compute_right_patch_H`.
-
-### 3.3 VLE elements
-
-VLE gas phases use a `<vle T_bp_A=… T_bp_B=… L_A=… L_B=…/>` element inside
-`<phase>`. The parser stores a sentinel dict on the first pass and resolves it
-to a full `Phase` on the second pass once the liquid H/S are available.
-
-### 3.4 Optional elements
+### 3.3 Optional elements
 
 `<title>`, `<V x0=… x1=…/>` inside `<energy>` (molar volume), `ideal_gas=
 "true"` on `<phase>`, `R_gas`/`P_ref` on the pressure element.
@@ -347,14 +350,22 @@ class SystemData:
     phases:                   list[PhaseData]
 ```
 
-### 6.2 Conversion paths
+### 6.2 Conversion paths (legacy — pending removal)
 
-- `SystemData.to_system()` — three-pass builder (non-VLE, VLE gas, patched).
-  Patches computed by `compute_left_patch_H` / `compute_right_patch_H`.
-- `SystemData.from_system(system)` — reconstructs `SystemData` from a live
-  `System` via `isinstance` chains on `EnergyModel` subclasses.
-- `SystemData.from_xml(xml)` — builds `SystemData` directly from XML.
-- `SystemData.to_xml_str()` — serialises to the new `<fields>` schema.
+> **Note:** These paths exist in the current code but are
+> slated for elimination.  D-6 replaces them with the
+> Spec layer: `MainWindow` will hold a `SystemSpec`
+> directly, the builder will receive and mutate it, and
+> `from_system()` will be deleted.
+
+- `SystemData.to_system()` — three-pass builder
+  (non-VLE, VLE gas, patched).
+- `SystemData.from_system(system)` — reconstructs
+  `SystemData` from a live `System` via `isinstance`
+  chains on `EnergyModel` subclasses.
+- `SystemData.from_xml(xml)` — builds `SystemData`
+  directly from XML.
+- `SystemData.to_xml_str()` — serialises to XML.
 
 ### 6.3 Drag mechanics
 
@@ -461,10 +472,10 @@ check function is independently callable. `ConsistencyWarning` carries
 both a quick single-parameter fix and a minimum-norm joint H/S
 correction. This composable design should be preserved.
 
-**Dual XML schema.** Legacy demo files work unchanged while the
-builder emits the new `<fields>` schema. Both paths produce identical
-`System` objects via `parse_system()`. This backward compatibility is
-valuable for the demo library.
+**Clean XML schema.** The XML input uses a single
+`<fields>` schema.  Backward compatibility with prior
+XML formats is not required; the project has full
+freedom to redesign the input format as needed.
 
 **O(1) reveal animation.** `SweepCanvas` pre-draws all regions and
 hides the unrevealed portion behind a white cover rectangle.
@@ -479,15 +490,16 @@ region-classification walk assumes a 1-D composition axis, so the
 ternary generalisation is untested, but the algorithm choice itself
 does not need to change when that work is done.
 
-**Field abstraction (partial).** The `Field` dataclass cleanly
-separates the identity of an intensive parameter from its role in any
-particular view. Adding a new field to the XML and `System` works.
-However, the abstraction is incomplete downstream: `EqResult`,
-`compute_equilibrium`, `SystemData`, `FullGridWorker`, and
-`PhaseDiagram3D` all still hardcode temperature and pressure (see
-issues 12.3, 12.4, 12.6, 12.7). A third field is silently dropped or
-mislabeled. The Field dataclass is the right foundation; completing
-the abstraction is Phase 1 work.
+**Field abstraction (partial).** The `Field` dataclass
+cleanly separates the identity of an intensive parameter
+from its role in any particular view.  `SystemSpec` uses
+`fields: list[FieldSpec]` from day one, resolving the
+old `SystemData` gap (issue 12.3).  However, the
+abstraction is still incomplete downstream: `EqResult`,
+`compute_equilibrium`, `FullGridWorker`, and
+`PhaseDiagram3D` all still hardcode temperature and
+pressure (see issues 12.4, 12.6, 12.7).  Completing the
+abstraction is Phase 1 work.
 
 **Palette infrastructure (partial).** Nine named palettes exist in
 `_PALETTES` and `ColorDialog` allows user selection. However,
@@ -543,17 +555,31 @@ not change.
 
 ### 11.3 make_energy_model and factory dispatch
 
-`PhaseSpec.make_energy_model(all_specs_by_name)` dispatches on `model_type`
-and constructs the appropriate `EnergyModel` subclass. It accepts a dict of
-all `PhaseSpec` objects by name to resolve cross-phase dependencies:
+`PhaseSpec.make_energy_model(specs_by_name, built,
+field_specs)` dispatches on `model_type` and constructs
+the appropriate `EnergyModel` subclass.
 
-- VLE gas: `model_params['liquid_phase']` names the liquid whose H/S are
-  needed to compute gas H/S via `compute_vle_gas_hs`.
-- Patch: `model_params['patch_left_phase']` / `'patch_right_phase'` name the
-  target phases for G/dG matching at cut points.
+- `specs_by_name` (`dict[str, PhaseSpec]`) — all phase
+  specs in the system, for reading dependency-phase
+  coefficient data (e.g. liquid H/S for VLE gas).
+- `built` (`dict[str, EnergyModel]`) — models already
+  constructed during the topological walk, for patch
+  targets that need a built model's arrays.
+- `field_specs` (`list[FieldSpec]`) — system fields,
+  supplying R_gas/P_ref from the pressure field's
+  extras and T_ref from the temperature field.
 
-A topological sort (trivial for two-level dependency) replaces the ad-hoc
-three-pass logic in both `parse_system()` and `to_system()`.
+Cross-phase references resolved:
+
+- VLE gas: `model_params['vle_params']['liquid_phase']`
+  names the liquid whose H/S feed
+  `compute_vle_gas_hs`.
+- Patch: `model_params['patch_left_phase']` /
+  `'patch_right_phase'` name the target phases for
+  G/dG matching at cut points.
+
+A topological sort (trivial for two-level dependency)
+ensures dependencies are built before dependents.
 
 ### 11.4 Dependency-aware construction
 
@@ -578,17 +604,29 @@ System                           ← derived; never round-tripped
 `to_system()` internally. `from_system()` is eliminated entirely. The builder
 receives the live `SystemSpec` directly.
 
-### 11.5 Builder shim strategy
+### 11.5 Builder migration (resolved)
 
-During Phase 0, `PhaseSpec` temporarily exposes computed properties (`hs_H`,
-`hs_S`, `hs_V`, `poly`, `vle`, etc.) that delegate into `model_params`.
-`BuilderWindow` keeps working without UI changes. These shims are removed
-when the builder UI is redesigned to generate controls dynamically by model
-type (a later follow-on pass).
+> **Status: resolved.** D-5, D-6, D-8, and D-9 were
+> merged into a single migration.  `PhaseData` and
+> `SystemData` are deleted.
 
-`MainWindow` holds a `SystemSpec` alongside `System`. The builder receives
-the `SystemSpec`; on Apply, it calls `spec.to_system()` and emits the result.
-No `from_system()` round-trip is needed.
+`PhaseSpec` exposes permanent convenience properties
+(`H_coeffs`, `S_coeffs`, `V_coeffs`, `ideal_gas`,
+`poly_coeffs`, `vle_params`, `patch_left_x`, etc.)
+that delegate into `model_params`.  These are the
+API used by the builder UI, the fitting functions
+(`apply_handle_drag`, etc.), and the G(x) canvas
+edit overlay.
+
+`BuilderWindow` takes a `SystemSpec` directly.  On
+Apply it calls `spec.to_system()` and emits the
+`(System, SystemSpec)` pair.  `MainWindow` stores
+the `SystemSpec`; no `from_system()` round-trip.
+
+`SystemSpec.to_xml_str()` and `parse_system_spec()`
+provide serialisation round-tripping.
+`_G_from_phase_spec` replaces the former
+`_G_from_phase_data` in the viz layer.
 
 ---
 
@@ -601,89 +639,85 @@ issue notes which remediation phase addresses it (see `TODO.md`).
 
 ### 12.1 Dual data model (Phase vs. PhaseData) — Phase 0
 
-Every phase lives in two separate object graphs: the runtime graph (`Phase` +
-`EnergyModel`) and the builder graph (`PhaseData` in `SystemData`). Three
-conversion paths connect them: `to_system()`, `from_system()`, and
-`parse_system()`. Every new energy model feature must be implemented in at
-least seven places. The `isinstance` chain in `from_system()` is particularly
-fragile.
+> **Status: resolved.** `PhaseData` and `SystemData`
+> are deleted.  The builder and viz work directly
+> with `PhaseSpec`/`SystemSpec`.  See §11.5.
 
-**Root cause:** the runtime `EnergyModel` was not designed for mutation, so a
-parallel mutable container was introduced.
+The original problem: every phase lived in two
+separate object graphs (runtime `Phase` + `EnergyModel`
+and builder `PhaseData` in `SystemData`).  Three
+conversion paths connected them.  Every new energy
+model feature required changes in at least seven
+places.
 
-**Resolution:** PhaseSpec with `model_type` + `model_params` dict replaces
-PhaseData; `make_energy_model()` becomes the single factory. See §11.2–11.3.
+**Resolution:** `PhaseSpec` with `model_type` +
+`model_params` dict replaces `PhaseData`;
+`make_energy_model()` is the single factory.
+See §11.2–11.3.
 
 ### 12.2 Patch-H computation duplicated — Phase 0
 
-`_compute_left_patch_H` exists in both `pde_input.py` (plain coefficient
-lists) and `pde_builder.py` (PhaseData objects). Same algorithm, different
-signatures, slightly different degenerate-case handling.
+> **Status: resolved.** `compute_left_patch_H` and
+> `compute_right_patch_H` now live in `pde_energy.py`
+> (D-7).  The `pde_input.py` copies are removed;
+> `pde_builder.py` still has its own copies pending
+> the D-5/D-6 migration.
 
-**Root cause:** circular import avoidance. `pde_builder` lazy-imports
-`pde_input`; the reverse would create a cycle.
+The original problem: `_compute_left_patch_H` existed
+in both `pde_input.py` and `pde_builder.py` with
+different signatures and degenerate-case handling.
 
-**Resolution:** move patch-H helpers to `pde_energy.py` (which both modules
-already import). The coefficient-list form becomes canonical.
+**Resolution:** shared helpers in `pde_energy.py`;
+the coefficient-list form is canonical.
 
 ### 12.3 SystemData not migrated to fields list — Phase 0
 
-`SystemData` has flat `T_min/max/initial`, `has_pressure`, `P_min/max/initial`,
-`R_gas`, `P_ref`, `P_unit` attributes instead of a `fields` list. A third
-field (e.g., magnetic) loaded from XML is silently dropped by `from_system()`.
-When the user clicks Apply, the builder emits a two-field System with no
-warning.
+> **Status: resolved at the Spec level.** `SystemSpec`
+> uses `fields: list[FieldSpec]` (D-1) and the parse
+> path builds it correctly (D-4).  `SystemData` in the
+> builder still has the flat structure — it will be
+> replaced entirely by D-6.
 
-**Root cause:** incomplete migration; `Field` was added to the runtime
-`System` but `SystemData` kept its flat structure.
+The original problem: `SystemData` had flat
+`T_min/max/initial`, `has_pressure`,
+`P_min/max/initial`, `R_gas`, `P_ref`, `P_unit`
+attributes.  A third field was silently dropped.
 
-**Resolution:** SystemSpec uses `fields: list[FieldSpec]` from day one.
-See §11.2.
+**Resolution:** `SystemSpec` uses `fields:
+list[FieldSpec]` from day one.  See §11.2.
 
-### 12.4 EqResult / compute_equilibrium only know T and P — Phase 1
+### 12.4 EqResult / compute_equilibrium — Phase 1
 
-`EqResult` stores field values as two named scalars (`.T`, `.P`).
-`_extract_field_values` falls back to temperature for unknown fields. A third
-field produces a sweep canvas with a wrong axis label, silently.
+> **Status: resolved.** `EqResult` stores
+> `field_values: dict`.  `.T` and `.P` are computed
+> properties.  `compute_equilibrium(system,
+> field_values)` takes a dict.
+> `_extract_field_values` eliminated.
+> — D-10, D-11, D-13.
 
-**Root cause:** `EqResult` was designed before the field abstraction.
+### 12.5 `_G_from_phase_data` duplication — Phase 0
 
-**Resolution:** `EqResult.field_values: dict[str, float]`; `.T` and `.P`
-become computed properties. `compute_equilibrium` takes a `field_values:
-dict`. `_extract_field_values` is eliminated.
-
-### 12.5 `_G_from_phase_data` duplicates HSModel — Phase 0
-
-`pde_viz.py` contains a standalone `_G_from_phase_data()` that reimplements
-`HSModel._gibbs_impl`. Patched phases fall back to stale precomputed curves
-and cannot be dragged interactively.
-
-**Root cause:** during a drag, no `EnergyModel` exists for the updated
-coefficients — the drag state lives in `PhaseData`.
-
-**Resolution:** dissolves once PhaseSpec gains `make_energy_model()`. The
-canvas calls `spec.make_energy_model().gibbs(x, field_values)` during drags.
-See §11.3.
+> **Status: resolved.** `_G_from_phase_data` replaced
+> by `_G_from_phase_spec` which reads coefficients
+> directly from `PhaseSpec` convenience properties.
+> The lightweight evaluator is retained for drag
+> performance (avoids constructing a temporary
+> `EnergyModel` per mouse-move event).
 
 ### 12.6 Backward-compat gibbs() shim — Phase 1
 
-The `gibbs()` shim allocates a new dict on every call (millions per session).
-The `isinstance(T, dict)` test is fragile. Most call sites still use the old
-positional API, so the new path remains untested.
-
-**Resolution:** remove the shim; `gibbs(x, field_values: dict)` only. Update
-`Phase.gibbs()`, `compute_equilibrium()`, and `pde_check` to build and pass
-dicts. Mechanical change, done in a single pass.
+> **Status: resolved.** Shim removed.
+> `EnergyModel.gibbs(x, field_values)` is the only
+> public API.  `Phase.gibbs()`, `pde_check`, and all
+> callers updated to pass dicts.  — D-12.
 
 ### 12.7 3-D visualization hardcoded to T × P — Phase 1
 
-`FullGridWorker` takes `T_values`, `P_values` by name. `PhaseDiagram3D` and
-`Viz3DWindow` hardcode the axis convention. Single-field systems cannot
-produce a 3-D diagram at all.
-
-**Resolution:** `FullGridWorker` takes `field0_values`, `field1_values`, and
-two field indices. `PhaseDiagram3D` takes two `Field` objects. Axis labels
-come from `Field.symbol`. Single-field systems hide the 3-D button.
+> **Status: resolved.** `FullGridWorker` takes two
+> `Field` objects + value arrays.  `PhaseDiagram3D`
+> and `Viz3DWindow` derive axis labels from
+> `Field.symbol` and `Field.unit`.  Single-field
+> systems already hide the 3-D button.  — D-14, D-15.
 
 ### 12.8 pde.py entry point has legacy cruft — Phase 2
 
@@ -695,24 +729,59 @@ Unused imports (`h5py`, `math`, `random`). `ScriptSettings` class reimplements
 
 ### 12.9 Color assignment ignores active palette — Phase 2
 
-`_color_map()` always uses the module-level `_COLOR_PALETTE` (Muted). The
-palette selector works once per session but `reload_system()` reinstates
-Muted, discarding the user's choice.
+> **Status: resolved.** `_init_system_state` preserves
+> existing user-chosen colors for phases that survive
+> a reload; only new phases get fresh defaults.
+> Two-phase color/hatch also preserved.  — C-2.
 
-**Resolution:** `MainWindow` tracks the active palette as an instance
-variable. `_color_map` accepts a `palette` argument. `_init_system_state`
-passes the stored palette.
+### 12.10 Unit system — Phase 2
 
-### 12.10 No unit system — Phase 2
+> Resolved.  `<units>` block implemented; R_gas
+> validation active.  — C-3.
 
-`Field.unit` is display-only. Coefficients are dimensionless floats. Mismatched
-units (e.g., R_gas in J vs. energy in kJ) produce wrong diagrams with no error.
+`Field.unit` is display-only.  Coefficients are
+dimensionless floats.  Mismatched units (e.g.
+R_gas in J vs. energy in kJ) previously produced
+wrong diagrams with no error.
 
-**Resolution (minimal):** emit expected unit system in
-XML schema comment and builder UI. Add a `<units>` block
-as a human-readable record. Optionally validate R_gas
+**Resolution:** a `<units>` element inside `<system>`
+declares the unit system as a human-readable record
+with optional parse-time validation:
+
+```xml
+<system>
+  ...
+  <units energy="kJ/mol" temperature="K"
+         pressure="atm"/>
+</system>
+```
+
+Attributes (`energy`, `temperature`, `pressure`)
+are all optional.  When both `energy` and
+`temperature` are declared and a pressure field
+carries an `R_gas` value, the parser checks R_gas
 against a lookup table of known values per unit
-combination.
+pair and issues a `warnings.warn()` if the
+relative error exceeds 1%.
+
+Known R_gas values (energy_unit, K):
+
+| Units        | R_gas              |
+|--------------|--------------------|
+| J/mol, K     | 8.314              |
+| kJ/mol, K    | 0.008314           |
+| cal/mol, K   | 1.987              |
+| kcal/mol, K  | 0.001987           |
+| eV/atom, K   | 8.617 x 10^-5      |
+
+CALPHAD systems (`energy_form='calphad'`) default
+to SI (`J/mol`, `K`, `Pa`) when no `<units>` block
+is present.  If a `<units>` block is present with
+non-SI values, the parser warns.
+
+`SystemSpec.units` stores the dict; `to_xml_str()`
+emits `<units>` when non-empty.  All 11 demo files
+now carry explicit `<units>` blocks.
 
 ---
 
@@ -779,6 +848,308 @@ and a flat screen is inadequate. VR/volumetric rendering
 inside the composition tetrahedron is a natural target.
 `vedo` (VTK wrapper with OpenVR support) has a
 prototype-level hook in the codebase already.
+
+### 13.5 Composition representation
+
+Binary convention: `x` is a scalar — the mole
+fraction of component B (components[1]).
+`x_A = 1 - x`.
+
+Multi-component generalisation: composition is an
+`(N-1)`-dimensional vector of independent mole
+fractions `[x_2, x_3, ..., x_N]`.  The first
+component's fraction is implied:
+`x_1 = 1 - sum(x_i for i in 2..N)`.
+
+At the API boundary, `x` changes from a 1-D array
+of shape `(n_pts,)` to a 2-D array of shape
+`(n_pts, N-1)`.  For binary systems `N-1 = 1`, so
+a column vector `(n_pts, 1)` is the canonical
+form; the scalar convention is a squeeze of this
+for backward compatibility.
+
+Key decision: **keep the scalar squeeze for
+binary**.  Energy models receive `x` as `(n,)` when
+`N = 2` and `(n, N-1)` when `N >= 3`.  This avoids
+a mass migration of all binary-model code.  The
+`Phase.gibbs()` wrapper handles the reshape:
+
+```python
+def gibbs(self, x, field_values):
+    x = np.atleast_2d(x)
+    if self.n_components == 2:
+        x = x.ravel()    # (n,) for binary
+    return self.energy_model.gibbs(x, field_values)
+```
+
+### 13.6 Energy model generalisation
+
+#### 13.6.1 Native multi-component model
+
+For ternary+ native (non-CALPHAD) systems, the
+natural formalism is the Redlich-Kister-Muggianu
+(RKM) pairwise expansion:
+
+```
+G(x, T) = sum_i x_i * G_i^0(T)           (end-member reference)
+         + sum_{i<j} x_i * x_j
+           * sum_k L_{ij,k}(T)
+           * (x_i - x_j)^k               (binary interaction)
+         + sum_{i<j<k} x_i * x_j * x_k
+           * L_{ijk}(T)                   (ternary interaction)
+```
+
+This is implemented as a new `RKMModel(EnergyModel)`
+subclass.  The constructor takes:
+
+```python
+class RKMModel(EnergyModel):
+    def __init__(self, n_components,
+                 ref_G,        # list of T-poly per component
+                 binary_L,     # dict[(i,j)] -> list of T-polys per order k
+                 ternary_L=None):  # dict[(i,j,k)] -> T-poly
+```
+
+`ref_G[i]` is a T-polynomial (ascending order) for
+the Gibbs energy of pure component `i`.
+`binary_L[(i,j)][k]` is a T-polynomial for the
+k-th order Redlich-Kister parameter between
+components `i` and `j`.
+
+For binary systems (`n_components == 2`), this
+reduces to the familiar sub-regular solution
+model:
+
+```
+G(x, T) = (1-x)*G_A(T) + x*G_B(T)
+         + x*(1-x) * sum_k L_k(T) * (1-2x)^k
+```
+
+This overlaps with but does not replace HSModel.
+HS remains the simple pedagogical model; RKM is
+the thermodynamically rigorous multi-component
+extension.
+
+#### 13.6.2 CALPHAD multi-component
+
+`CALPHADModel` already wraps `pycalphad.calculate()`
+which handles N-component systems natively.  The
+changes needed:
+
+- `components` becomes a list of N elements
+  (currently hardcoded as binary `[comp_A, comp_B]`)
+- Site-fraction construction generalises from
+  2 columns to N columns per mixing sublattice
+- The `_gibbs_impl` signature accepts
+  `(n_pts, N-1)` composition arrays and maps them
+  to site fractions
+
+The internal changes are modest because pycalphad
+does the heavy lifting.
+
+### 13.7 Data structure changes
+
+#### pde_phase.py
+
+```python
+class Phase:
+    # xmin, xmax (scalar) → composition_bounds:
+    #   binary: (xmin, xmax)
+    #   ternary+: convex polygon on the simplex,
+    #     or None for the full simplex
+    # is_point → is_point (xmin == xmax for binary;
+    #   single-point composition for ternary)
+    composition_bounds: ...
+
+    def composition_grid(self, n_points=500):
+        # binary: np.linspace(xmin, xmax, n)
+        # ternary: triangular mesh on simplex
+        # quaternary: tetrahedral mesh
+```
+
+For the spec layer, `PhaseSpec.xmin`/`xmax` remain
+for binary.  Multi-component phases add a
+`composition_region` key to `model_params` (or a
+new PhaseSpec attribute).
+
+#### SystemSpec
+
+No structural changes — `components` is already a
+list of arbitrary length.  `n_components` is
+`len(components)`.
+
+### 13.8 Equilibrium computation
+
+#### 13.8.1 Hull construction
+
+`compute_equilibrium()` builds the convex hull in
+(N-1+1)-dimensional space:
+
+```python
+# Binary (current):
+points = np.column_stack([x, G])       # (n, 2)
+
+# Multi-component:
+# x is (n, N-1), G is (n,)
+points = np.column_stack([x, G])       # (n, N)
+hull = ConvexHull(points)
+```
+
+The lower-hull filter generalises:
+
+```python
+# Binary: equations[:, 1] < 0
+#   (G is the second coordinate)
+# N-component: equations[:, N-1] < 0
+#   (G is the last coordinate)
+lower = hull.equations[:, N-1] < 0
+```
+
+#### 13.8.2 Region extraction
+
+This is the hardest algorithmic change.
+
+**Binary (current):** walks sorted hull vertices
+left-to-right.  Each vertex belongs to one phase.
+Consecutive vertices from different phases define
+a two-phase region; same-phase runs define
+single-phase regions.
+
+**Ternary:** the lower hull is a 2-D triangulated
+surface.  Each simplex (triangle) in the hull uses
+vertices from 1, 2, or 3 distinct phases:
+
+- 1 phase: interior of a single-phase region
+- 2 phases: edge of a two-phase (tie-line) region
+- 3 phases: invariant tie-triangle (three-phase
+  equilibrium, the ternary analogue of a eutectic)
+
+Region extraction groups adjacent simplices by
+their phase-set signature.  The algorithm:
+
+1. Label each lower-hull simplex with its
+   phase-set (frozenset of phase indices).
+2. Build an adjacency graph of simplices.
+3. Connected components with the same phase-set
+   form a region.
+4. Region boundaries are extracted from the
+   unshared edges of each component.
+
+The output replaces the current flat list of
+`{'type': 'single'|'two_phase', 'x0': ...,
+'x1': ..., 'phases': ...}` dicts with a richer
+structure:
+
+```python
+@dataclass
+class EqRegion:
+    phase_set: frozenset[int]  # phase indices
+    vertices: ndarray          # (m, N-1) boundary
+    simplices: list[int]       # hull simplex indices
+    # type is implicit:
+    #   len(phase_set) == 1 → single-phase
+    #   len(phase_set) == 2 → two-phase (tie-lines)
+    #   len(phase_set) == N → invariant
+```
+
+For binary backward compatibility, the 1-D walk
+algorithm is preserved when `N == 2`.
+
+### 13.9 XML schema
+
+Multi-component `<components>`:
+
+```xml
+<system>
+  <components>Al Cu Mg</components>
+  <energy_form>calphad</energy_form>
+  <tdb>Al-Cu-Mg.tdb</tdb>
+</system>
+```
+
+For native RKM models, a new energy block format:
+
+```xml
+<energy model="rkm">
+  <!-- End-member reference G(T) for this phase -->
+  <ref component="Al">
+    <G a0="0" a1="0"/>
+  </ref>
+  <ref component="Cu">
+    <G a0="5000" a1="-3.2"/>
+  </ref>
+  <ref component="Mg">
+    <G a0="2600" a1="0"/>
+  </ref>
+
+  <!-- Binary interaction L_{Al,Cu}(T) -->
+  <binary components="Al Cu">
+    <L order="0" a0="-12000" a1="3.0"/>
+    <L order="1" a0="-1100" a1="0.5"/>
+  </binary>
+  <binary components="Al Mg">
+    <L order="0" a0="-1800" a1="2.0"/>
+  </binary>
+
+  <!-- Optional ternary interaction -->
+  <ternary components="Al Cu Mg">
+    <L a0="500"/>
+  </ternary>
+</energy>
+```
+
+Composition range for ternary phases replaces
+scalar `xmin`/`xmax` with a convex polygon (or
+is omitted for the full simplex):
+
+```xml
+<composition_region>
+  <vertex x_Cu="0.0" x_Mg="0.0"/>
+  <vertex x_Cu="0.5" x_Mg="0.0"/>
+  <vertex x_Cu="0.0" x_Mg="0.5"/>
+</composition_region>
+```
+
+### 13.10 Implementation roadmap
+
+The multi-component generalisation decomposes into
+four ordered implementation steps, matching the
+existing TODO items C-8 through C-11:
+
+1. **C-8: RKMModel + XML schema.**  The energy
+   model subclass and input format.  Can be tested
+   in binary mode first (RKM reduces to sub-regular
+   solution) before exercising ternary.
+
+2. **C-9: Simplicial composition grid.**  Replace
+   `Phase.composition_grid()` with a simplex mesh
+   generator.  `pde_phase.py` changes: new
+   `composition_bounds` representation, `is_point`
+   generalisation.
+
+3. **C-10: N-D hull region extraction.**  Rewrite
+   `_extract_regions()` in `pde_compute.py`.
+   The `EqRegion` dataclass replaces the current
+   dict-based region format.  Binary backward
+   compat via the 1-D walk when `N == 2`.
+
+4. **C-11: Ternary visualisation.**  Gibbs triangle
+   canvas in `pde_viz.py` or a new module.  HDF5
+   export with unstructured triangular mesh.
+
+Each step is independently testable.  C-8 can be
+validated against known binary sub-regular solution
+results.  C-9+C-10 can be validated against
+pycalphad's own equilibrium solver for ternary
+CALPHAD systems.  C-11 is purely visual.
+
+**CALPHAD ternary** is the easiest path to a
+working ternary diagram because CALPHADModel
+already delegates to pycalphad, which handles
+N-component systems.  The implementation order for
+a ternary milestone is: C-9 → C-10 → C-11 → C-8,
+deferring the native RKM model until the grid,
+hull, and visualisation infrastructure exist.
 
 ---
 
@@ -916,32 +1287,115 @@ A magnetic-field example:
 
 ---
 
-## 16. CALPHAD Integration (future)
+## 16. CALPHAD Integration
 
 CALPHAD databases (TDB files) provide assessed
 thermodynamic data for multicomponent systems using
-Redlich–Kister polynomials for excess Gibbs energy,
+Redlich-Kister polynomials for excess Gibbs energy,
 sublattice models for ordered phases, and magnetic
-contributions (Hillert–Jarl model near the Curie
-temperature — a non-polynomial coupling term that is a
-concrete example of the `'custom'` coupling type in
-§2.5).
+contributions (Hillert-Jarl model near the Curie
+temperature — a non-polynomial coupling term that is
+a concrete example of the `'custom'` coupling type
+in §2.5).
 
-The `pycalphad` library (open source) handles TDB
-parsing and phase equilibrium calculations. The natural
-integration point is a `CALPHADModel` subclass of
-`EnergyModel`:
+### 16.1 Architecture
+
+The integration uses `pycalphad` (open source) for
+TDB parsing and single-phase G evaluation.  The key
+design decisions:
+
+1. **TDB at system level.**  The `<system>` block
+   carries a `<tdb>` element with the file path.
+   `SystemSpec.to_system()` loads the `Database`
+   once and shares it across all phase constructors.
+
+2. **Components = element names.**  When
+   `energy_form='calphad'`, the `<components>`
+   values are real element symbols (e.g. `Al Mg`).
+   The parser uppercases them for pycalphad and
+   each `CALPHADModel` appends `VA` internally.
+
+3. **All-CALPHAD systems.**  `energy_form='calphad'`
+   means every phase comes from the same TDB.
+   Mixing CALPHAD and native phases within one
+   system is not supported in v1.
+
+4. **SI units.**  pycalphad uses J/mol, K, Pa.
+   When `energy_form='calphad'`, all field ranges
+   and display values are SI.
+
+5. **Lazy import.**  `pycalphad` is imported only
+   inside `SystemSpec.to_system()` and
+   `CALPHADModel.__init__`.  The application works
+   without it installed; loading a CALPHAD input
+   file triggers the import (with a clear error
+   if missing).
+
+### 16.2 CALPHADModel
 
 ```python
 class CALPHADModel(EnergyModel):
-    def __init__(self, pycalphad_phase, ...):
-        ...
-    def gibbs(self, x, field_values):
-        ...  # delegates to pycalphad
+    """G(x, T, P) from pycalphad Database + phase.
+
+    Wraps pc.calculate() for single-phase Gibbs
+    energy evaluation.  Handles sublattice models,
+    Redlich-Kister mixing, and magnetic contributions
+    via the pycalphad internals.
+    """
+    def __init__(self, db, phase_name,
+                 components, P_default=101325.0):
+        # db: pycalphad.Database (shared)
+        # phase_name: 'LIQUID', 'FCC_A1', etc.
+        # components: ['AL', 'MG'] (no VA)
+
+    def _gibbs_impl(self, x, field_values):
+        # x is mole fraction of components[-1]
+        # Build (n, 2) points array
+        # Call pc.calculate(db, comps+['VA'],
+        #     phase_name, T=T, P=P, points=pts)
+        # Return GM.values.flatten()
 ```
 
-This requires no changes to `pde_compute` or the
-visualisation layer — only a new `EnergyModel` subclass
-and a TDB import path in `pde_input`. CALPHAD
-integration is deferred until the field generalisation
-and spec-layer redesign are stable.
+### 16.3 XML Schema
+
+```xml
+<system>
+  <components>Al Mg</components>
+  <energy_form>calphad</energy_form>
+  <tdb>Al-Mg.tdb</tdb>
+</system>
+
+<phase name="liquid" type="liquid">
+  <energy model="calphad" phase="LIQUID"/>
+</phase>
+```
+
+The `phase` attribute on `<energy>` is the TDB
+phase identifier (e.g. `LIQUID`, `FCC_A1`,
+`HCP_A3`).  The TDB path is resolved relative to
+the input XML file's directory.
+
+### 16.4 PhaseSpec model_params
+
+```
+'calphad':
+    calphad_phase : str        — TDB phase name
+    components    : list[str]  — element names
+```
+
+No cross-phase dependencies; build order is
+independent.  The `couplings` property returns
+an empty list (CALPHAD G(x,T,P) is opaque to
+the coupling inspector).
+
+### 16.5 Limitations (v1)
+
+- Binary systems only (PDE limitation, not
+  pycalphad).
+- No mixing of CALPHAD and native phases.
+- No automatic unit conversion; SI is required.
+- No sublattice-aware composition mapping;
+  x is a simple mole fraction.
+- `couplings` returns `[]` — the 3-D and export
+  modules work but field-coupling inspection
+  is unavailable.

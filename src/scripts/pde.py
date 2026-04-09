@@ -119,14 +119,15 @@ Defaults are given in ./pderc.py or $PDE_RC/pderc.py.
 
 
     def read_input_file(self):
-        from pde_input import parse_system
-        self.system = parse_system(self.infile)
+        from pde_input import parse_system_spec
+        self.spec = parse_system_spec(self.infile)
+        self.system = self.spec.to_system()
 
 
 def start_program(settings):
     # Launch the interactive visualization UI.
     from pde_viz import launch_ui
-    launch_ui(settings.system)
+    launch_ui(settings.system, spec=settings.spec)
 
 
 def main():

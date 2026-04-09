@@ -18,7 +18,7 @@ pde/
   src/
     scripts/
       pde.py               Entry point (→ $PDE_DIR/bin/)
-      pde_phase.py         Field, Phase, System
+      pde_phase.py         Spec + runtime data model
       pde_energy.py        Energy models + VLE + patches
       pde_input.py         XML parser → System
       pde_compute.py       Equilibrium → EqResult
@@ -33,7 +33,6 @@ pde/
     pderc                  Bash environment setup
     pderc.py               Python resource control template
   CLAUDE.md                AI assistant guidance
-  DESIGN.md                Legacy design doc (→ dev/)
 ```
 
 ---
@@ -41,18 +40,29 @@ pde/
 ## 2. Module Map
 
 ### Data model
-- **pde_phase.py** — `Field`, `Phase`, `System` dataclasses. The core data
-  model consumed by all other modules.
+- **pde_phase.py** — Spec layer (`FieldSpec`,
+  `PhaseSpec`, `SystemSpec`) and runtime layer
+  (`Field`, `Phase`, `System`).  The spec layer is
+  the single canonical input form; `SystemSpec.
+  to_system()` is the only place `EnergyModel`
+  instances are built.  Topological helpers
+  (`_dependency_edges`, `_topo_sort`) live here too.
 
 ### Energy
-- **pde_energy.py** — `EnergyModel` (ABC), `HSModel`, `PolyModel`,
-  `PiecewisePatchModel`, `CouplingTerm`. VLE helper `compute_vle_gas_hs`.
-  Patch-H helpers. All polynomial coefficient machinery lives here.
+- **pde_energy.py** — `EnergyModel` (ABC), `HSModel`,
+  `PolyModel`, `PiecewisePatchModel`,
+  `CALPHADModel`, `CouplingTerm`.  VLE helper
+  `compute_vle_gas_hs`.  Patch-H helpers.  All
+  polynomial coefficient machinery lives here.
+  `CALPHADModel` wraps `pycalphad.calculate()` for
+  assessed TDB data (see DESIGN §16).
 
-### Input / serialization
-- **pde_input.py** — XML parser. Two schemas: new `<fields>` block and legacy
-  `<temperature>`/`<pressure>`. Three-pass construction (non-VLE, VLE gas,
-  patches). Produces `System`.
+### Input / serialisation
+- **pde_input.py** — XML parser.  Translates XML into
+  `SystemSpec` (list of `FieldSpec` + `PhaseSpec`),
+  then calls `spec.to_system()`.  VLE and patch
+  dependencies are resolved by the topological sort
+  inside `to_system()`, not by the parser itself.
 
 ### Computation
 - **pde_compute.py** — `compute_equilibrium()` via scipy `ConvexHull`. Produces
@@ -64,8 +74,10 @@ pde/
   Interactive display with drag-editing.
 
 ### Builder
-- **pde_builder.py** — `PhaseData`, `SystemData`, `BuilderWindow(QDialog)`.
-  Mutable data containers and graphical editor for phase parameters.
+- **pde_builder.py** — `BuilderWindow(QDialog)` +
+  fitting functions (`apply_handle_drag`, etc.).
+  Works directly with `PhaseSpec`/`SystemSpec` —
+  no intermediate data model.
 
 ### Checking
 - **pde_check.py** — Six check functions + `run_all_checks` orchestrator.
@@ -100,7 +112,7 @@ pde.py (entry point)
   |     +-- pde_builder.py
   |     |     +-- pde_phase.py
   |     |     +-- pde_energy.py
-  |     |     +-- pde_input.py  (lazy, for from_xml)
+  |     |     +-- pde_input.py  (lazy)
   |     +-- pde_check.py
   |     |     +-- pde_phase.py
   |     +-- pde_3d.py           (optional, lazy)
@@ -108,6 +120,7 @@ pde.py (entry point)
   |     +-- pde_export.py
   |           +-- pde_compute.py
   +-- pde_phase.py
+        +-- pde_energy.py       (lazy, in make_energy_model)
 ```
 
 ---
@@ -124,8 +137,8 @@ make install       # copies scripts to $PDE_DIR/bin/
 matplotlib (all required).
 **Optional:** pyvista, pyvistaqt (3-D visualization),
 vedo (prototype only).
-**Future:** pycalphad (CALPHAD model support; see
-VISION goal 6 and DESIGN §16).
+**Optional:** pycalphad (CALPHAD model support; see
+DESIGN §16).
 **Dev:** pytest.
 
 ### 4.1 CALPHAD / TDB Database Sources
@@ -162,7 +175,9 @@ XML file
    │
    ▼
 pde_input.parse_system()
-   │  → System (components, phases, fields, title)
+   │  XML → SystemSpec (FieldSpecs + PhaseSpecs)
+   │    → spec.to_system()  (topo sort, build models)
+   │      → System (components, phases, fields, title)
    │
    ├──► pde_viz.launch_ui(system)
    │       ├── precompute: compute_equilibrium

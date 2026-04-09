@@ -15,15 +15,13 @@ End-member (point) phases are represented naturally:
   HSModel  with single-element H and S lists  → G(T) = H[0] - T·S[0]
   PolyModel with only an x⁰ T-coefficient list → G(T) = Σⱼ a₀ⱼ·Tʲ
 
-Generalised interface
----------------------
-EnergyModel.gibbs() accepts both calling conventions:
-
-  Old (positional):  model.gibbs(x, T)  or  model.gibbs(x, T, P)
-  New (field dict):  model.gibbs(x, {'temperature': T, 'pressure': P})
-
-Both map to the internal _gibbs_impl(x, field_values) which subclasses
-implement.  The shim handles type-dispatch; call sites need not change.
+Field-values interface
+----------------------
+EnergyModel.gibbs(x, field_values) takes a dict
+mapping field names to scalar values, e.g.
+{'temperature': 800.0, 'pressure': 1.5}.  This
+dict is forwarded to _gibbs_impl() which each
+subclass implements.
 
 Each model also exposes a `couplings` property returning a list of
 CouplingTerm objects that describes how each field enters G(x).  This
@@ -103,53 +101,30 @@ class CouplingTerm:
 class EnergyModel(ABC):
     """Abstract base for all Gibbs energy models.
 
-    Subclasses implement _gibbs_impl(x, field_values) where field_values
-    is a dict mapping field names to scalar values (e.g.
-    {'temperature': 800.0, 'pressure': 1.5}).
-
-    The public gibbs() method is a backward-compatible shim that accepts
-    both the old positional signature gibbs(x, T, P=0.0) and the new
-    dict-based signature gibbs(x, {'temperature': T, 'pressure': P}).
+    Subclasses implement _gibbs_impl(x, field_values)
+    where field_values is a dict mapping field names
+    to scalar values (e.g. {'temperature': 800.0,
+    'pressure': 1.5}).
     """
 
     @abstractmethod
-    def _gibbs_impl(self, x, field_values: dict) -> np.ndarray:
-        """Return G(x, {fields}) as a numpy array with the same shape as x."""
+    def _gibbs_impl(self, x, field_values):
+        """Return G(x) as a numpy array (same shape
+        as x) at the given field values.
+        """
 
-    def gibbs(self, x, T=None, P=0.0, field_values=None, **kwargs):
-        """Return G evaluated at composition x and the given field values.
-
-        Accepts two calling conventions (both remain supported):
-
-          Old:  model.gibbs(x, T)
-                model.gibbs(x, T, P)
-          New:  model.gibbs(x, {'temperature': T, 'pressure': P, ...})
-                model.gibbs(x, field_values={'temperature': T, ...})
+    def gibbs(self, x, field_values):
+        """Evaluate G at composition *x* and the given
+        *field_values* dict.
 
         Parameters
         ----------
-        x             : array-like   — composition values
-        T             : float or dict — temperature (old style) or
-                        field_values dict (new style, positional shortcut)
-        P             : float        — pressure (old style only)
-        field_values  : dict or None — explicit field dict (new style)
-        **kwargs      : extra field values merged into field_values (new style)
+        x            : array-like — composition
+        field_values : dict[str, float]
         """
-        if field_values is not None:
-            fv = dict(field_values)
-            fv.update(kwargs)
-        elif isinstance(T, dict):
-            # New style passed positionally: gibbs(x, {'temperature': T, ...})
-            fv = dict(T)
-            fv.update(kwargs)
-        else:
-            # Old style: gibbs(x, T) or gibbs(x, T, P)
-            fv = {
-                'temperature': float(T) if T is not None else 0.0,
-                'pressure':    float(P),
-            }
-            fv.update(kwargs)
-        return self._gibbs_impl(np.asarray(x, dtype=float), fv)
+        return self._gibbs_impl(
+            np.asarray(x, dtype=float),
+            field_values)
 
     @property
     def couplings(self) -> list:
@@ -531,3 +506,165 @@ class PolyModel(EnergyModel):
                 params={'P_ref': self.P_ref},
             ))
         return terms
+
+
+# -----------------------------------------------------------
+# CALPHADModel — wraps pycalphad for assessed TDB data
+# -----------------------------------------------------------
+
+class CALPHADModel(EnergyModel):
+    """G(x, T, P) from a pycalphad Database + phase.
+
+    Evaluates the molar Gibbs energy of a single
+    phase in a binary system using thermodynamic
+    parameters from a TDB file.  pycalphad handles
+    sublattice models, Redlich-Kister mixing, and
+    magnetic contributions internally.
+
+    All values are in SI: G in J/mol, T in K,
+    P in Pa.
+
+    The constructor inspects the phase's sublattice
+    structure and precomputes a column layout for
+    building site-fraction arrays from composition
+    *x*.  For each sublattice the layout records
+    which columns correspond to the A and B
+    components and which are pure-vacancy (fixed
+    at 1.0).  Species within each sublattice are
+    sorted alphabetically, matching pycalphad's
+    internal DOF ordering.
+
+    Parameters
+    ----------
+    db : pycalphad.Database
+        Pre-loaded TDB database (shared across
+        phases in the same system; loaded once
+        by SystemSpec.to_system()).
+    phase_name : str
+        Phase identifier in the TDB file, e.g.
+        'LIQUID', 'FCC_A1', 'HCP_A3'.
+    components : list[str]
+        Binary component names in the order used
+        by the System (e.g. ['AL', 'MG']).  PDE's
+        composition x is the mole fraction of
+        components[-1].  'VA' (vacancy) is appended
+        automatically for pycalphad.
+    P_default : float
+        Default pressure in Pa when field_values
+        has no 'pressure' key (default 101325 =
+        1 atm).
+
+    Notes
+    -----
+    pycalphad is lazy-imported in __init__ so the
+    application works when pycalphad is not
+    installed.
+    """
+
+    def __init__(self, db, phase_name, components,
+                 P_default=101325.0):
+        import pycalphad as _pc
+        self._pc = _pc
+        self._db = db
+        self._phase_name = phase_name
+        self._components = list(components)
+        self._comps_va = (
+            list(components) + ['VA'])
+        self._P_default = P_default
+
+        # Precompute the site-fraction column
+        # layout from the phase's sublattice
+        # structure.  Each entry in _sf_layout
+        # is a sorted list of species names that
+        # are active in our component set for
+        # that sublattice.  We use
+        # phase.constituents (not .sublattices,
+        # which holds stoichiometric multipliers)
+        # and extract the .name attribute from
+        # each pycalphad Species object.
+        comp_set = set(self._comps_va)
+        phase_obj = db.phases[phase_name]
+        self._sf_layout = []
+        for subl in phase_obj.constituents:
+            active = sorted(
+                sp.name for sp in subl
+                if sp.name in comp_set)
+            self._sf_layout.append(active)
+
+        # Precompute component-name → index map
+        # for fast lookup in _gibbs_impl.
+        self._comp_idx = {
+            name: i for i, name
+            in enumerate(self._components)}
+
+    def _gibbs_impl(self, x, field_values):
+        """Evaluate G(x) at the given field values.
+
+        Binary: *x* is shape (n,) — mole fraction
+        of components[-1].
+        Multi-component: *x* is shape (n, N-1) —
+        independent mole fractions [x_2, ..., x_N].
+        x_1 = 1 - sum(x_i).
+
+        Returns G values in J/mol as a 1-D array.
+        """
+        T = field_values.get(
+            'temperature', 300.0)
+        P = field_values.get(
+            'pressure', self._P_default)
+
+        x_arr = np.asarray(x, dtype=float)
+        N = len(self._components)
+
+        # Build full mole-fraction array (n, N)
+        # from the independent coordinates.
+        if x_arr.ndim == 1:
+            # Binary or squeezed: (n,) → (n, 1)
+            x_indep = x_arr.reshape(-1, 1)
+        else:
+            x_indep = x_arr        # (n, N-1)
+        n_pts = x_indep.shape[0]
+        x_first = (
+            1.0 - x_indep.sum(axis=1))
+        x_full = np.column_stack(
+            [x_first, x_indep])    # (n, N)
+
+        # Build site-fraction columns for each
+        # sublattice in the order pycalphad
+        # expects (alphabetical within each
+        # sublattice).
+        columns = []
+        for species_list in self._sf_layout:
+            for sp_name in species_list:
+                ci = self._comp_idx.get(
+                    sp_name)
+                if ci is not None:
+                    columns.append(
+                        x_full[:, ci])
+                elif sp_name == 'VA':
+                    columns.append(
+                        np.ones(n_pts))
+                else:
+                    columns.append(
+                        np.zeros(n_pts))
+
+        pts = np.column_stack(columns)
+
+        result = self._pc.calculate(
+            self._db,
+            self._comps_va,
+            self._phase_name,
+            T=float(T),
+            P=float(P),
+            points=pts,
+            output='GM')
+
+        return result.GM.values.flatten()
+
+    @property
+    def couplings(self):
+        """CALPHAD couplings are complex and not
+        decomposable into simple CouplingTerm
+        objects.
+        """
+        return []

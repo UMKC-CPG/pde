@@ -8,21 +8,28 @@
 ## 1. Equilibrium Computation (DESIGN §4)
 
 ```
-function compute_equilibrium(system, T, P):
+function compute_equilibrium(system,
+                             field_values: dict):
+    # field_values maps field names to current
+    # values, e.g. {'temperature': 1200.0,
+    #               'pressure': 2.0}
+
     all_x  ← []
     all_G  ← []
     curves ← []
 
     for each phase in system.phases:
-        x ← linspace(phase.xmin, phase.xmax, n_points)
-        G ← phase.gibbs(x, T, P)
+        x ← linspace(phase.xmin, phase.xmax,
+                      n_points)
+        G ← phase.gibbs(x, field_values)
         append (x, G) to all_x, all_G
         append (x, G, phase) to curves
 
     points ← stack(all_x, all_G) as (N, 2)
     hull   ← ConvexHull(points)
 
-    # Extract lower hull: facets with downward-pointing normal
+    # Extract lower hull: facets with
+    # downward-pointing normal
     lower_vertices ← {}
     for each simplex in hull.simplices:
         normal ← hull.equations[simplex].normal
@@ -32,9 +39,10 @@ function compute_equilibrium(system, T, P):
     sort lower_vertices by x coordinate
     hull_x, hull_G ← points[lower_vertices]
 
-    # Classify regions by walking hull vertices left to right
+    # Classify regions by walking hull vertices
     regions ← []
-    for consecutive pairs (i, i+1) in lower_vertices:
+    for consecutive pairs (i, i+1) in
+            lower_vertices:
         phase_i ← phase owning point i
         phase_j ← phase owning point j
         if phase_i == phase_j:
@@ -42,7 +50,8 @@ function compute_equilibrium(system, T, P):
         else:
             append two-phase region [x_i, x_j]
 
-    return EqResult(T, P, curves, hull_x, hull_G, regions)
+    return EqResult(field_values, curves,
+                    hull_x, hull_G, regions)
 ```
 
 ---
@@ -171,18 +180,18 @@ function shift_poly_coeffs(coeffs, dx):
 ## 6. Sweep Precomputation (DESIGN §5.4)
 
 ```
-function precompute_sweep_diagram(system, primary_idx,
-                                   fixed_values, n_steps):
+function precompute_sweep_diagram(system,
+        primary_idx, fixed_values, n_steps):
     field  ← system.fields[primary_idx]
-    values ← linspace(field.min_val, field.max_val, n_steps)
+    values ← linspace(field.min_val,
+                      field.max_val, n_steps)
     results ← []
 
     for v in values:
         fv ← copy(fixed_values)
         fv[field.name] ← v
-        T ← fv['temperature']
-        P ← fv.get('pressure', 0.0)
-        results.append(compute_equilibrium(system, T, P))
+        results.append(
+            compute_equilibrium(system, fv))
 
     return results, values
 ```

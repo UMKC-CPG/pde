@@ -216,9 +216,7 @@ def _compute_fields_on_mesh(system, nodes, n_x, n_field, field_range,
             progress_cb(j, n_field)
 
         fv[pf.name] = fval
-        T = fv.get('temperature', 0.0)
-        P = fv.get('pressure', 0.0)
-        eq = compute_equilibrium(system, T, P)
+        eq = compute_equilibrium(system, fv)
         eq_results.append(eq)
 
         row_start = j * n_x
@@ -617,7 +615,10 @@ def export_3d_TPx(system, filepath, n_x=100, n_T=100, n_P=50,
                 # export is T-ascending, P-ascending.
                 eq = precomputed_grid[n_T - 1 - jt][n_P - 1 - kp]
             else:
-                eq = compute_equilibrium(system, T, P)
+                eq = compute_equilibrium(
+                    system,
+                    {'temperature': T,
+                     'pressure': P})
 
             base = (kp * n_T + jt) * n_x
             sl = slice(base, base + n_x)

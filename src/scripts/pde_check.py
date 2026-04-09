@@ -106,8 +106,8 @@ def _numerical_slope(phase, x: float, T: float, P: float) -> float:
     x_hi = min(phase.xmax, x + dx)
     if x_hi <= x_lo:
         return 0.0
-    G_lo = float(phase.gibbs(x_lo, T, P))
-    G_hi = float(phase.gibbs(x_hi, T, P))
+    G_lo = float(phase.gibbs(x_lo, {'temperature': T, 'pressure': P}))
+    G_hi = float(phase.gibbs(x_hi, {'temperature': T, 'pressure': P}))
     return (G_hi - G_lo) / (x_hi - x_lo)
 
 
@@ -126,7 +126,7 @@ def _find_crossing_T(
     T_arr = np.linspace(T_min, T_max, n)
     try:
         dG = np.array([
-            float(phase_a.gibbs(x_val, T, P)) - float(phase_b.gibbs(x_val, T, P))
+            float(phase_a.gibbs(x_val, {'temperature': T, 'pressure': P})) - float(phase_b.gibbs(x_val, {'temperature': T, 'pressure': P}))
             for T in T_arr
         ])
     except Exception:
@@ -141,7 +141,7 @@ def _find_crossing_T(
     T_lo, T_hi = float(T_arr[i]), float(T_arr[i + 1])
     try:
         T_cross = _brentq(
-            lambda T: float(phase_a.gibbs(x_val, T, P)) - float(phase_b.gibbs(x_val, T, P)),
+            lambda T: float(phase_a.gibbs(x_val, {'temperature': T, 'pressure': P})) - float(phase_b.gibbs(x_val, {'temperature': T, 'pressure': P})),
             T_lo, T_hi, xtol=1e-6 * (T_max - T_min), maxiter=100
         )
         return float(T_cross)
@@ -268,7 +268,11 @@ def check_convexity(system, T=None, P=None) -> list[ConsistencyWarning]:
             continue
         x = phase.composition_grid(_N_CONV_POINTS)
         try:
-            G = np.array([float(phase.gibbs(xi, T, P)) for xi in x], dtype=float)
+            fv = {'temperature': T,
+                  'pressure': P}
+            G = np.array([
+                float(phase.gibbs(xi, fv))
+                for xi in x], dtype=float)
         except Exception:
             continue
 
@@ -348,8 +352,13 @@ def check_vle_terminal_tangency(system, P=None) -> list[ConsistencyWarning]:
                     continue
 
                 try:
-                    G_gas_val  = float(gas.gibbs(x_pure, T_bp, P))
-                    G_liq_val  = float(liq.gibbs(x_pure, T_bp, P))
+                    fv_bp = {
+                        'temperature': T_bp,
+                        'pressure': P}
+                    G_gas_val = float(
+                        gas.gibbs(x_pure, fv_bp))
+                    G_liq_val = float(
+                        liq.gibbs(x_pure, fv_bp))
                     slope_gas  = _numerical_slope(gas, x_pure, T_bp, P)
                     slope_liq  = _numerical_slope(liq, x_pure, T_bp, P)
                 except Exception:
@@ -501,8 +510,13 @@ def check_end_member_gmatch(system, P=None) -> list[ConsistencyWarning]:
                 continue
 
             try:
-                G_em   = float(em.gibbs(x_end, T_trans, P))
-                G_cand = float(cand.gibbs(x_end, T_trans, P))
+                fv_tr = {
+                    'temperature': T_trans,
+                    'pressure': P}
+                G_em = float(
+                    em.gibbs(x_end, fv_tr))
+                G_cand = float(
+                    cand.gibbs(x_end, fv_tr))
             except Exception:
                 continue
 
@@ -588,16 +602,30 @@ def check_vle_phase_ordering(system, P=None) -> list[ConsistencyWarning]:
 
                 try:
                     if T_above <= T_max:
-                        G_gas_ab  = float(gas.gibbs(x_pure, T_above, P))
-                        G_liq_ab  = float(liq.gibbs(x_pure, T_above, P))
-                        dG_above  = G_liq_ab - G_gas_ab   # > 0 ⟺ vapour stable
+                        fv_ab = {
+                            'temperature': T_above,
+                            'pressure': P}
+                        G_gas_ab = float(
+                            gas.gibbs(x_pure, fv_ab))
+                        G_liq_ab = float(
+                            liq.gibbs(x_pure, fv_ab))
+                        dG_above = (
+                            G_liq_ab - G_gas_ab)
                     else:
                         dG_above = None
 
                     if T_below >= T_min:
-                        G_gas_bel = float(gas.gibbs(x_pure, T_below, P))
-                        G_liq_bel = float(liq.gibbs(x_pure, T_below, P))
-                        dG_below  = G_liq_bel - G_gas_bel  # < 0 ⟺ liquid stable
+                        fv_bel = {
+                            'temperature': T_below,
+                            'pressure': P}
+                        G_gas_bel = float(
+                            gas.gibbs(
+                                x_pure, fv_bel))
+                        G_liq_bel = float(
+                            liq.gibbs(
+                                x_pure, fv_bel))
+                        dG_below = (
+                            G_liq_bel - G_gas_bel)
                     else:
                         dG_below = None
                 except Exception:

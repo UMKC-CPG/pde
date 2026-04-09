@@ -55,17 +55,65 @@ Ideal-gas phases
 When ideal_gas="true", R·T·ln(P/P°) is added to G. Requires R_gas > 0 in
 the <pressure> block and P > 0 at runtime.
 
-Coefficient conventions (both forms)
+CALPHAD form energy blocks
+----------------------------
+  <system>
+    <components>Al Mg</components>
+    <energy_form>calphad</energy_form>
+    <tdb>Al-Mg.tdb</tdb>
+  </system>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  The TDB file path is relative to the input XML
+  file's directory.  All values are SI: G in J/mol,
+  T in K, P in Pa.
+
+Units block (optional, recommended)
 --------------------------------------
+  <system>
+    ...
+    <units energy="kJ/mol" temperature="K"
+           pressure="atm"/>
+  </system>
+
+  Human-readable record of the unit system.  When
+  present, R_gas on the pressure field is validated
+  against a lookup table of known values per unit
+  pair.  CALPHAD systems default to SI (J/mol, K,
+  Pa) when no <units> block is given.
+
+Coefficient conventions (HS and polynomial forms)
+---------------------------------------------------
   x-polynomial ascending order: x0 is the constant term, x1 the linear, etc.
   T-polynomial ascending order: a0 is the constant term, a1 the linear, etc.
 """
 
 import pathlib
+import warnings
 
 from lxml import etree
 
 from pde_phase import FieldSpec, PhaseSpec, SystemSpec
+
+
+# ---------------------------------------------------
+# R_gas lookup table for unit-consistency validation
+# ---------------------------------------------------
+# Maps (energy_unit, temperature_unit) to the
+# expected gas constant.  Used by _validate_units()
+# to catch silent unit mismatches (e.g. R_gas in
+# J/(mol·K) when energy is in kJ/mol).
+
+_KNOWN_R_GAS = {
+    ('J/mol',    'K'): 8.314,
+    ('kJ/mol',   'K'): 0.008314,
+    ('cal/mol',  'K'): 1.987,
+    ('kcal/mol', 'K'): 0.001987,
+    ('eV/atom',  'K'): 8.617e-5,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +260,22 @@ def _parse_phase_spec(phase_el, energy_form):
     # -- Normal energy block → extract coefficients
     energy_el = phase_el.find('energy')
 
+    # -- CALPHAD form: <energy model="calphad"
+    #    phase="LIQUID"/>
+    # Components are injected later by
+    # parse_system_spec after all phases are parsed.
+    if energy_form == 'calphad':
+        calphad_phase = energy_el.get(
+            'phase', '')
+        return PhaseSpec(
+            name=name,
+            phase_type=phase_type,
+            xmin=xmin, xmax=xmax,
+            model_type='calphad',
+            model_params={
+                'calphad_phase': calphad_phase,
+            })
+
     if energy_form == 'HS':
         H_coeffs, S_coeffs, V_coeffs = (
             _extract_hs_coeffs(energy_el))
@@ -276,20 +340,21 @@ def _parse_phase_spec(phase_el, energy_form):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def parse_system(infile):
-    """Parse *infile* and return a System.
+def parse_system_spec(infile):
+    """Parse *infile* and return a SystemSpec.
 
-    Internally constructs a SystemSpec from the XML, then calls
-    spec.to_system() which handles all dependency resolution (VLE,
-    patches) via topological sort.
+    Translates XML into FieldSpec + PhaseSpec objects,
+    resolves VLE liquid_phase references, and returns
+    the assembled SystemSpec.  No EnergyModel objects
+    are built — call spec.to_system() for that.
 
-    Accepts two field schemas (new <fields> block or legacy separate
-    <temperature>/<pressure> blocks) — both produce identical results.
+    Accepts two field schemas (new <fields> block or
+    legacy separate <temperature>/<pressure> blocks).
     """
     tree = etree.parse(infile)
     root = tree.getroot()
 
-    # -- System metadata ---------------------------------------------------
+    # -- System metadata -------------------------
     sys_el = root.find('system')
     components = (
         sys_el.find('components')
@@ -298,7 +363,35 @@ def parse_system(infile):
         sys_el.find('energy_form')
         .text.strip())
 
-    # -- Title (optional; fall back to filename) ---------------------------
+    # -- TDB path (CALPHAD systems only) ---------
+    tdb_path = ''
+    tdb_el = sys_el.find('tdb')
+    if tdb_el is not None and tdb_el.text:
+        raw_tdb = tdb_el.text.strip()
+        resolved = (
+            pathlib.Path(infile).parent
+            / raw_tdb)
+        tdb_path = str(resolved.resolve())
+
+    # -- Units (optional human-readable record) ---
+    units = {}
+    units_el = sys_el.find('units')
+    if units_el is not None:
+        for attr in ('energy', 'temperature',
+                     'pressure'):
+            val = units_el.get(attr)
+            if val is not None:
+                units[attr] = val
+    # CALPHAD systems default to SI when no
+    # <units> block is provided.
+    if energy_form == 'calphad' and not units:
+        units = {
+            'energy': 'J/mol',
+            'temperature': 'K',
+            'pressure': 'Pa',
+        }
+
+    # -- Title (optional; fall back to filename) --
     title_el = root.find('title')
     if title_el is not None and title_el.text:
         title = title_el.text.strip()
@@ -309,23 +402,132 @@ def parse_system(infile):
                 fname = fname[:-len(ext)]
         title = fname
 
-    # -- Fields ------------------------------------------------------------
+    # -- Fields ------------------------------------------
     fields_el = root.find('fields')
     if fields_el is not None:
         field_specs = _parse_field_specs_block(
             fields_el)
     else:
+        # Legacy <temperature>/<pressure> blocks —
+        # pending removal (see TODO A-2).
         field_specs = _parse_legacy_field_specs(
             root)
 
-    # -- Phases ------------------------------------------------------------
+    # -- Phases ------------------------------------------
     phase_specs = [
         _parse_phase_spec(ph_el, energy_form)
         for ph_el in root.findall('phase')]
 
-    # Post-process: fill in VLE liquid_phase references.  The XML does not
-    # name the liquid explicitly; the convention is "first liquid phase
-    # in declaration order".
+    # Post-process: fill in VLE liquid_phase refs.
+    # Convention: first liquid phase in declaration
+    # order is the VLE reference.
+    _resolve_vle_liquid(phase_specs)
+
+    # For CALPHAD systems, inject uppercased
+    # component names into every CALPHAD phase
+    # spec.  pycalphad expects element symbols
+    # like 'AL', 'MG'; VA is appended by the
+    # CALPHADModel constructor.
+    if energy_form == 'calphad':
+        calphad_comps = [
+            c.upper() for c in components]
+        for ps in phase_specs:
+            if ps.model_type == 'calphad':
+                ps.model_params[
+                    'components'
+                ] = calphad_comps
+
+    # Validate R_gas against declared units.
+    _validate_units(
+        units, field_specs, energy_form)
+
+    return SystemSpec(
+        title=title,
+        components=components,
+        energy_form=energy_form,
+        fields=field_specs,
+        phases=phase_specs,
+        tdb_path=tdb_path,
+        units=units,
+    )
+
+
+def parse_system(infile):
+    """Parse *infile* and return a System.
+
+    Thin wrapper: calls parse_system_spec() then
+    spec.to_system() for full dependency resolution.
+    """
+    return parse_system_spec(infile).to_system()
+
+
+def _validate_units(units, field_specs,
+                    energy_form):
+    """Check R_gas consistency with declared units.
+
+    If the <units> block declares energy and
+    temperature units that correspond to a known
+    R_gas value, and the pressure field carries an
+    R_gas, warn when they disagree by more than 1%.
+
+    For CALPHAD systems, also warn if the declared
+    units are not SI (J/mol, K, Pa).
+    """
+    if not units:
+        return
+
+    # CALPHAD must use SI.
+    if energy_form == 'calphad':
+        _expected_si = {
+            'energy': 'J/mol',
+            'temperature': 'K',
+            'pressure': 'Pa',
+        }
+        for key, expected in (
+                _expected_si.items()):
+            declared = units.get(key, '')
+            if declared and declared != expected:
+                warnings.warn(
+                    f"CALPHAD systems require "
+                    f"SI units but <units> "
+                    f"declares {key}="
+                    f"'{declared}' (expected "
+                    f"'{expected}')")
+
+    # R_gas cross-check against the lookup table.
+    energy_unit = units.get('energy', '')
+    temp_unit = units.get(
+        'temperature', '')
+    if not energy_unit or not temp_unit:
+        return
+    expected_R = _KNOWN_R_GAS.get(
+        (energy_unit, temp_unit))
+    if expected_R is None:
+        return
+    for fs in field_specs:
+        if fs.name != 'pressure':
+            continue
+        R_gas = fs.extras.get('R_gas')
+        if R_gas is None:
+            continue
+        rel_err = (
+            abs(R_gas - expected_R)
+            / expected_R)
+        if rel_err > 0.01:
+            warnings.warn(
+                f"R_gas={R_gas} does not match "
+                f"the expected value "
+                f"{expected_R} for units "
+                f"({energy_unit}, {temp_unit})"
+                f".  Check unit consistency.")
+
+
+def _resolve_vle_liquid(phase_specs):
+    """Fill in vle_params['liquid_phase'] for VLE gas
+    phases that lack an explicit liquid reference.
+
+    Uses the first liquid phase in declaration order.
+    """
     liquid_name = ''
     for ps in phase_specs:
         if ps.phase_type == 'liquid':
@@ -336,16 +538,6 @@ def parse_system(infile):
         if vle is not None and not vle.get(
                 'liquid_phase'):
             vle['liquid_phase'] = liquid_name
-
-    # -- Assemble spec and build -------------------------------------------
-    spec = SystemSpec(
-        title=title,
-        components=components,
-        energy_form=energy_form,
-        fields=field_specs,
-        phases=phase_specs,
-    )
-    return spec.to_system()
 
 
 # ---------------------------------------------------------------------------
