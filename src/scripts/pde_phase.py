@@ -544,7 +544,14 @@ class SystemSpec:
     phases      : list[PhaseSpec] — phase specs
     tdb_path    : str        — path to TDB file
                                (CALPHAD only; '' when
-                               not applicable)
+                               not applicable).  Stored
+                               as written in the XML
+                               (usually relative).
+    base_dir    : str        — directory used to resolve
+                               relative tdb_path at
+                               runtime.  Set by the parser
+                               to the XML file's parent;
+                               defaults to cwd.
     units       : dict       — declared unit system,
                                e.g. {'energy': 'kJ/mol',
                                'temperature': 'K',
@@ -560,6 +567,7 @@ class SystemSpec:
     fields:      list = field(default_factory=list)
     phases:      list = field(default_factory=list)
     tdb_path:    str  = ''
+    base_dir:    str  = ''
     units:       dict = field(default_factory=dict)
 
     def to_system(self):
@@ -577,7 +585,10 @@ class SystemSpec:
         once here and the resulting Database object is
         shared across all phase model constructors.
         """
-        # Load TDB database once for CALPHAD systems.
+        # Load TDB database once for CALPHAD
+        # systems.  Resolve relative tdb_path against
+        # base_dir (set by the parser to the XML's
+        # parent directory, or cwd if unset).
         tdb_db = None
         if (self.energy_form == 'calphad'
                 and self.tdb_path):
@@ -589,7 +600,13 @@ class SystemSpec:
                     "CALPHAD energy models.  "
                     "Install it with:  pip "
                     "install pycalphad") from exc
-            tdb_db = _pc.Database(self.tdb_path)
+            import pathlib
+            tdb = pathlib.Path(self.tdb_path)
+            if not tdb.is_absolute():
+                base = pathlib.Path(
+                    self.base_dir or '.')
+                tdb = (base / tdb).resolve()
+            tdb_db = _pc.Database(str(tdb))
 
         edges = _dependency_edges(self.phases)
         order = _topo_sort(self.phases, edges)

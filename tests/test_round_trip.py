@@ -27,12 +27,17 @@ DEMO_DIR = os.path.join(
 def _round_trip(path):
     """Parse → serialise → re-parse and return both
     the original and round-tripped SystemSpec objects.
+
+    The temp XML is written to the same directory as
+    the original so that relative TDB paths resolve
+    correctly in the re-parsed spec.
     """
     spec1 = parse_system_spec(path)
     xml = spec1.to_xml_str()
+    parent = os.path.dirname(os.path.abspath(path))
     with tempfile.NamedTemporaryFile(
             suffix='.xml', mode='w',
-            delete=False) as fh:
+            dir=parent, delete=False) as fh:
         fh.write(xml)
         tmp = fh.name
     try:

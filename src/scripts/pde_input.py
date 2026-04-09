@@ -364,14 +364,16 @@ def parse_system_spec(infile):
         .text.strip())
 
     # -- TDB path (CALPHAD systems only) ---------
+    # Store the raw path exactly as written in the
+    # XML so that to_xml_str() stays portable.
+    # Resolution against the XML's parent directory
+    # happens at to_system() time via base_dir.
     tdb_path = ''
     tdb_el = sys_el.find('tdb')
     if tdb_el is not None and tdb_el.text:
-        raw_tdb = tdb_el.text.strip()
-        resolved = (
-            pathlib.Path(infile).parent
-            / raw_tdb)
-        tdb_path = str(resolved.resolve())
+        tdb_path = tdb_el.text.strip()
+    xml_dir = str(
+        pathlib.Path(infile).parent.resolve())
 
     # -- Units (optional human-readable record) ---
     units = {}
@@ -448,6 +450,7 @@ def parse_system_spec(infile):
         fields=field_specs,
         phases=phase_specs,
         tdb_path=tdb_path,
+        base_dir=xml_dir,
         units=units,
     )
 
