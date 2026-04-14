@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  Cu-Mg binary CALPHAD demo for PDE.
+
+  Uses the Al-Cu-Mg ternary TDB (al-cu-mg-demo.tdb)
+  with only Cu and Mg selected as components.
+  Cu melts at ~1358 K, Mg at ~923 K.  The liquid
+  has moderate negative mixing (L = -23164 + 4.5T).
+  FCC is destabilised for Mg (G_FCC,MG = +2600)
+  while HCP is destabilised for Cu (G_HCP,CU =
+  +6000 - T).
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Cu-Mg binary (CALPHAD)</title>
+
+  <system>
+    <components>Cu Mg</components>
+    <energy_form>calphad</energy_form>
+    <tdb>al-cu-mg-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="1500"
+           initial="1500"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+
+  <phase name="hcp" type="solid">
+    <energy model="calphad" phase="HCP_A3"/>
+  </phase>
+</pde>

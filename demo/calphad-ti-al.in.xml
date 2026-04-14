@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!--
+  Ti-Al CALPHAD demo for PDE.
+
+  Strong ordering system: Ti (HCP) and Al (FCC)
+  have very negative mixing energies in both
+  structures, reflecting the strong Ti-Al bonding
+  that produces the gamma-TiAl intermetallic in
+  real alloys.
+
+  Al melts at 933 K, Ti melts at 1941 K.  The
+  large melting-point difference and strong
+  interactions create a complex liquidus with
+  peritectic-like features.  FCC dominates the
+  Al-rich side; HCP dominates the Ti-rich side.
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Ti-Al peritectic (CALPHAD)</title>
+
+  <system>
+    <components>Al Ti</components>
+    <energy_form>calphad</energy_form>
+    <tdb>ti-al-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="500" max="2100"
+           initial="2100"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+
+  <phase name="hcp" type="solid">
+    <energy model="calphad" phase="HCP_A3"/>
+  </phase>
+</pde>

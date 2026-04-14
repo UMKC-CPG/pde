@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<!--
+  Al-Cu binary CALPHAD demo for PDE.
+
+  Uses the Al-Cu-Mg ternary TDB (al-cu-mg-demo.tdb)
+  with only Al and Cu selected as components.  The
+  binary Al-Cu subsystem has strong negative mixing
+  in both liquid and FCC, producing a deep eutectic
+  on the Al-rich side.
+
+  The FCC interaction L(FCC,AL,CU;0) = -53520 + 2T
+  drives strong ordering tendency (theta phase in
+  real Al-Cu is not modelled here).
+
+  Approximate melting points from the TDB:
+    Al: 933 K   Cu: 1358 K
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Al-Cu binary (CALPHAD)</title>
+
+  <system>
+    <components>Al Cu</components>
+    <energy_form>calphad</energy_form>
+    <tdb>al-cu-mg-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="1500"
+           initial="1500"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+</pde>

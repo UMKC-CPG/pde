@@ -1,0 +1,45 @@
+$ =============================================================
+$ Pb-Sn simplified demo database for PDE
+$
+$ Classic solder eutectic.  FCC (Pb-rich) and BCT_A5
+$ (Sn-rich) terminal phases with limited mutual
+$ solubility.
+$
+$ Pb melts at ~601 K, Sn melts at ~505 K.
+$
+$ NOT for research.  Simplified linear G(T).
+$ Units: SI (J/mol, K, Pa)
+$ =============================================================
+
+ELEMENT /-   ELECTRON_GAS   0.0      0.0      0.0 !
+ELEMENT VA   VACUUM         0.0      0.0      0.0 !
+ELEMENT PB   FCC_A1       207.200  6870.0    64.80 !
+ELEMENT SN   BCT_A5       118.710  6323.0    51.20 !
+
+TYPE_DEFINITION % SEQ *!
+DEFINE_SYSTEM_DEFAULT ELEMENT 2 !
+
+PHASE LIQUID %  1  1.0 !
+CONSTITUENT LIQUID : PB,SN : !
+
+PARAMETER G(LIQUID,PB;0)  298.15  +4774-7.94*T;  3000 N !
+PARAMETER G(LIQUID,SN;0)  298.15  +7030-13.92*T;  3000 N !
+PARAMETER L(LIQUID,PB,SN;0)  298.15  -5000;  3000 N !
+
+$ FCC_A1 — Pb-rich terminal solid
+PHASE FCC_A1 %  2  1.0  1.0 !
+CONSTITUENT FCC_A1 : PB,SN : VA : !
+
+PARAMETER G(FCC_A1,PB:VA;0)  298.15  0;  3000 N !
+PARAMETER G(FCC_A1,SN:VA;0)  298.15  +4000;  3000 N !
+PARAMETER L(FCC_A1,PB,SN:VA;0)  298.15  +2000;  3000 N !
+
+$ BCT_A5 — Sn-rich terminal solid
+PHASE BCT_A5 %  2  1.0  1.0 !
+CONSTITUENT BCT_A5 : PB,SN : VA : !
+
+PARAMETER G(BCT_A5,PB:VA;0)  298.15  +5000;  3000 N !
+PARAMETER G(BCT_A5,SN:VA;0)  298.15  0;  3000 N !
+PARAMETER L(BCT_A5,PB,SN:VA;0)  298.15  +3000;  3000 N !
+
+$ =============================================================

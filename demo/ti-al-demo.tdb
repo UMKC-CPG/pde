@@ -1,0 +1,54 @@
+$ =============================================================
+$ Ti-Al simplified demo database for PDE
+$
+$ Peritectic-like system with strong ordering.
+$ Ti is HCP, Al is FCC.  Both structures compete
+$ across the composition range with deep negative
+$ mixing due to strong Ti-Al bonding (gamma-TiAl
+$ intermetallic in real system).
+$
+$ Al melts at ~933 K, Ti melts at ~1941 K.
+$
+$ NOT for research.  Simplified linear G(T).
+$ Units: SI (J/mol, K, Pa)
+$ =============================================================
+
+ELEMENT /-   ELECTRON_GAS   0.0      0.0      0.0 !
+ELEMENT VA   VACUUM         0.0      0.0      0.0 !
+ELEMENT AL   FCC_A1        26.982  4540.0    28.30 !
+ELEMENT TI   HCP_A3        47.867  4824.0    30.72 !
+
+TYPE_DEFINITION % SEQ *!
+DEFINE_SYSTEM_DEFAULT ELEMENT 2 !
+
+PHASE LIQUID %  1  1.0 !
+CONSTITUENT LIQUID : AL,TI : !
+
+$ Al melts: 10711 / 11.473 = 933 K
+$ Ti melts: 14146 / 7.289  = 1941 K
+PARAMETER G(LIQUID,AL;0)  298.15  +10711-11.473*T;  3000 N !
+PARAMETER G(LIQUID,TI;0)  298.15  +14146-7.289*T;   3000 N !
+
+$ Strong attraction in liquid.
+PARAMETER L(LIQUID,AL,TI;0)  298.15  -108000+38*T;  3000 N !
+PARAMETER L(LIQUID,AL,TI;1)  298.15  -6000;  3000 N !
+
+$ FCC_A1 — Al-rich; Ti in FCC is metastable
+PHASE FCC_A1 %  2  1.0  1.0 !
+CONSTITUENT FCC_A1 : AL,TI : VA : !
+
+PARAMETER G(FCC_A1,AL:VA;0)  298.15  0;  3000 N !
+PARAMETER G(FCC_A1,TI:VA;0)  298.15  +6000-1.5*T;  3000 N !
+PARAMETER L(FCC_A1,AL,TI:VA;0)  298.15  -90000+20*T;  3000 N !
+PARAMETER L(FCC_A1,AL,TI:VA;1)  298.15  +10000;  3000 N !
+
+$ HCP_A3 — Ti-rich; Al in HCP is metastable
+PHASE HCP_A3 %  2  1.0  0.5 !
+CONSTITUENT HCP_A3 : AL,TI : VA : !
+
+PARAMETER G(HCP_A3,AL:VA;0)  298.15  +5481-1.8*T;  3000 N !
+PARAMETER G(HCP_A3,TI:VA;0)  298.15  0;  3000 N !
+PARAMETER L(HCP_A3,AL,TI:VA;0)  298.15  -128000+39*T;  3000 N !
+PARAMETER L(HCP_A3,AL,TI:VA;1)  298.15  +6000;  3000 N !
+
+$ =============================================================

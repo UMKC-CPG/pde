@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!--
+  Au-Si deep eutectic CALPHAD demo for PDE.
+
+  Au (FCC) melts at 1337 K, Si (diamond) melts at
+  1687 K, but the eutectic sits far below either
+  melting point due to strong liquid stabilisation
+  (L_liq = -40000 + 5T) and nearly zero mutual
+  solid solubility.  This deep eutectic is used in
+  semiconductor die-attach and wire bonding.
+
+  The diagram shows a dramatic V-shaped liquidus
+  dropping hundreds of kelvin below the terminal
+  melting points.
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Au-Si deep eutectic (CALPHAD)</title>
+
+  <system>
+    <components>Au Si</components>
+    <energy_form>calphad</energy_form>
+    <tdb>au-si-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="500" max="1800"
+           initial="1800"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+
+  <phase name="diamond" type="solid">
+    <energy model="calphad" phase="DIAMOND_A4"/>
+  </phase>
+</pde>

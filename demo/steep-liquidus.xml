@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo: highly asymmetric liquidus (steep curve).
+
+  Energy form: HS
+    G(x, T) = H(x) - T*S(x)
+
+  System description:
+    - One liquid spanning x in [0, 1].
+    - Alpha: A-rich solid (x in [0, 0.3]).
+    - Beta:  B-rich solid (x in [0.5, 1.0]).
+    - A melts at 500 K, B melts at 1875 K.
+
+  The large difference in melting points produces a
+  steeply tilted liquidus.  The eutectic point is
+  pushed far to the low-melting A side, and the
+  B-rich liquidus rises almost vertically.  This
+  topology is common in ceramic-metal systems where
+  one component is refractory (e.g. Fe-C, W-Cu).
+
+  Melting points:
+    A: T = (4.0 - 0.0) / (0.012 - 0.004) = 500 K
+    B: T = (16.0 - 1.0) / (0.012 - 0.004) = 1875 K
+-->
+
+<pde>
+
+  <title>Steep Liquidus (A at 500 K, B at 1875 K)</title>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+    <units energy="kJ/mol" temperature="K"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="2000"
+           initial="2000"/>
+  </fields>
+
+  <!-- ========================================================
+       Liquid (full range)
+       H_L(x) = 4.0 + 10.0x + 2.0x^2
+         H_L(0) = 4.0   H_L(1) = 16.0
+       S_L = 0.012
+       ======================================================== -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="4.0" x1="10.0" x2="2.0"/>
+      <S x0="0.012"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Alpha (A-rich, x in [0, 0.3])
+       H_alpha(x) = 0.0 + 1.0x + 8.0x^2
+       S_alpha = 0.004
+       ======================================================== -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.3"/>
+    <energy model="quadratic">
+      <H x0="0.0" x1="1.0" x2="8.0"/>
+      <S x0="0.004"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Beta (B-rich, x in [0.5, 1.0])
+       H_beta(x) = 2.0 - 2.0x + 1.0x^2
+         H_beta(1) = 1.0
+       S_beta = 0.004
+       ======================================================== -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.5" xmax="1.0"/>
+    <energy model="quadratic">
+      <H x0="2.0" x1="-2.0" x2="1.0"/>
+      <S x0="0.004"/>
+    </energy>
+  </phase>
+
+</pde>

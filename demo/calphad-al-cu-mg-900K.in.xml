@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!--
+  Al-Cu-Mg ternary CALPHAD demo for PDE.
+
+  Same TDB and phases as the demo/ ternary file but
+  with a different temperature range (300-900 K) and
+  initial temperature at 600 K — below the eutectic
+  region, showing the solid-phase competition between
+  FCC and HCP at intermediate temperatures.
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Al-Cu-Mg ternary, 600 K (CALPHAD)</title>
+
+  <system>
+    <components>Al Cu Mg</components>
+    <energy_form>calphad</energy_form>
+    <tdb>al-cu-mg-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="900"
+           initial="900"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+
+  <phase name="hcp" type="solid">
+    <energy model="calphad" phase="HCP_A3"/>
+  </phase>
+</pde>

@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo: liquid miscibility gap.
+
+  Energy form: HS
+    G(x, T) = H(x) - T*S(x)
+
+  System description:
+    - Two liquid phases (L1, L2) representing the
+      A-rich and B-rich sides of a miscibility gap.
+    - One solid phase spanning x in [0, 1].
+
+  Both liquids have identical entropy (they are the
+  same physical phase) but different enthalpy bowls.
+  L1's bowl sits near x = 0; L2's bowl sits near
+  x = 1.  The enthalpy step between them in the
+  middle range forces the convex hull to draw a
+  common tangent, producing the two-phase L1 + L2
+  region — the binodal of the miscibility gap.
+
+  At high temperature the T*S term dominates and
+  both liquid curves drop below the solid, so the
+  diagram shows:
+    - Above both melting points: L1 | L1+L2 | L2
+      (liquid miscibility gap).
+    - Below melting points: solid replaces
+      liquid(s) progressively.
+
+  The system is symmetric: H_L1(0) = H_L2(1) = 4.0
+  and both liquids have S = 0.008.
+
+  Melting points:
+    A: T = (4.0 - 0.0) / (0.008 - 0.003) = 800 K
+    B: T = (4.0 - 1.0) / (0.008 - 0.003) = 600 K
+-->
+
+<pde>
+
+  <title>Immiscible Liquids (Miscibility Gap)</title>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+    <units energy="kJ/mol" temperature="K"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="1200"
+           initial="1200"/>
+  </fields>
+
+  <!-- ========================================================
+       L1: A-rich liquid (x in [0, 0.4])
+       H_L1(x) = 4.0 + 0.0x + 5.0x^2
+         Bowl centred near x = 0.
+         H_L1(0) = 4.0   H_L1(0.4) = 4.8
+       S_L1 = 0.008
+       ======================================================== -->
+
+  <phase name="L1" type="liquid">
+    <composition_range xmin="0.0" xmax="0.4"/>
+    <energy model="quadratic">
+      <H x0="4.0" x1="0.0" x2="5.0"/>
+      <S x0="0.008"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       L2: B-rich liquid (x in [0.6, 1.0])
+       H_L2(x) = 9.0 - 10.0x + 5.0x^2
+         Bowl centred near x = 1.
+         H_L2(0.6) = 4.8   H_L2(1) = 4.0
+       S_L2 = 0.008
+
+       Symmetric partner of L1.  Same entropy,
+       mirrored enthalpy.  The gap in the middle
+       (x = 0.4 to 0.6) is the immiscible region.
+       ======================================================== -->
+
+  <phase name="L2" type="liquid">
+    <composition_range xmin="0.6" xmax="1.0"/>
+    <energy model="quadratic">
+      <H x0="9.0" x1="-10.0" x2="5.0"/>
+      <S x0="0.008"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Solid (full range, gently convex)
+       H_S(x) = 0.0 + 0.0x + 1.0x^2
+         H_S(0) = 0.0   H_S(1) = 1.0
+       S_S = 0.003  (low-entropy solid)
+       ======================================================== -->
+
+  <phase name="solid" type="solid">
+    <energy model="quadratic">
+      <H x0="0.0" x1="0.0" x2="1.0"/>
+      <S x0="0.003"/>
+    </energy>
+  </phase>
+
+</pde>

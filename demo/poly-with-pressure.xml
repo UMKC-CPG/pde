@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo: polynomial energy form with pressure.
+
+  Energy form: polynomial
+    G(x, T) = c0(T) + c1(T)*x + c2(T)*x^2
+    where ci(T) = ai0 + ai1*T [+ ai2*T^2 + ...]
+
+  System description:
+    - One liquid with a PV molar-volume term.
+    - Two solid phases (alpha, beta) without PV.
+    - Temperature and pressure are both sweepable.
+
+  Increasing pressure raises the liquid G via the
+  P*V(x) term, which depresses the melting points.
+  The solid phases have negligible compressibility
+  (no V term), so their G is pressure-independent.
+
+  At P = 1 atm:
+    A melts: (5.0 - 0.008T) = (0.0 - 0.003T)
+      5.0 = 0.005T  =>  T = 1000 K
+    B melts: (5.0-0.5+2.0 - 0.008T) = (4.0-8.0+5.0 - 0.003T)
+      6.5 - 0.008T = 1.0 - 0.003T
+      5.5 = 0.005T  =>  T = 1100 K
+-->
+
+<pde>
+
+  <title>Polynomial Eutectic with Pressure</title>
+
+  <system>
+    <components>A B</components>
+    <energy_form>polynomial</energy_form>
+    <units energy="kJ/mol" temperature="K"
+           pressure="atm"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="500" max="1400"
+           initial="1400"/>
+    <field name="pressure" symbol="P"
+           unit="atm" min="0.5" max="10"
+           initial="1"
+           R_gas="0.008314" P_ref="1"/>
+  </fields>
+
+  <!-- ========================================================
+       Liquid (full range, with molar volume)
+       G_L(x, T) = (5.0 - 0.008T) + (-0.5)x + (2.0)x^2
+       V(x) = 0.003  (constant molar volume)
+
+       Pressure contributes P * V(x) to G.
+       ======================================================== -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <x0 a0="5.0" a1="-0.008"/>
+      <x1 a0="-0.5"/>
+      <x2 a0="2.0"/>
+      <V x0="0.003"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Alpha (A-rich, x in [0, 0.4])
+       G_alpha(x, T) = (0.0 - 0.003T) + (0.0)x + (5.0)x^2
+       No volume term (incompressible solid).
+       ======================================================== -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.4"/>
+    <energy model="quadratic">
+      <x0 a0="0.0" a1="-0.003"/>
+      <x1 a0="0.0"/>
+      <x2 a0="5.0"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Beta (B-rich, x in [0.5, 1.0])
+       G_beta(x, T) = (4.0 - 0.003T) + (-8.0)x + (5.0)x^2
+       No volume term.
+       ======================================================== -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.5" xmax="1.0"/>
+    <energy model="quadratic">
+      <x0 a0="4.0" a1="-0.003"/>
+      <x1 a0="-8.0"/>
+      <x2 a0="5.0"/>
+    </energy>
+  </phase>
+
+</pde>

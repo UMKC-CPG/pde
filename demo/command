@@ -1,0 +1,60 @@
+Date: Apr. 07, 2026: 15:52:52
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-cu-mg.in.xml
+
+Date: Apr. 07, 2026: 15:55:47
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-al-cu.in.xml
+
+Date: Apr. 07, 2026: 15:57:17
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i immiscible-solids.xml
+
+Date: Apr. 07, 2026: 15:58:25
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-al-cu-mg-900K.in.xml
+
+Date: Apr. 07, 2026: 17:51:34
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-au-si.in.xml
+
+Date: Apr. 07, 2026: 17:53:05
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-cu-mg.in.xml
+
+Date: Apr. 07, 2026: 17:55:18
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-cu-ni.in.xml
+
+Date: Apr. 07, 2026: 17:56:50
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i immiscible-liquids.xml
+
+Date: Apr. 07, 2026: 17:59:25
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i immiscible-liquids.xml
+
+Date: Apr. 07, 2026: 18:30:51
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-cu-pb.in.xml
+
+Date: Apr. 09, 2026: 11:23:11
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-cu-pb.in.xml
+
+Date: Apr. 09, 2026: 16:44:24
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-al-cu.in.xml
+
+Date: Apr. 09, 2026: 16:49:04
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i immiscible-liquids.xml
+
+Date: Apr. 09, 2026: 16:49:26
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i immiscible-solids.xml
+
+Date: Apr. 09, 2026: 16:50:21
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-ti-al.in.xml
+
+Date: Apr. 09, 2026: 16:58:53
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-pb-sn.in.xml
+
+Date: Apr. 09, 2026: 17:00:58
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-cu-ni.in.xml
+
+Date: Apr. 09, 2026: 17:12:19
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-ti-al.in.xml
+
+Date: Apr. 14, 2026: 14:59:10
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-ti-al.in.xml
+
+Date: Apr. 14, 2026: 16:08:20
+Cmnd: /home/rulisp/CPG/cpg-repo/pde/bin/pde.py -i calphad-ti-al.in.xml
+

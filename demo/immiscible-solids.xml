@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo: solid miscibility gap.
+
+  Energy form: HS
+    G(x, T) = H(x) - T*S(x)
+
+  System description:
+    - One liquid phase spanning x in [0, 1].
+    - Alpha: A-rich solid (x in [0, 0.35]).
+    - Beta:  B-rich solid (x in [0.65, 1.0]).
+    - No stable phase in the gap (x in 0.35-0.65).
+
+  This creates a solid miscibility gap: the two terminal
+  solid solutions have limited mutual solubility.  Below
+  the eutectic, the system decomposes into alpha + beta
+  across the gap.  Above both melting points, liquid is
+  stable everywhere.
+
+  Unlike the eutectic with a compound, there is no
+  intermediate phase stabilising the middle range.  The
+  solvus curves (alpha/beta boundaries) simply end at
+  the composition limits.
+
+  Melting points:
+    A: T = (7.0 - 0.0) / (0.010 - 0.003) = 1000 K
+    B: T = (8.5 - 0.5) / (0.010 - 0.003) = 1143 K
+-->
+
+<pde>
+
+  <title>Solid Miscibility Gap (Alpha + Beta)</title>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+    <units energy="kJ/mol" temperature="K"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="400" max="1300"
+           initial="1300"/>
+  </fields>
+
+  <!-- ========================================================
+       Liquid (full range)
+       H_L(x) = 7.0 + 0.0x + 1.5x^2
+       S_L = 0.010
+       ======================================================== -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="7.0" x1="0.0" x2="1.5"/>
+      <S x0="0.010"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Alpha (A-rich, x in [0, 0.35])
+       H_alpha(x) = 0.0 + 0.5x + 8.0x^2
+       S_alpha = 0.003
+       ======================================================== -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.35"/>
+    <energy model="quadratic">
+      <H x0="0.0" x1="0.5" x2="8.0"/>
+      <S x0="0.003"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Beta (B-rich, x in [0.65, 1.0])
+       H_beta(x) = 8.5 - 16.0x + 8.0x^2
+         H_beta(1) = 0.5
+       S_beta = 0.003
+       ======================================================== -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.65" xmax="1.0"/>
+    <energy model="quadratic">
+      <H x0="8.5" x1="-16.0" x2="8.0"/>
+      <S x0="0.003"/>
+    </energy>
+  </phase>
+
+</pde>

@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PDE demo: two stoichiometric compounds with three
+  eutectic valleys.
+
+  Energy form: HS
+    G(x, T) = H(x) - T*S(x)
+
+  System description:
+    - One liquid phase spanning x in [0, 1].
+    - Alpha: A-rich terminal solid (x in [0, 0.2]).
+    - A2B compound: line phase at x = 0.333.
+    - AB2 compound: line phase at x = 0.667.
+    - Beta: B-rich terminal solid (x in [0.8, 1.0]).
+
+  The two compounds divide the composition range into
+  three sub-systems, each with its own eutectic valley.
+  Both compounds melt congruently above the terminal
+  melting points.
+
+  Melting points:
+    A:   T = (5.5 - 0.0) / (0.008 - 0.002) = 917 K
+    A2B: T = (5.667 + 2.0) / (0.008 - 0.001) = 1095 K
+    AB2: T = (6.167 + 1.5) / (0.008 - 0.001) = 1095 K
+    B:   T = (7.0 - 0.9) / (0.008 - 0.002) = 1017 K
+
+  The compound peaks at 1095 K rise above both
+  terminal melting points (917 K, 1017 K), confirming
+  congruent melting with strong ordering.
+-->
+
+<pde>
+
+  <title>Two Compounds (A2B + AB2), Three Eutectics</title>
+
+  <system>
+    <components>A B</components>
+    <energy_form>HS</energy_form>
+    <units energy="kJ/mol" temperature="K"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="400" max="1200"
+           initial="1200"/>
+  </fields>
+
+  <!-- ========================================================
+       Liquid (full range)
+       H_L(x) = 5.5 + 0.0x + 1.5x^2
+       S_L = 0.008
+       ======================================================== -->
+
+  <phase name="liquid" type="liquid">
+    <energy model="quadratic">
+      <H x0="5.5" x1="0.0" x2="1.5"/>
+      <S x0="0.008"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Alpha (A-rich, x in [0, 0.2])
+       H_alpha(x) = 0.0 + 0.5x + 12.0x^2
+       S_alpha = 0.002
+       ======================================================== -->
+
+  <phase name="alpha" type="solid">
+    <composition_range xmin="0.0" xmax="0.2"/>
+    <energy model="quadratic">
+      <H x0="0.0" x1="0.5" x2="12.0"/>
+      <S x0="0.002"/>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       A2B compound (x = 0.333)
+       H = -2.0   S = 0.001
+       ======================================================== -->
+
+  <phase name="A2B" type="end_member">
+    <composition_range xmin="0.333" xmax="0.333"/>
+    <energy model="point">
+      <H>-2.0</H>
+      <S>0.001</S>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       AB2 compound (x = 0.667)
+       H = -1.5   S = 0.001
+       ======================================================== -->
+
+  <phase name="AB2" type="end_member">
+    <composition_range xmin="0.667" xmax="0.667"/>
+    <energy model="point">
+      <H>-1.5</H>
+      <S>0.001</S>
+    </energy>
+  </phase>
+
+  <!-- ========================================================
+       Beta (B-rich, x in [0.8, 1.0])
+       H_beta(x) = 10.0 - 18.0x + 8.9x^2
+         H_beta(1) = 0.9
+       S_beta = 0.002
+       ======================================================== -->
+
+  <phase name="beta" type="solid">
+    <composition_range xmin="0.8" xmax="1.0"/>
+    <energy model="quadratic">
+      <H x0="10.0" x1="-18.0" x2="8.9"/>
+      <S x0="0.002"/>
+    </energy>
+  </phase>
+
+</pde>

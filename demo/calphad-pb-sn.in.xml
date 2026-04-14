@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!--
+  Pb-Sn eutectic CALPHAD demo for PDE.
+
+  The classic solder system.  Pb (FCC) melts at
+  601 K, Sn (BCT) melts at 505 K.  Limited mutual
+  solubility in both terminal solids creates a
+  eutectic between FCC and BCT.
+
+  The eutectic temperature depends on the
+  interaction parameters in the liquid and both
+  solids.  Positive L in FCC and BCT limits
+  solubility; moderate negative L in liquid
+  stabilises the melt.
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Pb-Sn eutectic (CALPHAD)</title>
+
+  <system>
+    <components>Pb Sn</components>
+    <energy_form>calphad</energy_form>
+    <tdb>pb-sn-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="700"
+           initial="700"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+
+  <phase name="bct" type="solid">
+    <energy model="calphad" phase="BCT_A5"/>
+  </phase>
+</pde>

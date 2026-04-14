@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!--
+  Cu-Ni isomorphous CALPHAD demo for PDE.
+
+  Both Cu and Ni are FCC with complete solid
+  solubility.  The phase diagram is a simple lens
+  between liquid and FCC — no eutectic, no
+  miscibility gap.  The liquidus and solidus
+  curves span from Cu's melting point (1357 K) to
+  Ni's (1728 K).
+
+  This is the simplest possible binary CALPHAD
+  diagram: two phases, one field, no invariants.
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Cu-Ni isomorphous (CALPHAD)</title>
+
+  <system>
+    <components>Cu Ni</components>
+    <energy_form>calphad</energy_form>
+    <tdb>cu-ni-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="1200" max="1800"
+           initial="1800"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+</pde>

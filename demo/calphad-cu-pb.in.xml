@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<!--
+  Cu-Pb liquid miscibility gap CALPHAD demo.
+
+  Strongly positive mixing in the liquid (L = +60000
+  - 10T) produces a wide miscibility gap.  The
+  monotectic reaction L1 = FCC(Cu) + L2 occurs where
+  the Cu-rich liquidus meets the binodal.  Pb-rich
+  liquid (L2) persists to lower temperatures.
+
+  This system demonstrates within-phase miscibility
+  gap detection: a single LIQUID phase has a concave
+  G(x) curve, and the equilibrium engine identifies
+  the common tangent as a two-phase L+L region.
+
+  Cu melts at ~1357 K, Pb melts at ~601 K.
+
+  Requires pycalphad:  pip install pycalphad
+-->
+<pde>
+  <title>Cu-Pb liquid immiscibility (CALPHAD)</title>
+
+  <system>
+    <components>Cu Pb</components>
+    <energy_form>calphad</energy_form>
+    <tdb>cu-pb-demo.tdb</tdb>
+    <units energy="J/mol" temperature="K"
+           pressure="Pa"/>
+  </system>
+
+  <fields>
+    <field name="temperature" symbol="T"
+           unit="K" min="300" max="1800"
+           initial="1800"/>
+  </fields>
+
+  <phase name="liquid" type="liquid">
+    <energy model="calphad" phase="LIQUID"/>
+  </phase>
+
+  <phase name="fcc" type="solid">
+    <energy model="calphad" phase="FCC_A1"/>
+  </phase>
+</pde>
